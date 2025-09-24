@@ -33,6 +33,8 @@ import axios from 'src/utils/axios';
 import { CONFIG } from 'src/config-global';
 
 import { ORIGIN } from 'src/sections/knowledgebase/constants/knowledge-search';
+import { useConnectors } from 'src/sections/accountdetails/connectors/context';
+import { KnowledgeBaseAPI } from 'src/sections/knowledgebase/services/api';
 import { getConnectorPublicUrl } from 'src/sections/accountdetails/account-settings/services/utils/services-configuration-service';
 
 import ChatInput from './components/chat-input';
@@ -566,6 +568,43 @@ const ChatInterface = () => {
   });
   const [showWelcome, setShowWelcome] = useState<boolean>(true);
 
+  // Filters: selected apps and knowledge base IDs (shared with ChatInput)
+  const [selectedApps, setSelectedApps] = useState<string[]>([]);
+  const [selectedKbIds, setSelectedKbIds] = useState<string[]>([]);
+  const [allApps, setAllApps] = useState<Array<{ id: string; name: string; iconPath?: string }>>([]);
+  const [allKBs, setAllKBs] = useState<Array<{ id: string; name: string }>>([]);
+  const { activeConnectors } = useConnectors();
+
+  // Helper to keep latest filters inline without refs
+  const currentFilters = useMemo(() => ({ apps: selectedApps, kb: selectedKbIds }), [selectedApps, selectedKbIds]);
+
+  // Build app sources from connectors
+  useEffect(() => {
+    const connectors = [...(activeConnectors || [])];
+    const apps = connectors.map((c: any) => ({
+      id: (c.name || '').toLowerCase(),
+      name: c.name || '',
+      iconPath: c.iconPath || '/assets/icons/connectors/default.svg',
+    }));
+    // include local KB app selector
+    setAllApps([{ id: 'local', name: 'KB', iconPath: '/assets/icons/connectors/kb.svg' }, ...apps]);
+  }, [activeConnectors]);
+
+  // Load knowledge bases once
+  useEffect(() => {
+    const loadKBs = async () => {
+      try {
+        const data = await KnowledgeBaseAPI.getKnowledgeBases({ page: 1, limit: 100, search: '' });
+        const list = data?.knowledgeBases ?? (Array.isArray(data) ? data : []);
+        setAllKBs(list.map((kb: any) => ({ id: kb.id, name: kb.name })));
+      } catch (e) {
+        console.error('Failed to load knowledge bases:', e);
+        setAllKBs([]);
+      }
+    };
+    loadKBs();
+  }, []);
+
   const [updateTrigger, setUpdateTrigger] = useState(0);
   const forceUpdate = useCallback(() => setUpdateTrigger((prev) => prev + 1), []);
 
@@ -907,7 +946,8 @@ const ChatInterface = () => {
       messageOverride?: string,
       modelKey?: string,
       modelName?: string,
-      chatMode?: string
+      chatMode?: string,
+      filters?: { apps: string[]; kb: string[] }
     ): Promise<void> => {
       const trimmedInput =
         typeof messageOverride === 'string' ? messageOverride.trim() : inputValue.trim();
@@ -942,6 +982,12 @@ const ChatInterface = () => {
         ? `${CONFIG.backendUrl}/api/v1/conversations/stream`
         : `${CONFIG.backendUrl}/api/v1/conversations/${currentConversationId}/messages/stream`;
       try {
+        // If child provided filters, capture them for subsequent messages and UI
+        if (filters) {
+          setSelectedApps(filters.apps || []);
+          setSelectedKbIds(filters.kb || []);
+        }
+
         const createdConversationId = await handleStreamingResponse(
           streamingUrl,
           { 
@@ -949,6 +995,7 @@ const ChatInterface = () => {
             modelKey: selectedModel?.modelKey,
             modelName: selectedModel?.modelName,
             chatMode,
+            filters: filters || currentFilters,
           },
           wasCreatingNewConversation
         );
@@ -972,6 +1019,7 @@ const ChatInterface = () => {
       isNavigationBlocked,
       isCurrentConversationLoading,
       selectedModel,
+      currentFilters,
     ]
   );
 
@@ -986,6 +1034,9 @@ const ChatInterface = () => {
     setShowWelcome(true);
     setSelectedChat(null);
     setIsNavigationBlocked(false);
+    // Reset filters for a fresh chat
+    setSelectedApps([]);
+    setSelectedKbIds([]);
   }, [navigate, streamingManager, currentConversationId, getConversationKey]);
 
   const handleChatSelect = useCallback(
@@ -1009,6 +1060,11 @@ const ChatInterface = () => {
 
         // Hide welcome screen immediately when selecting a chat
         setShowWelcome(false);
+
+        // Decide filter behavior on switching chats.
+        // Since filters are not stored per-conversation, reset to defaults on switch.
+        setSelectedApps([]);
+        setSelectedKbIds([]);
 
         // Update current conversation ID before navigation
         setCurrentConversationId(chat._id);
@@ -1138,6 +1194,12 @@ const ChatInterface = () => {
     streamingManager,
     currentConversationKey,
   ]);
+
+  // Stable handler for filters change passed to children
+  const handleFiltersChange = useCallback((f: { apps: string[]; kb: string[] }) => {
+    setSelectedApps(f?.apps || []);
+    setSelectedKbIds(f?.kb || []);
+  }, []);
 
   // PDF viewer functions
   const resetViewerStates = () => {
@@ -1547,6 +1609,11 @@ const ChatInterface = () => {
                 selectedChatMode={selectedChatMode}
                 onModelChange={setSelectedModel}
                 onChatModeChange={setSelectedChatMode}
+                apps={allApps}
+                knowledgeBases={allKBs}
+                initialSelectedApps={selectedApps}
+                initialSelectedKbIds={selectedKbIds}
+                onFiltersChange={handleFiltersChange}
               />
             ) : (
               <>
@@ -1562,7 +1629,6 @@ const ChatInterface = () => {
                   isStatusVisible={currentConversationStatus.showStatus}
                 />
                 <ChatInput
-                  key={`chat-input-${currentConversationId || 'new'}`}
                   onSubmit={handleSendMessage}
                   isLoading={isCurrentConversationLoading}
                   disabled={isCurrentConversationLoading || isNavigationBlocked}
@@ -1571,6 +1637,11 @@ const ChatInterface = () => {
                   selectedChatMode={selectedChatMode}
                   onModelChange={setSelectedModel}
                   onChatModeChange={setSelectedChatMode}
+                  apps={allApps}
+                  knowledgeBases={allKBs}
+                  initialSelectedApps={selectedApps}
+                  initialSelectedKbIds={selectedKbIds}
+                  onFiltersChange={handleFiltersChange}
                 />
               </>
             )}
