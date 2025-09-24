@@ -5,6 +5,7 @@ from urllib.parse import urlencode
 from pydantic import BaseModel  # type: ignore
 
 from app.config.configuration_service import ConfigurationService
+from app.config.constants.http_status_code import HttpStatusCode
 from app.services.graph_db.interface.graph_db import IGraphService
 from app.sources.client.http.http_client import HTTPClient
 from app.sources.client.http.http_request import HTTPRequest
@@ -188,9 +189,13 @@ class AirtableRESTClientViaOAuth(HTTPClient):
             body=data
         )
 
-        async with HTTPClient(token="") as client:
-            response = await client.execute(request)
-            token_data = response.json()
+        response = await self.execute(request)
+
+        # Check response status before parsing JSON
+        if response.status >= HttpStatusCode.BAD_REQUEST.value:
+            raise Exception(f"Token request failed with status {response.status}: {response.text}")
+
+        token_data = response.json()
 
         self.access_token = token_data.get("access_token")
 
