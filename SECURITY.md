@@ -34,7 +34,7 @@ When reporting a vulnerability, please include:
 - **Day 1-2**: Initial acknowledgment
 - **Day 1-5**: Initial triage and impact assessment
 - **Day 1-30**: Development and testing of fix
-- **Day 30+**: Public disclosure after fix is deployed
+- **Day 30+**: Public disclosure after the fix is deployed, typically within 90 days of the initial report.
 
 ### Vulnerability Assessment
 
