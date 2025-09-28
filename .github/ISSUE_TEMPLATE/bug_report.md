@@ -1,8 +1,8 @@
 ---
 name: Bug report
 about: Create a report to help us improve
-title: ''
-labels: ''
+title: '[BUG]'
+labels: 'bug'
 assignees: ''
 
 ---
@@ -23,10 +23,13 @@ A clear and concise description of what you expected to happen.
 **Screenshots**
 If applicable, add screenshots to help explain your problem.
 
-**Desktop (please complete the following information):**
- - Commit Id [e.g. 16fef8c3b3323c3af3a80f9291bcddc45e08b5c2] 
-Here: https://github.com/pipeshub-ai/pipeshub-ai/commits/main/
-
+**Environment (please complete the following information):**
+ - OS: [e.g. Ubuntu 22.04, macOS Sonoma, Windows 11]
+ - Browser (if applicable): [e.g. Chrome, Firefox]
+ - Version/Commit ID: [e.g. v1.0.0 or `16fef8c`]
+ 
+**Related issues**
+Please link to any related issues.
 
 **Additional context**
 Add any other context about the problem here.
