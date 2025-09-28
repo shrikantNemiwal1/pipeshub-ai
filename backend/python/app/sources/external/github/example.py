@@ -1,11 +1,12 @@
-# ruff: noqa: E501
+# ruff: noqa
 
 import os
 
-from dotenv import load_dotenv
+from dotenv import load_dotenv # type: ignore
 
 from app.sources.client.github.github import GitHubClient, GitHubConfig
-from app.sources.external.github.github_ import GitHubDataSource
+from app.sources.external.github.github_ import GitHubDataSource, GitHubResponse
+from github.AuthenticatedUser import AuthenticatedUser # type: ignore
 
 
 def print_result(title: str, res) -> None:
@@ -28,16 +29,55 @@ def main() -> None:
     client = GitHubClient.build_with_config(GitHubConfig(token=token))
     ds = GitHubDataSource(client)
 
-    # Public fixtures (exist on GitHub)
-    user_login = "octocat"
-    owner = "octocat"
-    repo = "Hello-World"
-
     # Authenticated user
-    auth_res = ds.get_authenticated()
+    auth_res: GitHubResponse[AuthenticatedUser] = ds.get_authenticated()
     print_result("Authenticated User", auth_res)
+    
+    print("\n=== GitHubResponse Fields ===")
+    print(f"success: {auth_res.success}")
+    print(f"data: {auth_res.data}")
+    print(f"error: {auth_res.error}")
+    print(f"message: {auth_res.message}")
+    
     if auth_res.success and auth_res.data:
-        print("login:", auth_res.data.login)
+        print("\n=== AuthenticatedUser Fields ===")
+        user = auth_res.data
+        
+        # List of possible fields to check
+        fields_to_check = [
+            'login', 'id', 'node_id', 'avatar_url', 'gravatar_id', 'url', 'html_url',
+            'followers_url', 'following_url', 'gists_url', 'starred_url', 'subscriptions_url',
+            'organizations_url', 'repos_url', 'events_url', 'received_events_url', 'type',
+            'site_admin', 'name', 'company', 'blog', 'location', 'email', 'hireable', 'bio',
+            'twitter_username', 'public_repos', 'public_gists', 'followers', 'following',
+            'created_at', 'updated_at', 'private_gists', 'total_private_repos', 'owned_private_repos',
+            'disk_usage', 'collaborators', 'two_factor_authentication', 'plan'
+        ]
+        
+        for field in fields_to_check:
+            try:
+                value = getattr(user, field, None)
+                print(f"{field}: {value}")
+            except AttributeError:
+                print(f"{field}: <AttributeError - field not available>")
+        
+        # Print plan details if available
+        if hasattr(user, 'plan') and user.plan:
+            print(f"\n=== Plan Details ===")
+            plan_fields = ['name', 'space', 'private_repos', 'collaborators']
+            for field in plan_fields:
+                try:
+                    value = getattr(user.plan, field, None)
+                    print(f"  plan.{field}: {value}")
+                except AttributeError:
+                    print(f"  plan.{field}: <AttributeError - field not available>")
+    
+    print("\n****************************")
+
+    # Extract user_login, owner, and repo from authenticated user data
+    user_login = auth_res.data.login
+    owner = user_login  # Use the same user as owner
+    repo = "pipeshub-ai"  # Use this repository for testing, fork this repository to your account and give a star :D
 
     # Fetch a specific user
     user_res = ds.get_user(user_login)
@@ -90,12 +130,26 @@ def main() -> None:
     rate_res = ds.get_rate_limit()
     print_result("Rate Limit", rate_res)
 
-    # Safe example for creating an issue (commented out)
-    # Note: Only works if you have write access to the repo
-
-    # create_issue_res = ds.create_issue("uncleSlayer", "file_keeper", "Test issue from API", "This is a body")
-    # print_result("Create Issue", create_issue_res)
-
+    # List pending invitations
+    invitations_res = ds.list_pending_invitations(owner, repo)
+    print_result("List Pending Invitations", invitations_res)
+    if invitations_res.success:
+        names = [i.login for i in (invitations_res.data or [])]
+        print("invitations:", names)
+    
+    # List Dependabot alerts
+    alerts_res = ds.list_dependabot_alerts(owner, repo)
+    print_result("List Dependabot Alerts", alerts_res)
+    if alerts_res.success:
+        names = [a.number for a in (alerts_res.data or [])]
+        print("alerts:", names)
+        
+    # Get Dependabot alert
+    alert_res = ds.get_dependabot_alert(owner, repo, 1)
+    print_result("Get Dependabot Alert", alert_res)
+    if alert_res.success:
+        print("alert:", alert_res.data)
+        
 
 if __name__ == "__main__":
     main()

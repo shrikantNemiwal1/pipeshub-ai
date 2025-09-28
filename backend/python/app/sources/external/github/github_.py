@@ -1,37 +1,37 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import List
 
-from github import Github
-from github.AuthenticatedUser import AuthenticatedUser
-from github.Branch import Branch
-from github.Commit import Commit
-from github.ContentFile import ContentFile
-from github.Deployment import Deployment
-from github.DeploymentStatus import DeploymentStatus
-from github.GitBlob import GitBlob
-from github.GitRef import GitRef
-from github.GitRelease import GitRelease
-from github.GitTag import GitTag
-from github.GitTree import GitTree
-from github.Hook import Hook
-from github.Issue import Issue
-from github.IssueComment import IssueComment
-from github.Label import Label
-from github.NamedUser import NamedUser
-from github.Organization import Organization
-from github.PullRequest import PullRequest
-from github.RateLimit import RateLimit
-from github.Repository import Repository
-from github.Tag import Tag
-from github.Team import Team
-from github.Workflow import Workflow
-from github.WorkflowRun import WorkflowRun
+from github import (
+    Github,  # type: ignore
+    Invitation,  # type: ignore
+)
+from github.AuthenticatedUser import AuthenticatedUser  # type: ignore
+from github.Branch import Branch  # type: ignore
+from github.Commit import Commit  # type: ignore
+from github.ContentFile import ContentFile  # type: ignore
+from github.Deployment import Deployment  # type: ignore
+from github.DeploymentStatus import DeploymentStatus  # type: ignore
+from github.GitBlob import GitBlob  # type: ignore
+from github.GitRef import GitRef  # type: ignore
+from github.GitRelease import GitRelease  # type: ignore
+from github.GitTag import GitTag  # type: ignore
+from github.GitTree import GitTree  # type: ignore
+from github.Hook import Hook  # type: ignore
+from github.Issue import Issue  # type: ignore
+from github.IssueComment import IssueComment  # type: ignore
+from github.Label import Label  # type: ignore
+from github.NamedUser import NamedUser  # type: ignore
+from github.Organization import Organization  # type: ignore
+from github.PullRequest import PullRequest  # type: ignore
+from github.RateLimit import RateLimit  # type: ignore
+from github.Repository import Repository  # type: ignore
+from github.Tag import Tag  # type: ignore
+from github.Team import Team  # type: ignore
+from github.Workflow import Workflow  # type: ignore
+from github.WorkflowRun import WorkflowRun  # type: ignore
 
-# from github.RepositoryTopic import RepositoryTopic
-# from github.RepositoryInvitation import RepositoryInvitation
-# from github.RepositoryAdvisory import RepositoryAdvisory
-# from github.DependabotAlert import DependabotAler
 from app.sources.client.github.github import GitHubResponse
 
 
@@ -694,15 +694,14 @@ class GitHubDataSource:
         except Exception as e:
             return GitHubResponse(success=False, error=str(e))
 
-    # Manually removed as the generated code was not working
-    # def list_pending_invitations(self, owner: str, repo: str) -> GitHubResponse[List[RepositoryInvitation]]:
-    #     """List pending repo invitations."""
-    #     try:
-    #         r = self._repo(owner, repo)
-    #         inv = list(r.get_pending_invitations())
-    #         return GitHubResponse(success=True, data=inv)
-    #     except Exception as e:
-    #         return GitHubResponse(success=False, error=str(e))
+    def list_pending_invitations(self, owner: str, repo: str) -> GitHubResponse[List[Invitation]]:
+        """List pending repo invitations."""
+        try:
+            r = self._repo(owner, repo)
+            inv = list(r.get_pending_invitations())
+            return GitHubResponse(success=True, data=inv)
+        except Exception as e:
+            return GitHubResponse(success=False, error=str(e))
 
 
     def remove_invitation(self, owner: str, repo: str, invitation_id: int) -> GitHubResponse[bool]:
@@ -715,26 +714,26 @@ class GitHubDataSource:
             return GitHubResponse(success=False, error=str(e))
 
 
-    # Manually removed as the generated code was not working
-    # def list_dependabot_alerts(self, owner: str, repo: str) -> GitHubResponse[List[DependabotAlert]]:
-    #     """List Dependabot alerts for a repo."""
-    #     try:
-    #         r = self._repo(owner, repo)
-    #         alerts = list(r.get_dependabot_alerts())
-    #         return GitHubResponse(success=True, data=alerts)
-    #     except Exception as e:
-    #         return GitHubResponse(success=False, error=str(e))
+    # DependabotAlert not available in older PyGithub versions
+    def list_dependabot_alerts(self, owner: str, repo: str) -> GitHubResponse[List[object]]:
+        """List Dependabot alerts for a repo."""
+        try:
+            r = self._repo(owner, repo)
+            alerts = list(r.get_dependabot_alerts())
+            return GitHubResponse(success=True, data=alerts)
+        except Exception as e:
+            return GitHubResponse(success=False, error=str(e))
 
 
-    # Manually removed as the generated code was not working
-    # def get_dependabot_alert(self, owner: str, repo: str, alert_number: int) -> GitHubResponse[DependabotAlert]:
-    #     """Get a single Dependabot alert."""
-    #     try:
-    #         r = self._repo(owner, repo)
-    #         alert = r.get_dependabot_alert(alert_number)
-    #         return GitHubResponse(success=True, data=alert)
-    #     except Exception as e:
-    #         return GitHubResponse(success=False, error=str(e))
+    # DependabotAlert not available in older PyGithub versions
+    def get_dependabot_alert(self, owner: str, repo: str, alert_number: int) -> GitHubResponse[object]:
+        """Get a single Dependabot alert."""
+        try:
+            r = self._repo(owner, repo)
+            alert = r.get_dependabot_alert(alert_number)
+            return GitHubResponse(success=True, data=alert)
+        except Exception as e:
+            return GitHubResponse(success=False, error=str(e))
 
 
     def create_git_ref(self, owner: str, repo: str, ref: str, sha: str) -> GitHubResponse[GitRef]:
