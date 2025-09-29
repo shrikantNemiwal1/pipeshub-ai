@@ -22,12 +22,18 @@ from app.config.constants.service import config_node_constants
 from app.exceptions.embedding_exceptions import EmbeddingModelCreationError
 from app.exceptions.fastapi_responses import Status
 from app.exceptions.indexing_exceptions import IndexingError
+from app.models.blocks import GroupType
 from app.modules.retrieval.retrieval_arango import ArangoService
+from app.modules.transformers.blob_storage import BlobStorage
 from app.services.vector_db.interface.vector_db import IVectorDBService
 from app.utils.aimodels import (
     get_default_embedding_model,
     get_embedding_model,
     get_generator_model,
+)
+from app.utils.chat_helpers import (
+    get_flattened_results,
+    get_record,
 )
 from app.utils.mimetype_to_extension import get_extension_from_mimetype
 
@@ -40,6 +46,7 @@ class RetrievalService:
         collection_name: str,
         vector_db_service: IVectorDBService,
         arango_service: ArangoService,
+        blob_store: BlobStorage,
     ) -> None:
         """
         Initialize the retrieval service with necessary configurations.
@@ -54,7 +61,7 @@ class RetrievalService:
         self.config_service = config_service
         self.llm = None
         self.arango_service = arango_service
-
+        self.blob_store = blob_store
         # Initialize sparse embeddings
         try:
             self.sparse_embeddings = FastEmbedSparse(model_name="Qdrant/BM25")
@@ -232,6 +239,7 @@ class RetrievalService:
         filter_groups: Optional[Dict[str, List[str]]] = None,
         limit: int = 20,
         arango_service: Optional[ArangoService] = None,
+        knowledge_search:bool = False,
     ) -> Dict[str, Any]:
         """Perform semantic search on accessible records with multiple queries."""
 
@@ -288,7 +296,6 @@ class RetrievalService:
             virtual_record_ids = []
             for idx, result in enumerate(search_results):
                 try:
-                    self.logger.debug(f"Processing search result {idx}: type={type(result)}, value={result}")
                     if result and isinstance(result, dict) and result.get("metadata"):
                         virtual_id = result["metadata"].get("virtualRecordId")
                         if virtual_id is not None:
@@ -318,6 +325,9 @@ class RetrievalService:
             self.logger.info(f"Unique record IDs count: {len(unique_record_ids)}")
 
             # Replace virtualRecordId with first accessible record ID in search results
+            virtual_record_id_to_record = {}
+            new_type_results = []
+            final_search_results = []
             for result in search_results:
                 if not result or not isinstance(result, dict):
                     continue
@@ -335,7 +345,6 @@ class RetrievalService:
                     # FIX: Add null check for r before accessing r["_key"]
                     record = next((r for r in accessible_records if r and r.get("_key") == record_id), None)
                     if record:
-
                         result["metadata"]["origin"] = record.get("origin")
                         result["metadata"]["connector"] = record.get("connectorName", None)
                         result["metadata"]["kbId"] = record.get("kbId", None)
@@ -350,7 +359,6 @@ class RetrievalService:
                         ext =  get_extension_from_mimetype(record.get("mimeType"))
                         if ext:
                             result["metadata"]["extension"] = ext
-
 
                         # Fetch additional file URL if needed
                         if not weburl and record.get("recordType", "") == RecordTypes.FILE.value:
@@ -384,6 +392,41 @@ class RetrievalService:
                             except Exception as e:
                                 self.logger.warning(f"Failed to fetch mail document for {record_id}: {str(e)}")
 
+                        if knowledge_search:
+                            meta = result.get("metadata")
+                            is_block_group = meta.get("isBlockGroup")
+                            if is_block_group is not None:
+                                if virtual_id not in virtual_record_id_to_record:
+                                    await get_record(meta,virtual_id,virtual_record_id_to_record,self.blob_store,org_id)
+
+                                record = virtual_record_id_to_record[virtual_id]
+                                if record is None:
+                                    continue
+                                new_type_results.append(result)
+                                continue
+
+                final_search_results.append(result)
+
+            if new_type_results:
+                is_multimodal_llm = False   #doesn't matter for retrieval service
+                flattened_results = await get_flattened_results(new_type_results,self.blob_store,org_id,is_multimodal_llm,virtual_record_id_to_record,from_retrieval_service=True)
+                for result in flattened_results:
+                    block_type = result.get("block_type")
+                    if block_type == GroupType.TABLE.value:
+                        _,child_results = result.get("content")
+                        for child in child_results:
+                            final_search_results.append(child)
+                    else:
+                        final_search_results.append(result)
+
+                final_search_results = sorted(
+                    final_search_results,
+                    key=lambda x: x.get("score") or 0,
+                    reverse=True,
+                )
+
+
+
             # Get full record documents from Arango
             records = []
             if unique_record_ids:
@@ -394,10 +437,12 @@ class RetrievalService:
                         records.append(record)
 
             # Filter out incomplete results to prevent citation validation failures
-            required_fields = ['origin', 'recordName', 'recordId', 'mimeType']
+            required_fields = ['origin', 'recordName', 'recordId', 'mimeType',"orgId"]
             complete_results = []
 
-            for result in search_results:
+            for result in final_search_results:
+                if result.get("content") is None or result.get("content") == "":
+                    continue
                 metadata = result.get('metadata', {})
                 if all(field in metadata and metadata[field] is not None for field in required_fields):
                     complete_results.append(result)
@@ -405,7 +450,6 @@ class RetrievalService:
                     self.logger.warning(f"Filtering out result with incomplete metadata. Virtual ID: {metadata.get('virtualRecordId')}, Missing fields: {[f for f in required_fields if f not in metadata]}")
 
             search_results = complete_results
-
             if search_results or records:
                 response_data = {
                     "searchResults": search_results,
