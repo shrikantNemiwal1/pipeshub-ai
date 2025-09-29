@@ -117,7 +117,6 @@ Beyond search, our platform allows enterprises to create custom apps and AI agen
 <img src="https://raw.githubusercontent.com/pipeshub-ai/documentation/refs/heads/main/logo/gmeet.png" alt="Google Meet" width="50" height="50">
 <img src="https://raw.githubusercontent.com/pipeshub-ai/documentation/refs/heads/main/logo/one-drive.png" alt="OneDrive" width="50" height="50">&nbsp;&nbsp;&nbsp;
 <img src="https://raw.githubusercontent.com/pipeshub-ai/documentation/refs/heads/main/logo/sharepoint.png" alt="SharePoint Online" width="50" height="50">&nbsp;&nbsp;&nbsp;
-<img src="https://raw.githubusercontent.com/pipeshub-ai/documentation/refs/heads/main/logo/outlook.png" alt="Outlook" width="50" height="50">&nbsp;&nbsp;&nbsp;
 <img src="https://raw.githubusercontent.com/pipeshub-ai/documentation/refs/heads/main/logo/outlook.png" alt="Outlook Calendar" width="50" height="50">&nbsp;&nbsp;&nbsp;
 <img src="https://raw.githubusercontent.com/pipeshub-ai/documentation/refs/heads/main/logo/teams.png" alt="Microsoft Teams" width="50" height="50">&nbsp;&nbsp;&nbsp;
 <img src="https://raw.githubusercontent.com/pipeshub-ai/documentation/refs/heads/main/logo/one-note.png" alt="OneNote" width="50" height="50">
