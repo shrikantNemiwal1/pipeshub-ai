@@ -35,6 +35,7 @@ dependencies = [
     "fastapi==0.115.6",
     "fastembed==0.5.1",
     "PyGithub==2.8.1",
+    "python-gitlab==6.4.0",
     "google-api-python-client==2.161.0",
     "google-auth-oauthlib==1.2.1",
     "Jinja2==3.1.6",
