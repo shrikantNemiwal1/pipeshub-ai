@@ -127,6 +127,7 @@ Beyond search, our platform allows enterprises to create custom apps and AI agen
 <img src="https://raw.githubusercontent.com/pipeshub-ai/documentation/refs/heads/main/logo/dropbox.png" alt="Dropbox" width="50" height="50">
 <img src="https://raw.githubusercontent.com/pipeshub-ai/documentation/refs/heads/main/logo/linear.png" alt="Linear" width="50" height="50">
 <img src="https://raw.githubusercontent.com/pipeshub-ai/documentation/refs/heads/main/logo/github.png" alt="GitHub" width="50" height="50">
+<img src="https://raw.githubusercontent.com/pipeshub-ai/documentation/refs/heads/main/logo/gitlab.png" alt="GitLab" width="50" height="50">
 <img src="https://raw.githubusercontent.com/pipeshub-ai/documentation/refs/heads/main/logo/zendesk.png" alt="Zendesk" width="50" height="50">
 <img src="https://raw.githubusercontent.com/pipeshub-ai/documentation/refs/heads/main/logo/airtable.png" alt="Airtable" width="50" height="50">
 <img src="https://raw.githubusercontent.com/pipeshub-ai/documentation/refs/heads/main/logo/s3.png" alt="S3" width="50" height="50">
