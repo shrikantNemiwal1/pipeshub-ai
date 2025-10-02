@@ -1,8 +1,11 @@
+import logging
 from typing import Any, Optional
 
 from github import Auth, Github
 from pydantic import BaseModel, Field  # type: ignore
 
+from app.config.configuration_service import ConfigurationService
+from app.services.graph_db.interface.graph_db import IGraphService
 from app.sources.client.iclient import IClient
 
 
@@ -14,8 +17,8 @@ class GitHubResponse:
     error: str | None = None
     message: str | None = None
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+    def to_dict(self) -> dict[str, Any]:  # type: ignore
+        return self.model_dump()
 
 
 # Auth holder clients
@@ -59,11 +62,12 @@ class GitHubClientViaToken:
 @dataclass
 class GitHubConfig:
     token: str
-    base_url: str | None = (
-        None  # e.g. "https://ghe.example.com/api/v3" for GH Enterprise
+    base_url: Optional[str] = Field(
+        default=None,
+        description='e.g. "https://ghe.example.com/api/v3" for GH Enterprise',
     )
-    timeout: float | None = None
-    per_page: int | None = None
+    timeout: Optional[float] = None
+    per_page: Optional[int] = None
 
     def create_client(self) -> GitHubClientViaToken:
         return GitHubClientViaToken(
@@ -92,3 +96,26 @@ class GitHubClient(IClient):
         client = config.create_client()
         client.create_client()
         return cls(client)
+
+    @classmethod
+    async def build_from_services(
+        cls,
+        logger: logging.Logger,
+        config_service: ConfigurationService,
+        graph_db_service: IGraphService,
+    ) -> "GitHubClient":
+        """Build GitHubClient using configuration service and graph database service
+        Args:
+            logger: Logger instance
+            config_service: Configuration service instance
+            graph_db_service: Graph database service instance
+        Returns:
+            GitHubClient instance
+        """
+        # TODO: Implement - fetch config from services
+        # This would typically:
+        # 1. Query graph_db_service for stored GitHub credentials
+        # 2. Use config_service to get environment-specific settings
+        # 3. Return appropriate client based on available credentials (token)
+
+        return cls(client=None)  # type: ignore
