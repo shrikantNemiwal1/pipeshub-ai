@@ -11037,7 +11037,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         # Indexing status filter
         if indexing_status:
             bind_vars["indexing_status"] = indexing_status
-            filter_conditions.append("(node.indexingStatus == null OR node.indexingStatus IN @indexing_status)")
+            filter_conditions.append("(node.indexingStatus != null AND node.indexingStatus IN @indexing_status)")
 
         # Created date filter
         if created_at:
@@ -12043,7 +12043,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         # Indexing status filter
         if indexing_status:
             bind_vars["indexing_status"] = indexing_status
-            filter_conditions.append("(node.indexingStatus == null OR node.indexingStatus IN @indexing_status)")
+            filter_conditions.append("(node.indexingStatus != null AND node.indexingStatus IN @indexing_status)")
 
         # Created date filter
         if created_at:
