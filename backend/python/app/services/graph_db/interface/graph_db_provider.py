@@ -2887,16 +2887,6 @@ class IGraphDBProvider(ABC):
         limit: int,
         sort_field: str,
         sort_dir: str,
-        search_query: Optional[str] = None,
-        node_types: Optional[List[str]] = None,
-        record_types: Optional[List[str]] = None,
-        origins: Optional[List[str]] = None,
-        connector_ids: Optional[List[str]] = None,
-        kb_ids: Optional[List[str]] = None,
-        indexing_status: Optional[List[str]] = None,
-        created_at: Optional[Dict[str, Optional[int]]] = None,
-        updated_at: Optional[Dict[str, Optional[int]]] = None,
-        size: Optional[Dict[str, Optional[int]]] = None,
         only_containers: bool = False,
         transaction: Optional[str] = None
     ) -> Dict[str, Any]:
@@ -2914,16 +2904,6 @@ class IGraphDBProvider(ABC):
             limit: Maximum number of items to return
             sort_field: Field to sort by
             sort_dir: Sort direction ('ASC' or 'DESC')
-            search_query: Optional search query to filter by name
-            node_types: Optional list of node types to filter by
-            record_types: Optional list of record types to filter by
-            origins: Optional list of origins to filter by (KB/CONNECTOR)
-            connector_ids: Optional list of connector IDs to filter by
-            kb_ids: Optional list of KB IDs to filter by
-            indexing_status: Optional list of indexing statuses to filter by
-            created_at: Optional date range filter for creation date
-            updated_at: Optional date range filter for update date
-            size: Optional size range filter
             only_containers: If True, only return nodes that can have children
             transaction: Optional transaction ID
 

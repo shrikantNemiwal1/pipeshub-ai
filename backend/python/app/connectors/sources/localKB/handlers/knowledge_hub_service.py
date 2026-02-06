@@ -407,7 +407,6 @@ class KnowledgeHubService:
         sort_field = sort_field_map.get(sort_by, "name")
         sort_dir = "ASC" if sort_order.lower() == "asc" else "DESC"
 
-        # Use unified provider method - pass structured parameters directly
         result = await self.graph_provider.get_knowledge_hub_children(
             parent_id=parent_id,
             parent_type=parent_type,
@@ -417,16 +416,6 @@ class KnowledgeHubService:
             limit=limit,
             sort_field=sort_field,
             sort_dir=sort_dir,
-            search_query=q,
-            node_types=node_types,
-            record_types=record_types,
-            origins=origins,
-            connector_ids=connector_ids,
-            kb_ids=kb_ids,
-            indexing_status=indexing_status,
-            created_at=created_at,
-            updated_at=updated_at,
-            size=size,
             only_containers=only_containers,
         )
 
