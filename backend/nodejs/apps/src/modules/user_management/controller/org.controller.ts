@@ -21,23 +21,17 @@ import {
   BadRequestError,
   InternalServerError,
   NotFoundError,
+  ServiceUnavailableError,
 } from '../../../libs/errors/http.errors';
 import { Logger } from '../../../libs/services/logger.service';
 import { ContainerRequest } from '../../auth/middlewares/types';
-import {
-  EntitiesEventProducer,
-  Event,
-  EventType,
-  OrgAddedEvent,
-  OrgDeletedEvent,
-  OrgUpdatedEvent,
-  UserAddedEvent,
-} from '../services/entity_events.service';
 import { mailJwtGenerator } from '../../../libs/utils/createJwt';
 import { AppConfig } from '../../tokens_manager/config/config';
 import { PrometheusService } from '../../../libs/services/prometheus/prometheus.service';
 import { HTTP_STATUS } from '../../../libs/enums/http-status.enum';
 import { ORG_CREATED_ACTIVITY } from '../constants/constants';
+import axios from 'axios';
+import { graphDbServiceJwtGenerator } from '../../../libs/utils/createJwt';
 
 @injectable()
 export class OrgController {
@@ -45,8 +39,6 @@ export class OrgController {
     @inject('AppConfig') private config: AppConfig,
     @inject('MailService') private mailService: MailService,
     @inject('Logger') private logger: Logger,
-    @inject('EntitiesEventProducer')
-    private eventService: EntitiesEventProducer,
   ) {}
 
   getDomainFromEmail(email: string) {
@@ -263,6 +255,78 @@ export class OrgController {
         await adminUserCredentials.save();
         await org.save();
       }
+      
+      this.logger.debug('Organization and admin user created in MongoDB', {
+        orgId: org._id,
+        adminUserId: adminUser._id,
+      });
+
+      // Synchronously create organization and admin user in graph database
+      try {
+        const graphToken = graphDbServiceJwtGenerator(
+          org._id.toString(),
+          this.config.scopedJwtSecret
+        );
+        
+        const authHeaders = {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${graphToken}`,
+        };
+        
+        // Create org in graph database (includes KB connector setup)
+        // Increased timeout to 30s - KB connector initialization takes time
+        await axios.post(
+          `${this.config.connectorBackend}/api/v1/connectors/graph/org`,
+          {
+            orgId: org._id.toString(),
+            registeredName: org.registeredName,
+            accountType: org.accountType,
+            userId: adminUser._id.toString(), // Admin user who created org
+          },
+          { timeout: 30000, headers: authHeaders }
+        );
+        this.logger.debug('Organization created in graph database with KB connector', { orgId: org._id });
+
+        // Create admin user in graph database (includes default KB, permissions)
+        // Increased timeout to 30s - KB creation + permissions setup takes time
+        await axios.post(
+          `${this.config.connectorBackend}/api/v1/connectors/graph/user`,
+          {
+            userId: adminUser._id.toString(),
+            orgId: org._id.toString(),
+            fullName: adminUser.fullName,
+            email: adminUser.email,
+            firstName: adminUser.firstName,
+            lastName: adminUser.lastName,
+            syncAction: 'none', // Don't trigger immediate sync on org creation
+          },
+          { timeout: 30000, headers: authHeaders }
+        );
+        this.logger.debug('Admin user created in graph database with KB and permissions', { userId: adminUser._id });
+      } catch (graphError: any) {
+        // Rollback: Delete everything from MongoDB
+        this.logger.error('Failed to create org/user in graph database, rolling back', {
+          orgId: org._id,
+          adminUserId: adminUser._id,
+          error: graphError.message,
+        });
+
+        if (rsAvailable && session) {
+          await session.abortTransaction();
+        }
+        
+        // Delete all created MongoDB documents
+        await Org.deleteOne({ _id: org._id });
+        await Users.deleteOne({ _id: adminUser._id });
+        await UserGroups.deleteMany({ orgId: org._id });
+        await UserCredentials.deleteOne({ userId: adminUser._id });
+        await OrgAuthConfig.deleteOne({ orgId: org._id });
+        
+        throw new ServiceUnavailableError(
+          'Connector service is unavailable. Please try again later.'
+        );
+      }
+
       prometheusService.recordActivity(
         ORG_CREATED_ACTIVITY,
         adminUser._id?.toString(),
@@ -296,32 +360,6 @@ export class OrgController {
         });
       }
 
-      await this.eventService.start();
-      let event: Event = {
-        eventType: EventType.OrgCreatedEvent,
-        timestamp: Date.now(),
-        payload: {
-          orgId: org._id,
-          accountType: org.accountType,
-          registeredName: org.registeredName,
-        } as OrgAddedEvent,
-      };
-      await this.eventService.publishEvent(event);
-
-      event = {
-        eventType: EventType.NewUserEvent,
-        timestamp: Date.now(),
-        payload: {
-          orgId: adminUser.orgId.toString(),
-          userId: adminUser._id,
-          fullName: adminUser.fullName,
-          email: adminUser.email,
-          syncAction: 'none',
-        } as UserAddedEvent,
-      };
-      await this.eventService.publishEvent(event);
-
-      await this.eventService.stop();
       res.status(200).json(org);
     } catch (error) {
       throw new InternalServerError(
@@ -394,18 +432,7 @@ export class OrgController {
         new: true,
       });
 
-      await this.eventService.start();
-      let event: Event = {
-        eventType: EventType.OrgUpdatedEvent,
-        timestamp: Date.now(),
-        payload: {
-          orgId: org._id,
-          registeredName: org.registeredName,
-        } as OrgUpdatedEvent,
-      };
-      await this.eventService.publishEvent(event);
-
-      await this.eventService.stop();
+      // No event publishing needed - org update is synchronous
 
       res.status(200).json({
         message: 'Organization updated successfully',
@@ -434,17 +461,7 @@ export class OrgController {
       org.isDeleted = true;
       await org.save();
 
-      await this.eventService.start();
-      let event: Event = {
-        eventType: EventType.OrgDeletedEvent,
-        timestamp: Date.now(),
-        payload: {
-          orgId: org._id,
-        } as OrgDeletedEvent,
-      };
-      await this.eventService.publishEvent(event);
-
-      await this.eventService.stop();
+      // No event publishing needed - org deletion is synchronous
 
       res.status(200).json({
         message: 'Organization marked as deleted successfully',

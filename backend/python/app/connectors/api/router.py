@@ -1600,6 +1600,182 @@ async def reindex_record_group(
             detail=f"Internal server error while reindexing record group: {str(e)}"
         )
 
+@router.post("/api/v1/connectors/reindex-failed")
+@inject
+async def reindex_failed_records(
+    request: Request,
+    kafka_service: KafkaService = Depends(get_kafka_service),
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider),
+) -> Dict:
+    """
+    Reindex all failed records for a connector by publishing a Kafka sync event.
+    
+    Request body should contain:
+    - connectorId: str - The connector ID
+    - app: str - The app/connector name
+    - orgId: str - The organization ID
+    """
+    try:
+        container = request.app.container
+        logger = container.logger()
+        user_id = request.state.user.get("userId")
+        org_id = request.state.user.get("orgId")
+        
+        # Parse request body
+        body = await request.json()
+        connector_id = body.get("connectorId")
+        app = body.get("app")
+        request_org_id = body.get("orgId")
+        
+        if not connector_id or not app or not request_org_id:
+            raise HTTPException(
+                status_code=400,
+                detail="connectorId, app, and orgId are required"
+            )
+        
+        logger.info(f"🔄 Reindexing failed records for connector {connector_id} (app: {app})")
+        
+        # Validate connector exists and user has access
+        # We'll use a simple check - the connector should exist in the connectors collection
+        result = await graph_provider.get_connector_instance(
+            connector_id=connector_id,
+            user_id=user_id,
+            org_id=org_id
+        )
+        
+        if not result.get("success"):
+            logger.error(f"❌ Connector not found or access denied: {connector_id}")
+            raise HTTPException(
+                status_code=404,
+                detail="Connector not found or you don't have access"
+            )
+        
+        # Publish to sync-events topic
+        connector_normalized = app.replace(' ', '').lower()
+        event_type = f"{connector_normalized}.reindex"
+        
+        payload = {
+            "orgId": request_org_id,
+            "connector": connector_normalized,
+            "connectorId": connector_id,
+            "statusFilters": ["FAILED"]
+        }
+        
+        timestamp = get_epoch_timestamp_in_ms()
+        event = {
+            "eventType": event_type,
+            "timestamp": timestamp,
+            "payload": payload
+        }
+        
+        await kafka_service.publish_event("sync-events", event)
+        logger.info(f"✅ Published {event_type} event for connector {connector_id}")
+        
+        return {
+            "success": True,
+            "message": f"Reindex initiated for failed records in connector {connector_id}",
+            "connectorId": connector_id,
+            "eventPublished": True
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error reindexing failed records: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error while reindexing failed records: {str(e)}"
+        )
+
+@router.post("/api/v1/connectors/resync")
+@inject
+async def resync_connector_records(
+    request: Request,
+    kafka_service: KafkaService = Depends(get_kafka_service),
+    graph_provider: IGraphDBProvider = Depends(get_graph_provider),
+) -> Dict:
+    """
+    Resync all records for a connector by publishing a Kafka sync event.
+    
+    Request body should contain:
+    - connectorId: str - The connector ID
+    - connectorName: str - The connector name
+    - orgId: str - The organization ID
+    """
+    try:
+        container = request.app.container
+        logger = container.logger()
+        user_id = request.state.user.get("userId")
+        org_id = request.state.user.get("orgId")
+        
+        # Parse request body
+        body = await request.json()
+        connector_id = body.get("connectorId")
+        connector_name = body.get("connectorName")
+        request_org_id = body.get("orgId")
+        
+        if not connector_id or not connector_name or not request_org_id:
+            raise HTTPException(
+                status_code=400,
+                detail="connectorId, connectorName, and orgId are required"
+            )
+        
+        logger.info(f"🔄 Resyncing connector {connector_id} (name: {connector_name})")
+        
+        # Validate connector exists and user has access
+        result = await graph_provider.get_connector_instance(
+            connector_id=connector_id,
+            user_id=user_id,
+            org_id=org_id
+        )
+        
+        if not result.get("success"):
+            logger.error(f"❌ Connector not found or access denied: {connector_id}")
+            raise HTTPException(
+                status_code=404,
+                detail="Connector not found or you don't have access"
+            )
+        
+        # Publish to sync-events topic
+        connector_normalized = connector_name.replace(' ', '').lower()
+        event_type = f"{connector_normalized}.resync"
+        
+        timestamp = get_epoch_timestamp_in_ms()
+        payload = {
+            "orgId": request_org_id,
+            "connector": connector_name,
+            "connectorId": connector_id,
+            "origin": "manual",
+            "createdAtTimestamp": str(timestamp),
+            "updatedAtTimestamp": str(timestamp),
+            "sourceCreatedAtTimestamp": str(timestamp)
+        }
+        
+        event = {
+            "eventType": event_type,
+            "timestamp": timestamp,
+            "payload": payload
+        }
+        
+        await kafka_service.publish_event("sync-events", event)
+        logger.info(f"✅ Published {event_type} event for connector {connector_id}")
+        
+        return {
+            "success": True,
+            "message": f"Resync initiated for connector {connector_id}",
+            "connectorId": connector_id,
+            "eventPublished": True
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Error resyncing connector: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Internal server error while resyncing connector: {str(e)}"
+        )
+
 def _validate_connector_deletion_permissions(
     instance: Dict[str, Any],
     user_id: str,
@@ -3192,13 +3368,8 @@ async def update_connector_instance_filters_sync_config(
         # Trim whitespace from config values before processing
         body = _trim_connector_config(body)
 
-        # Validation: Connector must be disabled
-        if instance.get("isActive"):
-            logger.error("Cannot update filters and sync configuration while connector is active. Please disable the connector first.")
-            raise HTTPException(
-                status_code=HttpStatusCode.BAD_REQUEST.value,
-                detail="Cannot update filters and sync configuration while connector is active. Please disable the connector first."
-            )
+        # Note: We allow updating filters/sync config even while connector is active.
+        # The new configuration will be used on the next sync cycle or can trigger a re-sync if needed.
 
         config_service = container.config_service()
         config_path = _get_config_path_for_instance(connector_id)
@@ -5281,7 +5452,7 @@ async def toggle_connector_instance(
     """
     container = request.app.container
     logger = container.logger()
-    producer = container.messaging_producer
+    producer = container.kafka_service()
     connector_registry = request.app.state.connector_registry
 
     user_info = {
@@ -5488,7 +5659,7 @@ async def toggle_connector_instance(
 
             # Send message to sync-events topic
             logger.info(f"Sending message to sync-events topic: {message}")
-            await producer.send_message(topic="entity-events", message=message)
+            await producer.publish_event(topic="entity-events", event=message)
 
         return {
             "success": True,
@@ -5582,7 +5753,7 @@ async def delete_connector_instance(
 
         # 4. Stop any active sync services for this connector (send appDisabled event)
         try:
-            producer = container.messaging_producer
+            producer = container.kafka_service()
             disable_payload = {
                 "orgId": org_id,
                 "appGroup": instance.get("appGroup"),
@@ -5596,7 +5767,7 @@ async def delete_connector_instance(
                 "payload": disable_payload,
                 "timestamp": get_epoch_timestamp_in_ms()
             }
-            await producer.send_message(topic="entity-events", message=disable_message)
+            await producer.publish_event(topic="entity-events", event=disable_message)
             logger.info(f"✅ Sent appDisabled event for connector {connector_id}")
         except Exception as e:
             logger.error(
@@ -5637,7 +5808,7 @@ async def delete_connector_instance(
                 }
 
                 # Publish bulk delete event using messaging producer for consistency
-                await producer.send_message(topic="record-events", message=bulk_delete_message)
+                await producer.publish_event(topic="record-events", event=bulk_delete_message)
                 logger.info(f"✅ Published bulk delete event for {len(virtual_record_ids)} records")
             except Exception as e:
                 logger.error(
@@ -6832,4 +7003,561 @@ async def delete_oauth_config(
         raise HTTPException(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to delete OAuth configuration: {str(e)}"
+        )
+
+
+# ============================================================================
+# Event Endpoints (replace Node.js Kafka publishing)
+# ============================================================================
+
+@router.post("/api/v1/connectors/entity-event")
+@inject
+async def publish_entity_event(
+    request: Request,
+    graph_provider: IGraphDBProvider = Depends(Provide[ConnectorAppContainer.graph_provider])
+) -> Dict[str, Any]:
+    """
+    Process entity events (org, user, app) synchronously.
+    Replaces Kafka publishing from Node.js.
+
+    Expected request body:
+    {
+        "eventType": "orgCreated" | "userAdded" | "appEnabled" | etc.,
+        "payload": { ... event-specific data ... }
+    }
+
+    Returns:
+        Dictionary with success status
+    """
+    container = request.app.container
+    logger = container.logger()
+
+    try:
+        body = await request.json()
+        event_type = body.get("eventType")
+        payload = body.get("payload")
+
+        if not event_type or not payload:
+            logger.error("Missing eventType or payload in entity-event request")
+            raise HTTPException(
+                status_code=HttpStatusCode.BAD_REQUEST.value,
+                detail="eventType and payload are required"
+            )
+
+        logger.info(f"📥 Received entity event from Node.js: {event_type}")
+
+        # Import EntityEventService
+        from app.services.messaging.kafka.handlers.entity import EntityEventService
+
+        # Create entity event service
+        entity_event_service = EntityEventService(
+            logger=logger,
+            graph_provider=graph_provider,
+            app_container=container
+        )
+
+        # Process event synchronously
+        success = await entity_event_service.process_event(event_type, payload)
+
+        if not success:
+            logger.error(f"Failed to process entity event: {event_type}")
+            raise HTTPException(
+                status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+                detail=f"Failed to process entity event: {event_type}"
+            )
+
+        logger.info(f"✅ Successfully processed entity event: {event_type}")
+
+        return {
+            "success": True,
+            "message": f"Entity event {event_type} processed successfully"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error processing entity event: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+            detail=f"Failed to process entity event: {str(e)}"
+        )
+
+
+@router.post("/api/v1/connectors/sync-event")
+@inject
+async def publish_sync_event(
+    request: Request,
+    kafka_service: KafkaService = Depends(Provide[ConnectorAppContainer.kafka_service])
+) -> Dict[str, Any]:
+    """
+    Publish sync events to Kafka (Python-to-Python).
+    Replaces Kafka publishing from Node.js for:
+    - gmailUpdatesEnabledEvent
+    - gmailUpdatesDisabledEvent
+    - connectorPublicUrlChanged
+    - connector.resync events
+
+    Expected request body:
+    {
+        "eventType": "gmailUpdatesEnabledEvent" | "connectorPublicUrlChanged" | etc.,
+        "payload": { ... event-specific data ... }
+    }
+
+    Returns:
+        Dictionary with success status
+    """
+    container = request.app.container
+    logger = container.logger()
+
+    try:
+        body = await request.json()
+        event_type = body.get("eventType")
+        payload = body.get("payload")
+
+        if not event_type or not payload:
+            logger.error("Missing eventType or payload in sync-event request")
+            raise HTTPException(
+                status_code=HttpStatusCode.BAD_REQUEST.value,
+                detail="eventType and payload are required"
+            )
+
+        logger.info(f"📥 Received sync event from Node.js: {event_type}")
+
+        # Publish to sync-events Kafka topic
+        message = {
+            'eventType': event_type,
+            'payload': payload,
+            'timestamp': get_epoch_timestamp_in_ms()
+        }
+
+        await kafka_service.publish_event(
+            topic='sync-events',
+            event=message
+        )
+
+        logger.info(f"✅ Successfully published sync event to Kafka: {event_type}")
+
+        return {
+            "success": True,
+            "message": f"Sync event {event_type} published successfully"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error publishing sync event: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+            detail=f"Failed to publish sync event: {str(e)}"
+        )
+
+
+@router.post("/api/v1/connectors/config-event")
+@inject
+async def publish_config_event(
+    request: Request,
+    kafka_service: KafkaService = Depends(Provide[ConnectorAppContainer.kafka_service])
+) -> Dict[str, Any]:
+    """
+    Publish AI config events to Kafka (Python-to-Python).
+    Replaces Kafka publishing from Node.js for:
+    - llmConfigured
+    - embeddingModelConfigured
+
+    Expected request body:
+    {
+        "eventType": "llmConfigured" | "embeddingModelConfigured",
+        "payload": { ... event-specific data ... }
+    }
+
+    Returns:
+        Dictionary with success status
+    """
+    container = request.app.container
+    logger = container.logger()
+
+    try:
+        body = await request.json()
+        event_type = body.get("eventType")
+        payload = body.get("payload")
+
+        if not event_type or not payload:
+            logger.error("Missing eventType or payload in config-event request")
+            raise HTTPException(
+                status_code=HttpStatusCode.BAD_REQUEST.value,
+                detail="eventType and payload are required"
+            )
+
+        logger.info(f"📥 Received config event from Node.js: {event_type}")
+
+        # Publish to entity-events Kafka topic (consumed by Query service for AI config)
+        message = {
+            'eventType': event_type,
+            'payload': payload,
+            'timestamp': get_epoch_timestamp_in_ms()
+        }
+
+        await kafka_service.publish_event(
+            topic='entity-events',
+            event=message
+        )
+
+        logger.info(f"✅ Successfully published config event to Kafka: {event_type}")
+
+        return {
+            "success": True,
+            "message": f"Config event {event_type} published successfully"
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error publishing config event: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+            detail=f"Failed to publish config event: {str(e)}"
+        )
+
+
+# ============================================================================
+# Graph Database Sync Endpoints (for Node.js to create/update/delete entities)
+# ============================================================================
+
+@router.post("/api/v1/connectors/graph/user")
+async def create_user_in_graph(
+    request: Request
+) -> Dict[str, Any]:
+    """
+    Create user node in graph database (Neo4j/ArangoDB) with full setup.
+    Called synchronously from Node.js after user creation in MongoDB.
+    
+    Creates user node, default KB, permissions, and app relations.
+    
+    Expected request body:
+    {
+        "userId": "507f1f77bcf86cd799439011",
+        "orgId": "507f191e810c19729de860ea",
+        "fullName": "John Doe",
+        "email": "john@example.com",
+        "firstName": "John",
+        "lastName": "Doe",
+        "syncAction": "immediate" | "none"  // optional, defaults to "none"
+    }
+    """
+    container = request.app.container
+    logger = container.logger()
+    graph_provider = request.app.state.graph_provider
+    
+    try:
+        body = await request.json()
+        user_id = body.get("userId")
+        org_id = body.get("orgId")
+        email = body.get("email")
+        
+        if not user_id or not org_id or not email:
+            raise HTTPException(
+                status_code=HttpStatusCode.BAD_REQUEST.value,
+                detail="userId, orgId, and email are required"
+            )
+        
+        logger.info(f"Creating user in graph database: {user_id} ({email})")
+        
+        # Use EntityEventService to handle full user creation
+        from app.services.messaging.kafka.handlers.entity import EntityEventService
+        
+        entity_event_service = EntityEventService(
+            logger=logger,
+            graph_provider=graph_provider,
+            app_container=container
+        )
+        
+        # Build payload for userAdded event
+        payload = {
+            "userId": user_id,
+            "orgId": org_id,
+            "email": email,
+            "fullName": body.get("fullName", ""),
+            "firstName": body.get("firstName", ""),
+            "lastName": body.get("lastName", ""),
+            "middleName": body.get("middleName", ""),
+            "designation": body.get("designation", ""),
+            "businessPhones": body.get("businessPhones", []),
+            "syncAction": body.get("syncAction", "none"),
+        }
+        
+        # Process user creation event (creates user, KB, permissions, etc.)
+        success = await entity_event_service.process_event("userAdded", payload)
+        
+        if not success:
+            raise HTTPException(
+                status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+                detail="Failed to create user in graph database"
+            )
+        
+        logger.info(f"✅ User {user_id} created successfully in graph database with KB and permissions")
+        return {"success": True, "message": "User created in graph database with full setup"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Failed to create user in graph database: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+            detail=f"Failed to create user in graph database: {str(e)}"
+        )
+
+
+@router.put("/api/v1/connectors/graph/user/{user_id}")
+async def update_user_in_graph(
+    user_id: str,
+    request: Request
+) -> Dict[str, Any]:
+    """
+    Update user node in graph database.
+    Called synchronously from Node.js after user update in MongoDB.
+    Uses EntityEventService to handle proper UUID-based user updates.
+    """
+    container = request.app.container
+    logger = container.logger()
+    graph_provider = request.app.state.graph_provider
+    
+    try:
+        body = await request.json()
+        
+        logger.info(f"Updating user in graph database: {user_id}")
+        
+        # Use EntityEventService to handle user update (respects UUID system)
+        from app.services.messaging.kafka.handlers.entity import EntityEventService
+        
+        entity_event_service = EntityEventService(
+            logger=logger,
+            graph_provider=graph_provider,
+            app_container=container
+        )
+        
+        # Build payload for userUpdated event
+        payload = {
+            "userId": user_id,
+            "orgId": body.get("orgId"),  # Required for EntityEventService
+            "fullName": body.get("fullName"),
+            "email": body.get("email"),
+            "firstName": body.get("firstName", ""),
+            "lastName": body.get("lastName", ""),
+            "syncAction": "none",  # Don't trigger sync on update
+        }
+        
+        # Process user update event
+        success = await entity_event_service.process_event("userUpdated", payload)
+        
+        if not success:
+            raise HTTPException(
+                status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+                detail="Failed to update user in graph database"
+            )
+        
+        logger.info(f"✅ User {user_id} updated successfully in graph database")
+        return {"success": True, "message": "User updated in graph database"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Failed to update user in graph database: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+            detail=f"Failed to update user in graph database: {str(e)}"
+        )
+
+
+@router.delete("/api/v1/connectors/graph/user/{user_id}")
+async def delete_user_in_graph(
+    user_id: str,
+    request: Request
+) -> Dict[str, Any]:
+    """
+    Delete user node from graph database.
+    Called synchronously from Node.js after user deletion in MongoDB.
+    Uses EntityEventService to handle proper UUID-based user deletion.
+    """
+    container = request.app.container
+    logger = container.logger()
+    graph_provider = request.app.state.graph_provider
+    
+    try:
+        logger.info(f"Deleting user from graph database: {user_id}")
+        
+        # Use EntityEventService to handle user deletion (respects UUID system)
+        from app.services.messaging.kafka.handlers.entity import EntityEventService
+        
+        entity_event_service = EntityEventService(
+            logger=logger,
+            graph_provider=graph_provider,
+            app_container=container
+        )
+        
+        # Build payload for userRemoved event
+        payload = {
+            "userId": user_id,
+        }
+        
+        # Process user deletion event
+        success = await entity_event_service.process_event("userRemoved", payload)
+        
+        if not success:
+            raise HTTPException(
+                status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+                detail="Failed to delete user from graph database"
+            )
+        
+        logger.info(f"✅ User {user_id} deleted successfully from graph database")
+        return {"success": True, "message": "User deleted from graph database"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Failed to delete user from graph database: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+            detail=f"Failed to delete user from graph database: {str(e)}"
+        )
+
+
+@router.post("/api/v1/connectors/graph/org")
+async def create_org_in_graph(
+    request: Request
+) -> Dict[str, Any]:
+    """
+    Create organization node in graph database with full setup.
+    Called synchronously from Node.js after org creation in MongoDB.
+    
+    Creates org node, department relations, and KB connector instance.
+    
+    Expected request body:
+    {
+        "orgId": "507f191e810c19729de860ea",
+        "registeredName": "Acme Corp",
+        "accountType": "business",
+        "userId": "507f1f77bcf86cd799439011"  // optional, user who created org
+    }
+    """
+    container = request.app.container
+    logger = container.logger()
+    graph_provider = request.app.state.graph_provider
+    
+    try:
+        body = await request.json()
+        org_id = body.get("orgId")
+        registered_name = body.get("registeredName") or body.get("name")
+        account_type = body.get("accountType")
+        user_id = body.get("userId")
+        
+        if not org_id or not registered_name:
+            raise HTTPException(
+                status_code=HttpStatusCode.BAD_REQUEST.value,
+                detail="orgId and registeredName are required"
+            )
+        
+        logger.info(f"Creating organization in graph database: {org_id} ({registered_name})")
+        
+        # Use EntityEventService to handle full org creation
+        from app.services.messaging.kafka.handlers.entity import EntityEventService
+        
+        entity_event_service = EntityEventService(
+            logger=logger,
+            graph_provider=graph_provider,
+            app_container=container
+        )
+        
+        # Build payload for orgCreated event
+        payload = {
+            "orgId": org_id,
+            "registeredName": registered_name,
+            "accountType": account_type,
+            "userId": user_id,
+        }
+        
+        # Process org creation event (creates org, KB connector, department relations)
+        success = await entity_event_service.process_event("orgCreated", payload)
+        
+        if not success:
+            raise HTTPException(
+                status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+                detail="Failed to create organization in graph database"
+            )
+        
+        logger.info(f"✅ Organization {org_id} created successfully in graph database with KB connector")
+        return {"success": True, "message": "Organization created in graph database with full setup"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ Failed to create organization in graph database: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+            detail=f"Failed to create organization in graph database: {str(e)}"
+        )
+
+
+@router.put("/api/v1/connectors/graph/org/{org_id}")
+async def update_org_in_graph(
+    org_id: str,
+    request: Request
+) -> Dict[str, Any]:
+    """
+    Update organization node in graph database.
+    Called synchronously from Node.js after org update in MongoDB.
+    """
+    container = request.app.container
+    logger = container.logger()
+    graph_provider = request.app.state.graph_provider
+    
+    try:
+        body = await request.json()
+        
+        logger.info(f"Updating organization in graph database: {org_id}")
+        
+        # Update org node
+        await graph_provider.update_org_node(
+            org_id=org_id,
+            name=body.get("name"),
+            account_type=body.get("accountType")
+        )
+        
+        logger.info(f"✅ Organization {org_id} updated successfully in graph database")
+        return {"success": True, "message": "Organization updated in graph database"}
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to update organization in graph database: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+            detail=f"Failed to update organization in graph database: {str(e)}"
+        )
+
+
+@router.delete("/api/v1/connectors/graph/org/{org_id}")
+async def delete_org_in_graph(
+    org_id: str,
+    request: Request
+) -> Dict[str, Any]:
+    """
+    Delete organization node in graph database.
+    Called synchronously from Node.js after org deletion in MongoDB.
+    """
+    container = request.app.container
+    logger = container.logger()
+    graph_provider = request.app.state.graph_provider
+    
+    try:
+        logger.info(f"Deleting organization from graph database: {org_id}")
+        
+        # Delete org node and all related data
+        await graph_provider.delete_org_node(org_id=org_id)
+        
+        logger.info(f"✅ Organization {org_id} deleted successfully from graph database")
+        return {"success": True, "message": "Organization deleted from graph database"}
+        
+    except Exception as e:
+        logger.error(f"❌ Failed to delete organization from graph database: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
+            detail=f"Failed to delete organization from graph database: {str(e)}"
         )

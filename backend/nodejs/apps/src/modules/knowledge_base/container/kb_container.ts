@@ -1,13 +1,10 @@
 import { Container } from 'inversify';
 import { Logger } from '../../../libs/services/logger.service';
-import { ArangoService } from '../../../libs/services/arango.service';
 import { ConfigurationManagerConfig } from '../../configuration_manager/config/config';
 import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
-import { RecordsEventProducer } from '../services/records_events.service';
 import { AuthTokenService } from '../../../libs/services/authtoken.service';
 import { AuthMiddleware } from '../../../libs/middlewares/auth.middleware';
 import { AppConfig } from '../../tokens_manager/config/config';
-import { SyncEventProducer } from '../services/sync_events.service';
 const loggerConfig = {
   service: 'Knowledge Base Service',
 };
@@ -42,19 +39,6 @@ export class KnowledgeBaseContainer {
     appConfig: AppConfig,
   ): Promise<void> {
     try {
-      // Initialize ArangoDB only when DATA_STORE is set to 'arangodb'
-      const dataStore = (process.env.DATA_STORE || 'neo4j').toLowerCase();
-      if (dataStore === 'arangodb') {
-        const arangoService = new ArangoService(appConfig.arango);
-        await arangoService.initialize();
-        container
-          .bind<ArangoService>('ArangoService')
-          .toConstantValue(arangoService);
-        this.logger.info('ArangoDB service initialized');
-      } else {
-        this.logger.info(`Skipping ArangoDB initialization (DATA_STORE=${dataStore})`);
-      }
-
       const configurationManagerConfig =
         container.get<ConfigurationManagerConfig>('ConfigurationManagerConfig');
       const keyValueStoreService = KeyValueStoreService.getInstance(
@@ -64,36 +48,6 @@ export class KnowledgeBaseContainer {
       container
         .bind<KeyValueStoreService>('KeyValueStoreService')
         .toConstantValue(keyValueStoreService);
-
-      this.logger.info('before events producer');
-
-      const recordsEventProducer = new RecordsEventProducer(
-        appConfig.kafka,
-        this.logger,
-      );
-
-      // Start the Kafka producer
-      await recordsEventProducer.start();
-
-      container
-        .bind<RecordsEventProducer>('RecordsEventProducer')
-        .toConstantValue(recordsEventProducer);
-
-      this.logger.info('After events producer binding');
-
-      const syncEventProducer = new SyncEventProducer(
-        appConfig.kafka,
-        this.logger,
-      );
-
-      // start the kafka producer for sync-events
-      await syncEventProducer.start();
-
-      container
-        .bind<SyncEventProducer>('SyncEventProducer')
-        .toConstantValue(syncEventProducer);
-        
-      this.logger.info('After sync producer binding');
 
       const authTokenService = new AuthTokenService(
         appConfig.jwtSecret,
@@ -125,20 +79,6 @@ export class KnowledgeBaseContainer {
   static async dispose(): Promise<void> {
     if (this.instance) {
       try {
-        // Stop the Kafka producer
-        if (this.instance.isBound('RecordsEventProducer')) {
-          const recordsEventProducer = this.instance.get<RecordsEventProducer>(
-            'RecordsEventProducer',
-          );
-          await recordsEventProducer.stop();
-        }
-
-        // stop the sync-event kafka
-        if (this.instance.isBound('SyncEventProducer')) {
-          const syncEventProducer =
-            this.instance.get<SyncEventProducer>('SyncEventProducer');
-          await syncEventProducer.stop();
-        }
         const keyValueStoreService = this.instance.isBound(
           'KeyValueStoreService',
         )

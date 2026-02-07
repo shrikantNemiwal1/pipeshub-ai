@@ -32,7 +32,6 @@ import {
   getKnowledgeHubNodes,
   moveRecord,
 } from '../controllers/kb_controllers';
-import { ArangoService } from '../../../libs/services/arango.service';
 import { metricsMiddleware } from '../../../libs/middlewares/prometheus.middleware';
 import { ValidationMiddleware } from '../../../libs/middlewares/validation.middleware';
 import {
@@ -66,11 +65,8 @@ import {
 // Clean up unused commented import
 import { FileProcessingType } from '../../../libs/middlewares/file_processor/fp.constant';
 import { extensionToMimeType } from '../../storage/mimetypes/mimetypes';
-import { RecordRelationService } from '../services/kb.relation.service';
 import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
-import { RecordsEventProducer } from '../services/records_events.service';
 import { AppConfig } from '../../tokens_manager/config/config';
-import { SyncEventProducer } from '../services/sync_events.service';
 import { FileProcessorService } from '../../../libs/middlewares/file_processor/fp.service';
 import { KB_UPLOAD_LIMITS } from '../constants/kb.constants';
 import { getPlatformSettingsFromStore } from '../../configuration_manager/utils/util';
@@ -86,19 +82,6 @@ const logger = Logger.getInstance({
 export function createKnowledgeBaseRouter(container: Container): Router {
   const router = Router();
   const appConfig = container.get<AppConfig>('AppConfig');
-  const arangoService = container.get<ArangoService>('ArangoService');
-  const recordsEventProducer = container.get<RecordsEventProducer>(
-    'RecordsEventProducer',
-  );
-  const syncEventProducer =
-    container.get<SyncEventProducer>('SyncEventProducer');
-
-  const recordRelationService = new RecordRelationService(
-    arangoService,
-    recordsEventProducer,
-    syncEventProducer,
-    appConfig.storage,
-  );
   const keyValueStoreService = container.get<KeyValueStoreService>(
     'KeyValueStoreService',
   );
@@ -306,7 +289,7 @@ export function createKnowledgeBaseRouter(container: Container): Router {
     authMiddleware.authenticate,
     metricsMiddleware(container),
     ValidationMiddleware.validate(reindexFailedRecordSchema),
-    reindexFailedRecords(recordRelationService, appConfig),
+    reindexFailedRecords(appConfig),
   );
 
   // resync connector records
@@ -315,7 +298,7 @@ export function createKnowledgeBaseRouter(container: Container): Router {
     authMiddleware.authenticate,
     metricsMiddleware(container),
     ValidationMiddleware.validate(resyncConnectorSchema),
-    resyncConnectorRecords(recordRelationService, appConfig),
+    resyncConnectorRecords(appConfig),
   );
 
   // Limits endpoint for clients to discover constraints
@@ -407,7 +390,7 @@ export function createKnowledgeBaseRouter(container: Container): Router {
     ValidationMiddleware.validate(uploadRecordsSchema),
 
     // Upload handler
-    uploadRecordsToKB(recordRelationService, keyValueStoreService, appConfig),
+    uploadRecordsToKB(keyValueStoreService, appConfig),
   );
 
   // Upload records to a specific folder in the KB
@@ -429,11 +412,7 @@ export function createKnowledgeBaseRouter(container: Container): Router {
     ValidationMiddleware.validate(uploadRecordsToFolderSchema),
 
     // Upload handler
-    uploadRecordsToFolder(
-      recordRelationService,
-      keyValueStoreService,
-      appConfig,
-    ),
+    uploadRecordsToFolder(keyValueStoreService, appConfig),
   );
 
   // Create a root folder

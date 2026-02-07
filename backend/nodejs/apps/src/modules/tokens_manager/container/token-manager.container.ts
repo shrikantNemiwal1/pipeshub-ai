@@ -3,11 +3,9 @@ import { AppConfig, loadAppConfig } from '../config/config';
 import { MongoService } from '../../../libs/services/mongo.service';
 import { RedisService } from '../../../libs/services/redis.service';
 import { Logger } from '../../../libs/services/logger.service';
-import { TokenEventProducer } from '../services/token-event.producer';
 import { ConfigurationManagerConfig } from '../../configuration_manager/config/config';
 import { AuthTokenService } from '../../../libs/services/authtoken.service';
 import { AuthMiddleware } from '../../../libs/middlewares/auth.middleware';
-import { EntitiesEventProducer } from '../services/entity_event.service';
 import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
 
 const loggerConfig = {
@@ -70,29 +68,6 @@ export class TokenManagerContainer {
         .bind<KeyValueStoreService>('KeyValueStoreService')
         .toConstantValue(keyValueStoreService);
 
-      // Initialize Kafka Service
-      const tokenEventProducer = new TokenEventProducer(
-        config.kafka,
-        container.get('Logger'),
-      );
-      await tokenEventProducer.start();
-      container
-        .bind<TokenEventProducer>('KafkaService')
-        .toConstantValue(tokenEventProducer);
-
-      const kafkaConfig = {
-        brokers: config.kafka.brokers,
-        ...(config.kafka.sasl && { sasl: config.kafka.sasl }), // Only includes `sasl` if it exists
-      };
-
-      const entityEventsService = new EntitiesEventProducer(
-        kafkaConfig,
-        container.get('Logger'),
-      );
-      container
-        .bind<EntitiesEventProducer>('EntitiesEventProducer')
-        .toConstantValue(entityEventsService);
-
       const jwtSecret = config.jwtSecret;
       const scopedJwtSecret = config.scopedJwtSecret;
       const authTokenService = new AuthTokenService(
@@ -134,25 +109,10 @@ export class TokenManagerContainer {
           ? this.instance.get<RedisService>('RedisService')
           : null;
 
-        const kafkaService = this.instance.isBound('KafkaService')
-          ? this.instance.get<TokenEventProducer>('KafkaService')
-          : null;
-
-        const entityEventsService = this.instance.isBound(
-          'EntitiesEventProducer',
-        )
-          ? this.instance.get<EntitiesEventProducer>('EntitiesEventProducer')
-          : null;
         // Disconnect services if they have a disconnect method
 
         if (redisService && redisService.isConnected()) {
           await redisService.disconnect();
-        }
-        if (kafkaService && kafkaService.isConnected()) {
-          await kafkaService.disconnect();
-        }
-        if (entityEventsService && entityEventsService.isConnected()) {
-          await entityEventsService.disconnect();
         }
         if (mongoService && mongoService.isConnected()) {
           await mongoService.destroy();

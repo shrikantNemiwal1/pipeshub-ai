@@ -24,7 +24,6 @@ import { Users } from '../schema/users.schema';
 import { NotFoundError } from '../../../libs/errors/http.errors';
 import { MailService } from '../services/mail.service';
 import { AuthService } from '../services/auth.service';
-import { EntitiesEventProducer } from '../services/entity_events.service';
 import { OrgController } from '../controller/org.controller';
 
 const UserIdUrlParams = z.object({
@@ -647,7 +646,6 @@ export function createUserRouter(container: Container) {
             updatedConfig,
             container.get<MailService>('MailService'),
             logger,
-            container.get<EntitiesEventProducer>('EntitiesEventProducer'),
           );
         });
 
@@ -659,7 +657,6 @@ export function createUserRouter(container: Container) {
               container.get<MailService>('MailService'),
               container.get<AuthService>('AuthService'),
               logger,
-              container.get<EntitiesEventProducer>('EntitiesEventProducer'),
             );
           });
         res.status(200).json({

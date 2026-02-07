@@ -28,7 +28,6 @@ import { createSamlRouter } from './modules/auth/routes/saml.routes';
 import { createOrgAuthConfigRouter } from './modules/auth/routes/orgAuthConfig.routes';
 import { KnowledgeBaseContainer } from './modules/knowledge_base/container/kb_container';
 import { createKnowledgeBaseRouter } from './modules/knowledge_base/routes/kb.routes';
-import { createKnowledgeBaseProxyRouter } from './modules/knowledge_base/routes/kb.proxy.routes';
 import { createStorageRouter } from './modules/storage/routes/storage.routes';
 import { createConfigurationManagerRouter } from './modules/configuration_manager/routes/cm_routes';
 import { loadConfigurationManagerConfig } from './modules/configuration_manager/config/config';
@@ -60,7 +59,6 @@ import {
   createOAuthClientsRouter,
   createOIDCDiscoveryRouter,
 } from './modules/oauth_provider/routes';
-import { ensureKafkaTopicsExist, REQUIRED_KAFKA_TOPICS } from './libs/services/kafka-admin.service';
 
 const loggerConfig = {
   service: 'Application',
@@ -98,18 +96,6 @@ export class Application {
       // Loads configuration
       const configurationManagerConfig = loadConfigurationManagerConfig();
       const appConfig = await loadAppConfig();
-
-      // Ensure Kafka topics exist (important for Kafka deployments where auto-create is disabled)
-      try {
-        this.logger.info('Ensuring Kafka topics exist...');
-        await ensureKafkaTopicsExist(appConfig.kafka, this.logger, REQUIRED_KAFKA_TOPICS);
-        this.logger.info('Kafka topics check completed');
-      } catch (kafkaError: any) {
-        this.logger.warn(
-          `Could not verify/create Kafka topics: ${kafkaError.message}.`
-        );
-        // Don't throw - allow app to continue; topics might already exist or be created elsewhere
-      }
 
       this.tokenManagerContainer = await TokenManagerContainer.initialize(
         configurationManagerConfig,
@@ -330,7 +316,6 @@ export class Application {
       '/api/v1/health',
       createHealthRouter(
         this.tokenManagerContainer,
-        this.knowledgeBaseContainer,
         this.configurationManagerContainer,
       ),
     );
@@ -396,22 +381,11 @@ export class Application {
       createOAuthRouter(this.tokenManagerContainer),
     );
 
-    // knowledge base routes
-    const dataStore = (process.env.DATA_STORE || 'neo4j').toLowerCase();
-    if (dataStore === 'arangodb') {
-      // Use direct ArangoDB routes
-      this.app.use(
-        '/api/v1/knowledgeBase',
-        createKnowledgeBaseRouter(this.knowledgeBaseContainer),
-      );
-    } else {
-      // Use proxy routes that forward to Python connector service (supports Neo4j)
-      this.logger.info(`Using Knowledge Base proxy routes (DATA_STORE=${dataStore})`);
-      this.app.use(
-        '/api/v1/knowledgeBase',
-        createKnowledgeBaseProxyRouter(this.knowledgeBaseContainer),
-      );
-    }
+    // knowledge base routes (unified - proxies to Python backend)
+    this.app.use(
+      '/api/v1/knowledgeBase',
+      createKnowledgeBaseRouter(this.knowledgeBaseContainer),
+    );
 
     // configuration manager routes
     this.app.use(

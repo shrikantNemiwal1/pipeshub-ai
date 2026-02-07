@@ -2,8 +2,6 @@ import { Router } from 'express';
 import { Container } from 'inversify';
 import { MongoService } from '../../../libs/services/mongo.service';
 import { RedisService } from '../../../libs/services/redis.service';
-import { TokenEventProducer } from '../services/token-event.producer';
-import { ArangoService } from '../../../libs/services/arango.service';
 import { Logger }  from '../../../libs/services/logger.service';
 import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
 import axios from 'axios';
@@ -16,8 +14,6 @@ const logger = Logger.getInstance({
 const TYPES = {
   MongoService: 'MongoService',
   RedisService: 'RedisService',
-  TokenEventProducer: 'KafkaService',
-  ArangoService: 'ArangoService',
   KeyValueStoreService: 'KeyValueStoreService',
 };
 
@@ -26,26 +22,18 @@ export interface HealthStatus {
   timestamp: string;
   services: {
     redis: string;
-    kafka: string;
     mongodb: string;
-    arangodb: string;
     KVStoreservice: string;
   };
 }
 
 export function createHealthRouter(
   container: Container,
-  knowledgeBaseContainer: Container,
   configurationManagerContainer: Container
 ): Router {
   const router = Router();
   const redis = container.get<RedisService>(TYPES.RedisService);
-  const kafka = container.get<TokenEventProducer>(TYPES.TokenEventProducer);
   const mongooseService = container.get<MongoService>(TYPES.MongoService);
-  // Only get ArangoService if it's bound (depends on DATA_STORE setting)
-  const arangoService = knowledgeBaseContainer.isBound(TYPES.ArangoService)
-    ? knowledgeBaseContainer.get<ArangoService>(TYPES.ArangoService)
-    : null;
   const keyValueStoreService = configurationManagerContainer.get<KeyValueStoreService>(
     TYPES.KeyValueStoreService,
   );
@@ -59,9 +47,7 @@ export function createHealthRouter(
         timestamp: new Date().toISOString(),
         services: {
           redis: 'unknown',
-          kafka: 'unknown',
           mongodb: 'unknown',
-          arangodb: 'unknown',
           KVStoreservice: 'unknown',
         },
       };
@@ -75,14 +61,6 @@ export function createHealthRouter(
       }
 
       try {
-        await kafka.healthCheck();
-        health.services.kafka = 'healthy';
-      } catch (error) {
-        health.services.kafka = 'unhealthy';
-        health.status = 'unhealthy';
-      }
-
-      try {
         const isMongoHealthy = await mongooseService.healthCheck();
         health.services.mongodb = isMongoHealthy ? 'healthy' : 'unhealthy';
         if (!isMongoHealthy) {
@@ -91,23 +69,6 @@ export function createHealthRouter(
       } catch (error) {
         health.services.mongodb = 'unhealthy';
         health.status = 'unhealthy';
-      }
-
-      // ArangoDB check - only when using ArangoDB as the graph database
-      const dataStore = (process.env.DATA_STORE || 'neo4j').toLowerCase();
-      if (dataStore === 'arangodb' && arangoService) {
-        try {
-          const isArangoHealthy = await arangoService.isConnected();
-          health.services.arangodb = isArangoHealthy ? 'healthy' : 'unhealthy';
-          if (!isArangoHealthy) {
-            health.status = 'unhealthy';
-          }
-        } catch (exception) {
-          health.services.arangodb = 'unhealthy';
-          health.status = 'unhealthy';
-        }
-      } else {
-        health.services.arangodb = 'skipped';
       }
 
       try {

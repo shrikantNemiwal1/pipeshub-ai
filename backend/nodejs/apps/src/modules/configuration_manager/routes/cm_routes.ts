@@ -90,10 +90,6 @@ import {
 } from '../../../libs/middlewares/types';
 import { NotFoundError } from '../../../libs/errors/http.errors';
 import { ConfigService } from '../services/updateConfig.service';
-import {
-  EntitiesEventProducer,
-  SyncEventProducer,
-} from '../services/kafka_events.service';
 
 export function createConfigurationManagerRouter(container: Container): Router {
   const router = Router();
@@ -101,11 +97,6 @@ export function createConfigurationManagerRouter(container: Container): Router {
     'KeyValueStoreService',
   );
   const appConfig = container.get<AppConfig>('AppConfig');
-  const entityEventService = container.get<EntitiesEventProducer>(
-    'EntitiesEventProducer',
-  );
-  const syncEventService =
-    container.get<SyncEventProducer>('SyncEventProducer');
   const configService = container.get<ConfigService>('ConfigService');
   const authMiddleware = container.get<AuthMiddleware>('AuthMiddleware');
   // storage config routes
@@ -519,7 +510,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
         keyValueStoreService,
         req.user.userId,
         req.user.orgId,
-        syncEventService,
+        appConfig,
       )(req, res, next);
     },
   );
@@ -546,7 +537,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
         keyValueStoreService,
         req.tokenPayload.userId,
         req.tokenPayload.orgId,
-        syncEventService,
+        appConfig,
       )(req, res, next);
     },
   );
@@ -638,7 +629,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
       }
       return setGoogleWorkspaceOauthConfig(
         keyValueStoreService,
-        syncEventService,
+        appConfig,
         req.user.orgId,
       )(req, res, next);
     },
@@ -662,7 +653,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
       }
       return setGoogleWorkspaceOauthConfig(
         keyValueStoreService,
-        syncEventService,
+        appConfig,
         req.tokenPayload?.orgId,
       )(req, res, next);
     },
@@ -682,7 +673,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(aiModelsConfigSchema),
-    createAIModelsConfig(keyValueStoreService, entityEventService, appConfig),
+    createAIModelsConfig(keyValueStoreService, appConfig),
   );
 
   /**
@@ -760,7 +751,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(addProviderRequestSchema),
-    addAIModelProvider(keyValueStoreService, entityEventService, appConfig),
+    addAIModelProvider(keyValueStoreService, appConfig),
   );
 
   /**
@@ -776,7 +767,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(updateProviderRequestSchema),
-    updateAIModelProvider(keyValueStoreService, entityEventService, appConfig),
+    updateAIModelProvider(keyValueStoreService, appConfig),
   );
 
   /**
@@ -792,7 +783,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(deleteProviderSchema),
-    deleteAIModelProvider(keyValueStoreService, entityEventService, appConfig),
+    deleteAIModelProvider(keyValueStoreService, appConfig),
   );
 
   /**
@@ -808,7 +799,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
     userAdminCheck,
     metricsMiddleware(container),
     ValidationMiddleware.validate(updateDefaultModelSchema),
-    updateDefaultAIModel(keyValueStoreService, entityEventService, appConfig),
+    updateDefaultAIModel(keyValueStoreService, appConfig),
   );
 
   router.get(
@@ -844,7 +835,7 @@ export function createConfigurationManagerRouter(container: Container): Router {
     userAdminCheck,
     ValidationMiddleware.validate(urlSchema),
     metricsMiddleware(container),
-    setConnectorPublicUrl(keyValueStoreService, syncEventService),
+    setConnectorPublicUrl(keyValueStoreService, appConfig),
   );
 
   // metrics collection routes

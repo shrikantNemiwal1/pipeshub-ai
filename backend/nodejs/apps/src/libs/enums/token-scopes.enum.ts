@@ -6,6 +6,7 @@ export const TokenScopes = Object.freeze({
   TOKEN_REFRESH: 'token:refresh',
   STORAGE_TOKEN: 'storage:token',
   CONVERSATION_CREATE: 'conversation:create',
+  GRAPH_DB_SYNC: 'graph:sync',
 } as const);
 
 // Create a type for the TokenScopes keys

@@ -68,13 +68,8 @@ import {
   setRefreshTokenCredentials,
 } from '../services/connectors-config.service';
 import { verifyGoogleWorkspaceToken } from '../utils/verifyToken';
-import {
-  AppEnabledEvent,
-  EntitiesEventProducer,
-  EventType,
-  Event,
-} from '../services/entity_event.service';
 import { ConnectorId, ConnectorIdToNameMap } from '../../../libs/types/connector.types';
+import { publishEntityEvent } from '../../../libs/utils/python-event-publisher';
 
 const logger = Logger.getInstance({
   service: 'ConnectorRoutes',
@@ -277,7 +272,6 @@ export function createConnectorRouter(container: Container): Router {
   const router = Router();
   let config = container.get<AppConfig>('AppConfig');
   const authMiddleware = container.get<AuthMiddleware>('AuthMiddleware');
-  const eventService = container.get<EntitiesEventProducer>('EntitiesEventProducer');
 
   // ============================================================================
   // Registry Routes
@@ -723,31 +717,31 @@ export function createConnectorRouter(container: Container): Router {
           .filter((scope) => receivedScopes.includes(scope))
           .map((scope) => scopeToAppMap[scope]);
 
-        // Prepare event for sync service
-        await eventService.start();
-        let event: Event;
-
         if (connector) {
           // Update existing connector
           connector.isEnabled = true;
           connector.lastUpdatedBy = req.user.userId;
 
-          event = {
-            eventType: EventType.AppEnabledEvent,
-            timestamp: Date.now(),
-            payload: {
-              orgId: req.user.orgId,
-              appGroup: connector.name,
-              appGroupId: connector._id,
-              credentialsRoute: `${config.cmBackend}/${GOOGLE_WORKSPACE_INDIVIDUAL_CREDENTIALS_PATH}`,
-              refreshTokenRoute: `${config.cmBackend}/${REFRESH_TOKEN_PATH}`,
-              apps: enabledApps,
-              syncAction: 'immediate',
-            } as AppEnabledEvent,
-          };
+          // Publish app enabled event to Python connector service
+          try {
+            await publishEntityEvent(
+              config.connectorBackend,
+              'appEnabled',
+              {
+                orgId: req.user.orgId,
+                appGroup: connector.name,
+                appGroupId: String(connector._id),
+                credentialsRoute: `${config.cmBackend}/${GOOGLE_WORKSPACE_INDIVIDUAL_CREDENTIALS_PATH}`,
+                refreshTokenRoute: `${config.cmBackend}/${REFRESH_TOKEN_PATH}`,
+                apps: enabledApps,
+                syncAction: 'immediate',
+              }
+            );
+          } catch (error) {
+            logger.error('Failed to publish app enabled event to Python', { error });
+            // Don't fail the request if event publishing fails
+          }
 
-          await eventService.publishEvent(event);
-          await eventService.stop();
           await connector.save();
 
           logger.info('Google Workspace connector enabled', {
@@ -779,26 +773,29 @@ export function createConnectorRouter(container: Container): Router {
             throw new InternalServerError('Error creating connector');
           }
 
-          event = {
-            eventType: EventType.AppEnabledEvent,
-            timestamp: Date.now(),
-            payload: {
-              orgId: req.user.orgId,
-              appGroup: connector.name,
-              appGroupId: connector._id,
-              credentialsRoute: `${config.cmBackend}/${GOOGLE_WORKSPACE_INDIVIDUAL_CREDENTIALS_PATH}`,
-              refreshTokenRoute: `${config.cmBackend}/${REFRESH_TOKEN_PATH}`,
-              apps: [
-                GoogleWorkspaceApp.Drive,
-                GoogleWorkspaceApp.Gmail,
-                GoogleWorkspaceApp.Calendar,
-              ],
-              syncAction: 'immediate',
-            } as AppEnabledEvent,
-          };
-
-          await eventService.publishEvent(event);
-          await eventService.stop();
+          // Publish app enabled event to Python connector service
+          try {
+            await publishEntityEvent(
+              config.connectorBackend,
+              'appEnabled',
+              {
+                orgId: req.user.orgId,
+                appGroup: connector.name,
+                appGroupId: String(connector._id),
+                credentialsRoute: `${config.cmBackend}/${GOOGLE_WORKSPACE_INDIVIDUAL_CREDENTIALS_PATH}`,
+                refreshTokenRoute: `${config.cmBackend}/${REFRESH_TOKEN_PATH}`,
+                apps: [
+                  GoogleWorkspaceApp.Drive,
+                  GoogleWorkspaceApp.Gmail,
+                  GoogleWorkspaceApp.Calendar,
+                ],
+                syncAction: 'immediate',
+              }
+            );
+          } catch (error) {
+            logger.error('Failed to publish app enabled event to Python', { error });
+            // Don't fail the request if event publishing fails
+          }
 
           logger.info('Google Workspace connector created and enabled', {
             connectorId: connector._id,

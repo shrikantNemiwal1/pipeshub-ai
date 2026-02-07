@@ -14,8 +14,6 @@ from datetime import datetime
 from logging import Logger
 from typing import Any, Dict, List, Optional, Tuple, Union
 
-from fastapi import Request
-
 from app.config.configuration_service import ConfigurationService
 from app.config.constants.arangodb import (
     RECORD_TYPE_COLLECTION_MAPPING,
@@ -53,6 +51,7 @@ from app.models.entities import (
 from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 from app.services.graph_db.neo4j.neo4j_client import Neo4jClient
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
+from fastapi import Request
 
 # Constants
 MAX_REINDEX_DEPTH = 100  # Maximum depth for reindexing records (unlimited depth is capped at this value)
@@ -3580,6 +3579,162 @@ class Neo4jProvider(IGraphDBProvider):
 
         except Exception as e:
             self.logger.error(f"❌ Batch upsert domains failed: {str(e)}")
+            raise
+
+    # ==================== Synchronous Entity Management (for Node.js calls) ====================
+
+    async def create_org_node(
+        self,
+        org_id: str,
+        name: str,
+        account_type: Optional[str] = None
+    ) -> None:
+        """
+        Create a single organization node in the graph database.
+        Called synchronously from Node.js after org creation in MongoDB.
+        """
+        try:
+            org_data = {
+                "id": org_id,
+                "name": name,
+                "accountType": account_type,
+            }
+            await self.batch_upsert_orgs([org_data])
+            self.logger.info(f"✅ Created org node: {org_id}")
+        except Exception as e:
+            self.logger.error(f"❌ Failed to create org node: {str(e)}")
+            raise
+
+    async def update_org_node(
+        self,
+        org_id: str,
+        name: Optional[str] = None,
+        account_type: Optional[str] = None
+    ) -> None:
+        """
+        Update an organization node in the graph database.
+        Called synchronously from Node.js after org update in MongoDB.
+        """
+        try:
+            update_data = {"id": org_id}
+            if name is not None:
+                update_data["name"] = name
+            if account_type is not None:
+                update_data["accountType"] = account_type
+            
+            await self.batch_upsert_orgs([update_data])
+            self.logger.info(f"✅ Updated org node: {org_id}")
+        except Exception as e:
+            self.logger.error(f"❌ Failed to update org node: {str(e)}")
+            raise
+
+    async def delete_org_node(self, org_id: str) -> None:
+        """
+        Delete an organization node and all related data from the graph database.
+        Called synchronously from Node.js after org deletion in MongoDB.
+        """
+        try:
+            # Delete org node and all relationships
+            await self.delete_document(org_id, CollectionNames.ORGS.value)
+            self.logger.info(f"✅ Deleted org node: {org_id}")
+        except Exception as e:
+            self.logger.error(f"❌ Failed to delete org node: {str(e)}")
+            raise
+
+    async def create_user_node(
+        self,
+        user_id: str,
+        org_id: str,
+        full_name: str,
+        email: str,
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None
+    ) -> None:
+        """
+        Create a single user node in the graph database.
+        Called synchronously from Node.js after user creation in MongoDB.
+        """
+        try:
+            # Create user node
+            user_data = {
+                "id": user_id,
+                "orgId": org_id,
+                "fullName": full_name,
+                "email": email,
+                "firstName": first_name,
+                "lastName": last_name,
+                "isActive": True,
+            }
+            
+            # Use batch_upsert_nodes for users collection
+            await self.batch_upsert_nodes(
+                [user_data],
+                collection=CollectionNames.USERS.value
+            )
+            
+            # Create BELONGS_TO edge from user to org
+            user_org_edge = {
+                "from_id": user_id,
+                "from_collection": CollectionNames.USERS.value,
+                "to_id": org_id,
+                "to_collection": CollectionNames.ORGS.value,
+                "entityType": "ORGANIZATION",
+                "createdAtTimestamp": get_epoch_timestamp_in_ms(),
+                "updatedAtTimestamp": get_epoch_timestamp_in_ms(),
+            }
+            await self.batch_create_edges(
+                [user_org_edge],
+                collection=CollectionNames.BELONGS_TO.value
+            )
+            
+            self.logger.info(f"✅ Created user node: {user_id}")
+        except Exception as e:
+            self.logger.error(f"❌ Failed to create user node: {str(e)}")
+            raise
+
+    async def update_user_node(
+        self,
+        user_id: str,
+        full_name: Optional[str] = None,
+        email: Optional[str] = None,
+        first_name: Optional[str] = None,
+        last_name: Optional[str] = None
+    ) -> None:
+        """
+        Update a user node in the graph database.
+        Called synchronously from Node.js after user update in MongoDB.
+        """
+        try:
+            update_data = {"id": user_id}
+            if full_name is not None:
+                update_data["fullName"] = full_name
+            if email is not None:
+                update_data["email"] = email
+            if first_name is not None:
+                update_data["firstName"] = first_name
+            if last_name is not None:
+                update_data["lastName"] = last_name
+            
+            await self.batch_upsert_nodes(
+                [update_data],
+                collection=CollectionNames.USERS.value
+            )
+            self.logger.info(f"✅ Updated user node: {user_id}")
+        except Exception as e:
+            self.logger.error(f"❌ Failed to update user node: {str(e)}")
+            raise
+
+    async def delete_user_node(self, user_id: str) -> None:
+        """
+        Delete a user node and all related edges from the graph database.
+        Called synchronously from Node.js after user deletion in MongoDB.
+        """
+        try:
+            # Delete user node and all relationships
+            await self.delete_document(user_id, CollectionNames.USERS.value)
+            self.logger.info(f"✅ Deleted user node: {user_id}")
+        except Exception as e:
+            self.logger.error(f"❌ Failed to delete user node: {str(e)}")
             raise
 
     async def batch_upsert_anyone(

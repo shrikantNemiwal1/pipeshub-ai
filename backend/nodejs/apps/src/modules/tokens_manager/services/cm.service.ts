@@ -24,16 +24,6 @@ export const randomKeyGenerator = () => {
   return result;
 };
 
-export interface KafkaConfig {
-  brokers: string[];
-  ssl?: boolean;
-  sasl?: {
-    mechanism: 'plain' | 'scram-sha-256' | 'scram-sha-512';
-    username: string;
-    password: string;
-  };
-}
-
 export interface RedisConfig {
   host: string;
   port: number;
@@ -155,21 +145,6 @@ export class ConfigService {
       return JSON.parse(this.encryptionService.decrypt(encryptedConfig));
     }
     return null;
-  }
-
-  // Kafka Configuration (supports standard Kafka and AWS MSK with SASL/SCRAM)
-  public async getKafkaConfig(): Promise<KafkaConfig> {
-    return this.getEncryptedConfig<KafkaConfig>(configPaths.broker.kafka, {
-      brokers: process.env.KAFKA_BROKERS!.split(','),
-      ssl: process.env.KAFKA_SSL === 'true',
-      ...(process.env.KAFKA_USERNAME && {
-        sasl: {
-          mechanism: (process.env.KAFKA_SASL_MECHANISM || 'scram-sha-512') as 'plain' | 'scram-sha-256' | 'scram-sha-512',
-          username: process.env.KAFKA_USERNAME,
-          password: process.env.KAFKA_PASSWORD!,
-        },
-      }),
-    });
   }
 
   // Redis Configuration

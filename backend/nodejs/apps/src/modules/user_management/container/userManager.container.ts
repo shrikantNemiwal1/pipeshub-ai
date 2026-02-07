@@ -6,7 +6,6 @@ import { UserController } from '../controller/users.controller';
 import { ConfigurationManagerConfig } from '../../configuration_manager/config/config';
 import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
 import { UserGroupController } from '../controller/userGroups.controller';
-import { EntitiesEventProducer } from '../services/entity_events.service';
 import { AuthTokenService } from '../../../libs/services/authtoken.service';
 import { AuthMiddleware } from '../../../libs/middlewares/auth.middleware';
 import { AppConfig } from '../../tokens_manager/config/config';
@@ -69,21 +68,12 @@ export class UserManagerContainer {
         .bind<KeyValueStoreService>('KeyValueStoreService')
         .toConstantValue(keyValueStoreService);
 
-      const entityEventsService = new EntitiesEventProducer(
-        appConfig.kafka,
-        container.get('Logger'),
-      );
-      container
-        .bind<EntitiesEventProducer>('EntitiesEventProducer')
-        .toConstantValue(entityEventsService);
-
       // Rebind controllers
       container.bind<OrgController>('OrgController').toDynamicValue(() => {
         return new OrgController(
           appConfig,
           container.get<MailService>('MailService'),
           container.get('Logger'),
-          container.get<EntitiesEventProducer>('EntitiesEventProducer'),
         );
       });
       
@@ -97,7 +87,6 @@ export class UserManagerContainer {
           container.get<MailService>('MailService'),
           container.get<AuthService>('AuthService'),
           container.get('Logger'),
-          container.get<EntitiesEventProducer>('EntitiesEventProducer'),
         );
       });
 
@@ -147,16 +136,6 @@ export class UserManagerContainer {
         if (keyValueStoreService && keyValueStoreService.isConnected()) {
           await keyValueStoreService.disconnect();
           this.logger.info('KeyValueStoreService disconnected successfully');
-        }
-        const entityEventsService = this.instance.isBound(
-          'EntitiesEventProducer',
-        )
-          ? this.instance.get<EntitiesEventProducer>('EntitiesEventProducer')
-          : null;
-        // Disconnect services if they have a disconnect method
-        if (entityEventsService && entityEventsService.isConnected()) {
-          this.logger.info('Entity Events disconnected successfully');
-          await entityEventsService.stop();
         }
 
         this.logger.info('All User Manager services disconnected successfully');

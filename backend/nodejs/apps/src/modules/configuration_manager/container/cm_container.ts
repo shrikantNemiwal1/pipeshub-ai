@@ -2,12 +2,10 @@ import { Container } from 'inversify';
 import { Logger } from '../../../libs/services/logger.service';
 import { ConfigurationManagerConfig } from '../config/config';
 import { KeyValueStoreService } from '../../../libs/services/keyValueStore.service';
-import { EntitiesEventProducer } from '../../user_management/services/entity_events.service';
 import { AuthTokenService } from '../../../libs/services/authtoken.service';
 import { AuthMiddleware } from '../../../libs/middlewares/auth.middleware';
 import { AppConfig } from '../../tokens_manager/config/config';
 import { ConfigService } from '../services/updateConfig.service';
-import { SyncEventProducer } from '../services/kafka_events.service';
 const loggerConfig = {
   service: 'Configuration Manager Service',
 };
@@ -53,22 +51,6 @@ export class ConfigurationManagerContainer {
         .bind<KeyValueStoreService>('KeyValueStoreService')
         .toConstantValue(keyValueStoreService);
 
-      const syncEventsService = new SyncEventProducer(
-        appConfig.kafka,
-        container.get('Logger'),
-      );
-      container
-        .bind<SyncEventProducer>('SyncEventProducer')
-        .toConstantValue(syncEventsService);
-
-      const entityEventsService = new EntitiesEventProducer(
-        appConfig.kafka,
-        container.get('Logger'),
-      );
-      container
-        .bind<EntitiesEventProducer>('EntitiesEventProducer')
-        .toConstantValue(entityEventsService);
-
       container.bind<ConfigService>('ConfigService').toDynamicValue(() => {
         return new ConfigService(appConfig, container.get('Logger'));
       });
@@ -112,30 +94,10 @@ export class ConfigurationManagerContainer {
           ? this.instance.get<KeyValueStoreService>('KeyValueStoreService')
           : null;
 
-        const entityEventsService = this.instance.isBound(
-          'EntitiesEventProducer',
-        )
-          ? this.instance.get<EntitiesEventProducer>('EntitiesEventProducer')
-          : null;
-
-        const syncEventsService = this.instance.isBound('SyncEventProducer')
-          ? this.instance.get<SyncEventProducer>('SyncEventProducer')
-          : null;
-
         // Disconnect services if they have a disconnect method
         if (keyValueStoreService && keyValueStoreService.isConnected()) {
           await keyValueStoreService.disconnect();
           this.logger.info('KeyValueStoreService disconnected successfully');
-        }
-
-        if (entityEventsService && entityEventsService.isConnected()) {
-          await entityEventsService.disconnect();
-          this.logger.info('EntitiesEventProducer disconnected successfully');
-        }
-
-        if (syncEventsService && syncEventsService.isConnected()) {
-          await syncEventsService.disconnect();
-          this.logger.info('SyncEventProducer disconnected successfully');
         }
 
         this.logger.info(

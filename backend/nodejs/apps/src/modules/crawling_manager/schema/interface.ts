@@ -12,7 +12,9 @@ import {
   IOnceCrawlingSchedule,
   IWeeklyCrawlingSchedule,
 } from './scheduler/scheduler';
-import { JobProgress } from 'bullmq';
+// BullMQ removed - crawling manager moved to Python
+// import { JobProgress } from 'bullmq';
+type JobProgress = number | object;
 
 export interface CrawlingJobData {
   connector: string;

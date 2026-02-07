@@ -13,7 +13,6 @@ import { AuthTokenService } from '../../../libs/services/authtoken.service';
 import { AuthMiddleware } from '../../../libs/middlewares/auth.middleware';
 import { AppConfig } from '../../tokens_manager/config/config';
 import { JitProvisioningService } from '../services/jit-provisioning.service';
-import { EntitiesEventProducer } from '../../user_management/services/entity_events.service';
 
 const loggerConfig = {
   service: 'Auth Service Container',
@@ -83,19 +82,10 @@ export class AuthServiceContainer {
         .bind<ConfigurationManagerService>('ConfigurationManagerService')
         .toConstantValue(configurationService);
 
-      // Initialize event producer for JIT provisioning
-      const entityEventsService = new EntitiesEventProducer(
-        appConfig.kafka,
-        logger,
-      );
-      container
-        .bind<EntitiesEventProducer>('EntitiesEventProducer')
-        .toConstantValue(entityEventsService);
-
       // JIT Provisioning Service - shared service for user provisioning
       const jitProvisioningService = new JitProvisioningService(
         logger,
-        entityEventsService,
+        appConfig,
       );
       container
         .bind<JitProvisioningService>('JitProvisioningService')
@@ -148,12 +138,6 @@ export class AuthServiceContainer {
           ? this.instance.get<KeyValueStoreService>('KeyValueStoreService')
           : null;
 
-        const entityEventsService = this.instance.isBound(
-          'EntitiesEventProducer',
-        )
-          ? this.instance.get<EntitiesEventProducer>('EntitiesEventProducer')
-          : null;
-
         // Disconnect services if they have a disconnect method
         if (redisService && redisService.isConnected()) {
           await redisService.disconnect();
@@ -161,10 +145,6 @@ export class AuthServiceContainer {
 
         if (keyValueStoreService && keyValueStoreService.isConnected()) {
           await keyValueStoreService.disconnect();
-        }
-
-        if (entityEventsService && entityEventsService.isConnected()) {
-          await entityEventsService.stop();
         }
 
         this.logger.info('All auth services disconnected successfully');

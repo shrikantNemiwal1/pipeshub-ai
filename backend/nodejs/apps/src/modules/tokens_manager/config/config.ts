@@ -19,15 +19,6 @@ export interface AppConfig {
   connectorBackend: string;
   connectorPublicUrl: string;
   indexingBackend: string;
-  kafka: {
-    brokers: string[];
-    ssl?: boolean;
-    sasl?: {
-      mechanism: 'plain' | 'scram-sha-256' | 'scram-sha-512';
-      username: string;
-      password: string;
-    };
-  };
   redis: {
     host: string;
     port: number;
@@ -97,7 +88,6 @@ export const loadAppConfig = async (): Promise<AppConfig> => {
     aiBackend: await configService.getAiBackendUrl(),
     storageBackend: await configService.getStorageBackendUrl(),
     tokenBackend: await configService.getTokenBackendUrl(),
-    kafka: await configService.getKafkaConfig(),
     redis: await configService.getRedisConfig(),
     arango: await configService.getArangoConfig(),
     qdrant: await configService.getQdrantConfig(),

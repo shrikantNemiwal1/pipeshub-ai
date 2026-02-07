@@ -1,14 +1,11 @@
 import { injectable, inject } from 'inversify';
 import { Logger } from '../../../libs/services/logger.service';
-import { BadRequestError } from '../../../libs/errors/http.errors';
+import { BadRequestError, ServiceUnavailableError } from '../../../libs/errors/http.errors';
 import { Users } from '../../user_management/schema/users.schema';
 import { UserGroups } from '../../user_management/schema/userGroup.schema';
-import {
-  EntitiesEventProducer,
-  EventType,
-  UserAddedEvent,
-  SyncAction,
-} from '../../user_management/services/entity_events.service';
+import { AppConfig } from '../../tokens_manager/config/config';
+import axios from 'axios';
+import { graphDbServiceJwtGenerator } from '../../../libs/utils/createJwt';
 
 export interface JitUserDetails {
   firstName?: string;
@@ -26,7 +23,7 @@ export type JitProvider = 'google' | 'microsoft' | 'azureAd' | 'oauth' | 'saml';
 export class JitProvisioningService {
   constructor(
     @inject('Logger') private logger: Logger,
-    @inject('EntitiesEventProducer') private eventService: EntitiesEventProducer,
+    @inject('AppConfig') private config: AppConfig,
   ) {}
 
   /**
@@ -62,6 +59,7 @@ export class JitProvisioningService {
     });
 
     await newUser.save();
+    this.logger.info(`User created in MongoDB during ${provider} JIT provisioning`, { userId: newUser._id });
 
     // Add to everyone group
     await UserGroups.updateOne(
@@ -69,27 +67,49 @@ export class JitProvisioningService {
       { $addToSet: { users: newUser._id } },
     );
 
-    // Publish user creation event
+    // Synchronously create user in graph database
     try {
-      await this.eventService.start();
-      await this.eventService.publishEvent({
-        eventType: EventType.NewUserEvent,
-        timestamp: Date.now(),
-        payload: {
-          orgId: orgId.toString(),
-          userId: newUser._id,
-          fullName: newUser.fullName,
-          email: newUser.email,
-          syncAction: SyncAction.Immediate,
-        } as UserAddedEvent,
-      });
-    } catch (eventError) {
-      this.logger.error('Failed to publish user creation event', {
-        error: eventError,
+      const graphToken = graphDbServiceJwtGenerator(
+        orgId,
+        this.config.scopedJwtSecret
+      );
+      
+      await axios.post(
+        `${this.config.connectorBackend}/api/v1/connectors/graph/user`,
+        {
+          userId: String(newUser._id),
+          orgId: orgId,
+          fullName: userDetails.fullName,
+          email: email,
+          firstName: userDetails.firstName,
+          lastName: userDetails.lastName,
+          syncAction: 'none', // Don't trigger immediate sync
+        },
+        {
+          timeout: 30000, // Increased to 30s - KB creation takes time
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${graphToken}`,
+          },
+        }
+      );
+      this.logger.info(`User created in graph database with KB and permissions during ${provider} JIT provisioning`, { userId: newUser._id });
+    } catch (graphError: any) {
+      // Rollback: Delete user from MongoDB and remove from group
+      this.logger.error(`Failed to create user in graph database during ${provider} JIT provisioning, rolling back`, {
         userId: newUser._id,
+        error: graphError.message,
       });
-    } finally {
-      await this.eventService.stop();
+      
+      await Users.deleteOne({ _id: newUser._id });
+      await UserGroups.updateOne(
+        { orgId, type: 'everyone' },
+        { $pull: { users: newUser._id } }
+      );
+      
+      throw new ServiceUnavailableError(
+        'Connector service is unavailable. Please try again later.'
+      );
     }
 
     this.logger.info(`User auto-provisioned successfully via ${provider}`, {

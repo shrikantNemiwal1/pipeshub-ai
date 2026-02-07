@@ -12,6 +12,7 @@ from app.api.middlewares.auth import authMiddleware
 from app.api.routes.entity import router as entity_router
 from app.config.constants.arangodb import AccountType
 from app.connectors.api.router import router
+from app.connectors.api.crawling_routes import router as crawling_router
 from app.connectors.core.base.data_store.graph_data_store import GraphDataStore
 from app.connectors.core.base.token_service.startup_service import startup_service
 from app.connectors.core.factory.connector_factory import ConnectorFactory
@@ -41,6 +42,7 @@ async def get_initialized_container() -> ConnectorAppContainer:
                 "app.core.celery_app",
                 "app.connectors.sources.google.common.sync_tasks",
                 "app.connectors.api.router",
+                "app.connectors.api.crawling_routes",  # Crawling/scheduling routes
                 "app.connectors.sources.localKB.api.kb_router",
                 "app.connectors.sources.localKB.api.knowledge_hub_router",
                 "app.api.routes.entity",
@@ -269,6 +271,14 @@ async def shutdown_container_resources(container: ConnectorAppContainer) -> None
         # Stop messaging producer
         await stop_messaging_producer(container)
 
+        # Stop crawling scheduler
+        try:
+            crawling_scheduler = container.crawling_scheduler()
+            crawling_scheduler.shutdown()
+            logger.info("✅ Crawling scheduler shut down successfully")
+        except Exception as e:
+            logger.warning(f"Error shutting down crawling scheduler: {e}")
+
         # Stop startup services (token refresh)
         try:
             await startup_service.shutdown()
@@ -379,6 +389,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
     # Resume sync services - pass already resolved graph_provider and data_store
     asyncio.create_task(resume_sync_services(app_container, data_store))
+
+    # Start the crawling scheduler
+    try:
+        crawling_scheduler = app_container.crawling_scheduler()
+        crawling_scheduler.start()
+        logger.info("✅ Crawling scheduler started successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to start crawling scheduler: {str(e)}")
+        # Don't fail startup - scheduler is not critical
 
     yield
     logger.info("🔄 Shut down application started")
@@ -493,7 +512,8 @@ async def health_check() -> JSONResponse:
 app.include_router(entity_router)
 app.include_router(kb_router)
 app.include_router(knowledge_hub_router)
-app.include_router(router)
+app.include_router(crawling_router)  # Crawling/scheduling routes
+app.include_router(router)  # Main connector routes (should be last as catch-all)
 
 
 

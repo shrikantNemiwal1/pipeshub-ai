@@ -15,18 +15,10 @@ import {
   LargePayloadError,
   NotFoundError,
   UnauthorizedError,
+  ServiceUnavailableError,
 } from '../../../libs/errors/http.errors';
 import { inject, injectable } from 'inversify';
 import { MailService } from '../services/mail.service';
-import {
-  EntitiesEventProducer,
-  Event,
-  EventType,
-  UserAddedEvent,
-  UserDeletedEvent,
-  UserUpdatedEvent,
-  SyncAction,
-} from '../services/entity_events.service';
 import { Logger } from '../../../libs/services/logger.service';
 import { AppConfig } from '../../tokens_manager/config/config';
 import { UserGroups } from '../schema/userGroup.schema';
@@ -38,6 +30,8 @@ import { AIServiceCommand } from '../../../libs/commands/ai_service/ai.service.c
 import { HttpMethod } from '../../../libs/enums/http-methods.enum';
 import { HTTP_STATUS } from '../../../libs/enums/http-status.enum';
 import { validateNoFormatSpecifiers, validateNoXSS } from '../../../utils/xss-sanitization';
+import axios from 'axios';
+import { graphDbServiceJwtGenerator } from '../../../libs/utils/createJwt';
 
 @injectable()
 export class UserController {
@@ -46,8 +40,6 @@ export class UserController {
     @inject('MailService') private mailService: MailService,
     @inject('AuthService') private authService: AuthService,
     @inject('Logger') private logger: Logger,
-    @inject('EntitiesEventProducer')
-    private eventService: EntitiesEventProducer,
   ) {}
 
   async getAllUsers(
@@ -251,27 +243,61 @@ export class UserController {
         orgId: req.user?.orgId,
       });
 
+      // Save user to MongoDB
+      await newUser.save();
+      this.logger.debug('User created in MongoDB', { userId: newUser._id });
+
+      // Add to everyone group
       await UserGroups.updateOne(
         { orgId: newUser.orgId, type: 'everyone' }, // Find the everyone group in the same org
         { $addToSet: { users: newUser._id } }, // Add user to the group if not already present
       );
 
-      await this.eventService.start();
-      const event: Event = {
-        eventType: EventType.NewUserEvent,
-        timestamp: Date.now(),
-        payload: {
-          orgId: newUser.orgId.toString(),
+      // Synchronously create user in graph database (Neo4j/ArangoDB)
+      try {
+        const graphToken = graphDbServiceJwtGenerator(
+          String(newUser.orgId),
+          this.config.scopedJwtSecret
+        );
+        
+        await axios.post(
+          `${this.config.connectorBackend}/api/v1/connectors/graph/user`,
+          {
+            userId: String(newUser._id),
+            orgId: String(newUser.orgId),
+            fullName: newUser.fullName,
+            email: newUser.email,
+            firstName: newUser.firstName,
+            lastName: newUser.lastName,
+            syncAction: 'none', // Don't trigger immediate sync
+          },
+          {
+            timeout: 30000, // Increased to 30s - KB creation takes time
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${graphToken}`,
+            },
+          }
+        );
+        this.logger.debug('User created in graph database with KB and permissions', { userId: newUser._id });
+      } catch (graphError: any) {
+        // Rollback: Delete user from MongoDB and remove from group
+        this.logger.error('Failed to create user in graph database, rolling back', {
           userId: newUser._id,
-          fullName: newUser.fullName,
-          email: newUser.email,
-          syncAction: SyncAction.Immediate,
-        } as UserAddedEvent,
-      };
-      await this.eventService.publishEvent(event);
-      await this.eventService.stop();
-      await newUser.save();
-      this.logger.debug('user created');
+          error: graphError.message,
+        });
+        
+        await Users.deleteOne({ _id: newUser._id });
+        await UserGroups.updateOne(
+          { orgId: newUser.orgId, type: 'everyone' },
+          { $pull: { users: newUser._id } }
+        );
+        
+        throw new ServiceUnavailableError(
+          'Connector service is unavailable. Please try again later.'
+        );
+      }
+
       res.status(201).json(newUser);
     } catch (error) {
       next(error);
@@ -300,6 +326,7 @@ export class UserController {
     });
 
     await newUser.save();
+    logger.info('User created in MongoDB during SAML provisioning', { userId: newUser._id });
 
     // Add to everyone group
     await UserGroups.updateOne(
@@ -307,27 +334,49 @@ export class UserController {
       { $addToSet: { users: newUser._id } },
     );
 
-    // Publish user creation event
+    // Synchronously create user in graph database
     try {
-      await this.eventService.start();
-      await this.eventService.publishEvent({
-        eventType: EventType.NewUserEvent,
-        timestamp: Date.now(),
-        payload: {
-          orgId: orgId.toString(),
-          userId: newUser._id,
-          fullName: newUser.fullName,
-          email: newUser.email,
-          syncAction: SyncAction.Immediate,
-        } as UserAddedEvent,
-      });
-    } catch (eventError) {
-      logger.error('Failed to publish user creation event', {
-        error: eventError,
+      const graphToken = graphDbServiceJwtGenerator(
+        orgId,
+        this.config.scopedJwtSecret
+      );
+      
+      await axios.post(
+        `${this.config.connectorBackend}/api/v1/connectors/graph/user`,
+        {
+          userId: String(newUser._id),
+          orgId: orgId,
+          fullName: userDetails.fullName,
+          email: email,
+          firstName: userDetails.firstName,
+          lastName: userDetails.lastName,
+          syncAction: 'none', // Don't trigger immediate sync
+        },
+        {
+          timeout: 30000, // Increased to 30s - KB creation takes time
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${graphToken}`,
+          },
+        }
+      );
+      logger.info('User created in graph database with KB and permissions during SAML provisioning', { userId: newUser._id });
+    } catch (graphError: any) {
+      // Rollback: Delete user from MongoDB and remove from group
+      logger.error('Failed to create user in graph database during SAML provisioning, rolling back', {
         userId: newUser._id,
+        error: graphError.message,
       });
-    } finally {
-      await this.eventService.stop();
+      
+      await Users.deleteOne({ _id: newUser._id });
+      await UserGroups.updateOne(
+        { orgId, type: 'everyone' },
+        { $pull: { users: newUser._id } }
+      );
+      
+      throw new ServiceUnavailableError(
+        'Connector service is unavailable. Please try again later.'
+      );
     }
 
     logger.info('User auto-provisioned successfully', {
@@ -368,6 +417,7 @@ export class UserController {
     });
 
     await newUser.save();
+    logger.info(`User created in MongoDB during ${provider} JIT provisioning`, { userId: newUser._id });
 
     // Add to everyone group
     await UserGroups.updateOne(
@@ -375,28 +425,52 @@ export class UserController {
       { $addToSet: { users: newUser._id } },
     );
 
-    // Publish user creation event
+    // Synchronously create user in graph database
     try {
-      await this.eventService.start();
-      await this.eventService.publishEvent({
-        eventType: EventType.NewUserEvent,
-        timestamp: Date.now(),
-        payload: {
-          orgId: orgId.toString(),
-          userId: newUser._id,
-          fullName: newUser.fullName,
-          email: newUser.email,
-          syncAction: SyncAction.Immediate,
-        } as UserAddedEvent,
-      });
-    } catch (eventError) {
-      logger.error('Failed to publish user creation event', {
-        error: eventError,
+      const graphToken = graphDbServiceJwtGenerator(
+        orgId,
+        this.config.scopedJwtSecret
+      );
+      
+      await axios.post(
+        `${this.config.connectorBackend}/api/v1/connectors/graph/user`,
+        {
+          userId: String(newUser._id),
+          orgId: orgId,
+          fullName: userDetails.fullName,
+          email: email,
+          firstName: userDetails.firstName,
+          lastName: userDetails.lastName,
+          syncAction: 'none', // Don't trigger immediate sync
+        },
+        {
+          timeout: 30000, // Increased to 30s - KB creation takes time
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${graphToken}`,
+          },
+        }
+      );
+      logger.info(`User created in graph database with KB and permissions during ${provider} JIT provisioning`, { userId: newUser._id });
+    } catch (graphError: any) {
+      // Rollback: Delete user from MongoDB and remove from group
+      logger.error(`Failed to create user in graph database during ${provider} JIT provisioning, rolling back`, {
         userId: newUser._id,
+        error: graphError.message,
       });
-    } finally {
-      await this.eventService.stop();
+      
+      await Users.deleteOne({ _id: newUser._id });
+      await UserGroups.updateOne(
+        { orgId, type: 'everyone' },
+        { $pull: { users: newUser._id } }
+      );
+      
+      throw new ServiceUnavailableError(
+        'Connector service is unavailable. Please try again later.'
+      );
     }
+
+    // No event publishing needed - user creation is synchronous
 
     logger.info(`User auto-provisioned successfully via ${provider}`, {
       userId: newUser._id,
@@ -570,27 +644,57 @@ export class UserController {
         }
       }
     
-      await user.save();
-
-      await this.eventService.start();
-
-      const event: Event = {
-        eventType: EventType.UpdateUserEvent,
-        timestamp: Date.now(),
-        payload: {
-          orgId: user.orgId.toString(),
-          userId: user._id,
-          fullName: user.fullName,
-          ...(user.firstName && { firstName: user.firstName }),
-          ...(user.lastName && { lastName: user.lastName }),
-          ...(user.designation && { designation: user.designation }),
-          email: user.email,
-        } as UserUpdatedEvent,
+      // Save old state for potential rollback
+      const oldUserState = {
+        fullName: user.fullName,
+        email: user.email,
+        firstName: user.firstName,
+        lastName: user.lastName,
       };
 
-      await this.eventService.publishEvent(event);
-      await this.eventService.stop();
-      // Save the updated user
+      await user.save();
+      this.logger.debug('User updated in MongoDB', { userId: id });
+
+      // Synchronously update user in graph database
+      try {
+        const graphToken = graphDbServiceJwtGenerator(
+          String(req.user.orgId),
+          this.config.scopedJwtSecret
+        );
+        
+        await axios.put(
+          `${this.config.connectorBackend}/api/v1/connectors/graph/user/${id}`,
+          {
+            orgId: String(user.orgId), // Required by EntityEventService
+            fullName: user.fullName,
+            email: user.email,
+            firstName: user.firstName,
+            lastName: user.lastName,
+          },
+          {
+            timeout: 10000, // 10s timeout for update operations
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${graphToken}`,
+            },
+          }
+        );
+        this.logger.debug('User updated in graph database', { userId: id });
+      } catch (graphError: any) {
+        // Rollback: Restore old user state in MongoDB
+        this.logger.error('Failed to update user in graph database, rolling back', {
+          userId: id,
+          error: graphError.message,
+        });
+        
+        Object.assign(user, oldUserState);
+        await user.save();
+        
+        throw new ServiceUnavailableError(
+          'Connector service is unavailable. Please try again later.'
+        );
+      }
+
       res.json(user.toObject());
     } catch (error) {
       next(error);
@@ -620,23 +724,8 @@ export class UserController {
       user.fullName = req.body.fullName;
       await user.save();
 
-      await this.eventService.start();
-      const event: Event = {
-        eventType: EventType.UpdateUserEvent,
-        timestamp: Date.now(),
-        payload: {
-          orgId: user.orgId.toString(),
-          userId: user._id,
-          fullName: user.fullName,
-          ...(user.firstName && { firstName: user.firstName }),
-          ...(user.lastName && { lastName: user.lastName }),
-          ...(user.designation && { designation: user.designation }),
-          email: user.email,
-        } as UserUpdatedEvent,
-      };
+      // No event publishing needed - user update is synchronous
 
-      await this.eventService.publishEvent(event);
-      await this.eventService.stop();
       res.json(user.toObject());
     } catch (error) {
       next(error);
@@ -667,23 +756,8 @@ export class UserController {
       user.firstName = req.body.firstName;
       await user.save();
 
-      await this.eventService.start();
-      const event: Event = {
-        eventType: EventType.UpdateUserEvent,
-        timestamp: Date.now(),
-        payload: {
-          orgId: user.orgId.toString(),
-          userId: user._id,
-          fullName: user.fullName,
-          ...(user.firstName && { firstName: user.firstName }),
-          ...(user.lastName && { lastName: user.lastName }),
-          ...(user.designation && { designation: user.designation }),
-          email: user.email,
-        } as UserUpdatedEvent,
-      };
+      // No event publishing needed - user update is synchronous
 
-      await this.eventService.publishEvent(event);
-      await this.eventService.stop();
       res.json(user.toObject());
     } catch (error) {
       next(error);
@@ -714,23 +788,8 @@ export class UserController {
       user.lastName = req.body.lastName;
       await user.save();
 
-      await this.eventService.start();
-      const event: Event = {
-        eventType: EventType.UpdateUserEvent,
-        timestamp: Date.now(),
-        payload: {
-          orgId: user.orgId.toString(),
-          userId: user._id,
-          fullName: user.fullName,
-          ...(user.firstName && { firstName: user.firstName }),
-          ...(user.lastName && { lastName: user.lastName }),
-          ...(user.designation && { designation: user.designation }),
-          email: user.email,
-        } as UserUpdatedEvent,
-      };
+      // No event publishing needed - user update is synchronous
 
-      await this.eventService.publishEvent(event);
-      await this.eventService.stop();
       res.json(user.toObject());
     } catch (error) {
       next(error);
@@ -761,23 +820,8 @@ export class UserController {
       user.designation = req.body.designation;
       await user.save();
 
-      await this.eventService.start();
-      const event: Event = {
-        eventType: EventType.UpdateUserEvent,
-        timestamp: Date.now(),
-        payload: {
-          orgId: user.orgId.toString(),
-          userId: user._id,
-          fullName: user.fullName,
-          ...(user.firstName && { firstName: user.firstName }),
-          ...(user.lastName && { lastName: user.lastName }),
-          ...(user.designation && { designation: user.designation }),
-          email: user.email,
-        } as UserUpdatedEvent,
-      };
+      // No event publishing needed - user update is synchronous
 
-      await this.eventService.publishEvent(event);
-      await this.eventService.stop();
       res.json(user.toObject());
     } catch (error) {
       next(error);
@@ -808,23 +852,8 @@ export class UserController {
       user.email = req.body.email;
       await user.save();
 
-      await this.eventService.start();
-      const event: Event = {
-        eventType: EventType.UpdateUserEvent,
-        timestamp: Date.now(),
-        payload: {
-          orgId: user.orgId.toString(),
-          userId: user._id,
-          fullName: user.fullName,
-          ...(user.firstName && { firstName: user.firstName }),
-          ...(user.lastName && { lastName: user.lastName }),
-          ...(user.designation && { designation: user.designation }),
-          email: user.email,
-        } as UserUpdatedEvent,
-      };
+      // No event publishing needed - user update is synchronous
 
-      await this.eventService.publishEvent(event);
-      await this.eventService.stop();
       res.json(user.toObject());
     } catch (error) {
       next(error);
@@ -871,34 +900,66 @@ export class UserController {
         throw new BadRequestError('Admin User deletion is not allowed');
       }
 
+      // Remove user from all groups
       await UserGroups.updateMany(
         { orgId, users: userId },
         { $pull: { users: userId } },
       );
 
+      // Mark user as deleted (soft delete)
       user.isDeleted = true;
       user.hasLoggedIn = false;
       user.deletedBy = req.user._id;
 
+      // Remove password
       await UserCredentials.updateOne(
         { userId },
         { $unset: { hashedPassword: '' } },
       );
 
       await user.save();
+      this.logger.debug('User soft-deleted in MongoDB', { userId });
 
-      await this.eventService.start();
-      const event: Event = {
-        eventType: EventType.DeleteUserEvent,
-        timestamp: Date.now(),
-        payload: {
-          orgId: user.orgId.toString(),
-          userId: user._id,
-          email: user.email,
-        } as UserDeletedEvent,
-      };
-      await this.eventService.publishEvent(event);
-      await this.eventService.stop();
+      // Synchronously delete user from graph database
+      try {
+        const graphToken = graphDbServiceJwtGenerator(
+          String(req.user.orgId),
+          this.config.scopedJwtSecret
+        );
+        
+        await axios.delete(
+          `${this.config.connectorBackend}/api/v1/connectors/graph/user/${userId}`,
+          {
+            timeout: 10000, // 10s timeout for delete operations
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${graphToken}`,
+            },
+          }
+        );
+        this.logger.debug('User deleted from graph database', { userId });
+      } catch (graphError: any) {
+        // Rollback: Restore user state and re-add to groups
+        this.logger.error('Failed to delete user from graph database, rolling back', {
+          userId,
+          error: graphError.message,
+        });
+        
+        user.isDeleted = false;
+        user.hasLoggedIn = true;
+        user.deletedBy = undefined;
+        await user.save();
+        
+        // Re-add user to groups
+        await UserGroups.updateMany(
+          { orgId, _id: { $in: groups.map(g => g._id) } },
+          { $addToSet: { users: userId } }
+        );
+        
+        throw new ServiceUnavailableError(
+          'Connector service is unavailable. Please try again later.'
+        );
+      }
 
       res.json({ message: 'User deleted successfully' });
     } catch (error) {
@@ -1211,7 +1272,6 @@ export class UserController {
       }
       let errorSendingMail = false;
 
-      await this.eventService.start();
       for (let i = 0; i < emailsForNewAccounts.length; ++i) {
         const email = emailsForNewAccounts[i];
         const userId = newUsers[i]?._id;
@@ -1231,17 +1291,7 @@ export class UserController {
           { $addToSet: { users: userId } }, // Add user to the group if not already present
         );
 
-        const event: Event = {
-          eventType: EventType.NewUserEvent,
-          timestamp: Date.now(),
-          payload: {
-            orgId: req.user?.orgId.toString(),
-            userId: userId,
-            email: email,
-            syncAction: SyncAction.Immediate,
-          } as UserAddedEvent,
-        };
-        await this.eventService.publishEvent(event);
+        // No event publishing needed - user creation is synchronous
 
         const authToken = fetchConfigJwtGenerator(
           userId.toString(),
@@ -1318,17 +1368,7 @@ export class UserController {
             'User ID missing while inviting restored user. Please ensure user restoration was successful.',
           );
         }
-        const event: Event = {
-          eventType: EventType.NewUserEvent,
-          timestamp: Date.now(),
-          payload: {
-            orgId: req.user?.orgId.toString(),
-            userId: userId,
-            email: email,
-            syncAction: SyncAction.Immediate,
-          } as UserAddedEvent,
-        };
-        await this.eventService.publishEvent(event);
+        // No event publishing needed - user restoration is synchronous
 
         const authToken = fetchConfigJwtGenerator(
           userId.toString(),
@@ -1390,8 +1430,6 @@ export class UserController {
           }
         }
       }
-
-      await this.eventService.stop();
 
       if (errorSendingMail) {
         res.status(200).json({

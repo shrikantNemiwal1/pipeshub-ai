@@ -3,7 +3,6 @@ import * as crypto from 'crypto';
 import { AuthenticatedUserRequest } from './../../../libs/middlewares/types';
 import { NextFunction, Response } from 'express';
 import { Logger } from '../../../libs/services/logger.service';
-import { RecordRelationService } from '../services/kb.relation.service';
 import { IRecordDocument } from '../types/record';
 import { IFileRecordDocument } from '../types/file_record';
 import {
@@ -695,7 +694,6 @@ export const deleteFolder =
  */
 export const uploadRecordsToKB =
   (
-    recordRelationService: RecordRelationService,
     keyValueStoreService: KeyValueStoreService,
     appConfig: AppConfig,
   ) =>
@@ -798,11 +796,8 @@ export const uploadRecordsToKB =
             file,
             fileName,
             isVersioned,
-            record,
-            fileRecord,
             keyValueStoreService,
             appConfig.storage,
-            recordRelationService,
           );
 
         // Update record and fileRecord with storage info
@@ -860,7 +855,6 @@ export const uploadRecordsToKB =
  */
 export const uploadRecordsToFolder =
   (
-    recordRelationService: RecordRelationService,
     keyValueStoreService: KeyValueStoreService,
     appConfig: AppConfig,
   ) =>
@@ -965,11 +959,8 @@ export const uploadRecordsToFolder =
             file,
             fileName,
             isVersioned,
-            record,
-            fileRecord,
             keyValueStoreService,
             appConfig.storage,
-            recordRelationService,
           );
 
         // Update record and fileRecord with storage info
@@ -2627,7 +2618,7 @@ export const getRecordBuffer =
   };
 
 export const reindexFailedRecords =
-  (recordRelationService: RecordRelationService, appConfig: AppConfig) =>
+  (appConfig: AppConfig) =>
   async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
     try {
       const userId = req.user?.userId;
@@ -2645,31 +2636,38 @@ export const reindexFailedRecords =
       );
 
       const reindexPayload = {
-        userId,
         orgId,
         app: normalizeAppName(app),
         connectorId,
       };
 
-      const reindexResponse =
-        await recordRelationService.reindexFailedRecords(reindexPayload);
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/connectors/reindex-failed`,
+        HttpMethod.POST,
+        req.headers as Record<string, string>,
+        reindexPayload,
+      );
 
-      res.status(200).json({
-        reindexResponse,
-      });
+      handleConnectorResponse(
+        response,
+        res,
+        'Reindexing failed records',
+        'Failed to reindex records',
+      );
 
       return; // Added return statement
     } catch (error: any) {
       logger.error('Error re indexing failed records', {
         error,
       });
-      next(error);
+      const handleError = handleBackendError(error, 'reindex failed records');
+      next(handleError);
       return; // Added return statement
     }
   };
 
 export const resyncConnectorRecords =
-  (recordRelationService: RecordRelationService, appConfig: AppConfig) =>
+  (appConfig: AppConfig) =>
   async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
     try {
       const userId = req.user?.userId;
@@ -2687,27 +2685,32 @@ export const resyncConnectorRecords =
       );
 
       const resyncConnectorPayload = {
-        userId,
         orgId,
         connectorName: normalizeAppName(connectorName),
         connectorId,
       };
 
-      const resyncConnectorResponse =
-        await recordRelationService.resyncConnectorRecords(
-          resyncConnectorPayload,
-        );
+      const response = await executeConnectorCommand(
+        `${appConfig.connectorBackend}/api/v1/connectors/resync`,
+        HttpMethod.POST,
+        req.headers as Record<string, string>,
+        resyncConnectorPayload,
+      );
 
-      res.status(200).json({
-        resyncConnectorResponse,
-      });
+      handleConnectorResponse(
+        response,
+        res,
+        'Resyncing connector records',
+        'Failed to resync connector',
+      );
 
       return; // Added return statement
     } catch (error: any) {
       logger.error('Error resyncing connector records', {
         error,
       });
-      next(error);
+      const handleError = handleBackendError(error, 'resync connector records');
+      next(handleError);
       return; // Added return statement
     }
   };

@@ -160,3 +160,16 @@ export const scopedStorageServiceJwtGenerator = (
     },
   );
 };
+
+export const graphDbServiceJwtGenerator = (
+  orgId: string,
+  scopedJwtSecret: string,
+) => {
+  return jwt.sign(
+    { orgId, scopes: [TokenScopes.GRAPH_DB_SYNC] },
+    scopedJwtSecret,
+    {
+      expiresIn: '1h',
+    },
+  );
+};

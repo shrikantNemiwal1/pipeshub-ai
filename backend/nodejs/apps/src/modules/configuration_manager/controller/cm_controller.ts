@@ -37,19 +37,10 @@ import axios from 'axios';
 import { ARANGO_DB_NAME, MONGO_DB_NAME } from '../../../libs/enums/db.enum';
 import { ConfigService } from '../services/updateConfig.service';
 import {
-  ConnectorPublicUrlChangedEvent,
-  EntitiesEventProducer,
-  Event,
-  EventType,
-  GmailUpdatesDisabledEvent,
-  GmailUpdatesEnabledEvent,
-  LLMConfiguredEvent,
-  SyncEventProducer,
-} from '../services/kafka_events.service';
-import {
   AICommandOptions,
   AIServiceCommand,
 } from '../../../libs/commands/ai_service/ai.service.command';
+import { publishSyncEvent, publishConfigEvent } from '../../../libs/utils/python-event-publisher';
 import { HttpMethod } from '../../../libs/enums/http-methods.enum';
 import { PLATFORM_FEATURE_FLAGS } from '../constants/constants';
 import { getPlatformSettingsFromStore } from '../utils/util';
@@ -858,63 +849,12 @@ export const getRedisConfig =
     }
   };
 
-export const createKafkaConfig =
-  (keyValueStoreService: KeyValueStoreService) =>
-  async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
-    try {
-      const { brokers, sasl } = req.body;
-      const configManagerConfig = loadConfigurationManagerConfig();
-      const encryptedKafkaConfig = EncryptionService.getInstance(
-        configManagerConfig.algorithm,
-        configManagerConfig.secretKey,
-      ).encrypt(JSON.stringify({ brokers, sasl }));
-      await keyValueStoreService.set<string>(
-        configPaths.broker.kafka,
-        encryptedKafkaConfig,
-      );
-      const warningMessage = res.getHeader('warning');
-      res
-        .status(200)
-        .json({ message: 'Kafka config created successfully', warningMessage })
-        .end();
-    } catch (error: any) {
-      logger.error('Error creating kafka config', { error });
-      next(error);
-    }
-  };
-
-export const getKafkaConfig =
-  (keyValueStoreService: KeyValueStoreService) =>
-  async (_req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
-    try {
-      const configManagerConfig = loadConfigurationManagerConfig();
-      const encryptedKafkaConfig = await keyValueStoreService.get<string>(
-        configPaths.broker.kafka,
-      );
-      if (encryptedKafkaConfig) {
-        const kafkaConfig = JSON.parse(
-          EncryptionService.getInstance(
-            configManagerConfig.algorithm,
-            configManagerConfig.secretKey,
-          ).decrypt(encryptedKafkaConfig),
-        );
-
-        res.status(200).json(kafkaConfig).end();
-      } else {
-        res.status(200).json({}).end();
-      }
-    } catch (error: any) {
-      logger.error('Error getting kafka config', { error });
-      next(error);
-    }
-  };
-
 export const createGoogleWorkspaceCredentials =
   (
     keyValueStoreService: KeyValueStoreService,
     userId: string,
     orgId: string,
-    eventService: SyncEventProducer,
+    appConfig: AppConfig,
   ) =>
   async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
     try {
@@ -1049,44 +989,47 @@ export const createGoogleWorkspaceCredentials =
               existingConfig.topicName != topicName ||
               existingConfig.enableRealTimeUpdates != realTimeUpdatesEnabled
             ) {
-              if (realTimeUpdatesEnabled) {
-                await eventService.start();
-                const event: Event = {
-                  eventType: EventType.GmailUpdatesEnabledEvent,
-                  timestamp: Date.now(),
-                  payload: {
-                    orgId,
-                    topicName: req.body.topicName,
-                  } as GmailUpdatesEnabledEvent,
-                };
-                await eventService.publishEvent(event);
-                await eventService.stop();
-              } else {
-                await eventService.start();
-                const event: Event = {
-                  eventType: EventType.GmailUpdatesDisabledEvent,
-                  timestamp: Date.now(),
-                  payload: {
-                    orgId,
-                  } as GmailUpdatesDisabledEvent,
-                };
-                await eventService.publishEvent(event);
-                await eventService.stop();
+              // Publish Gmail updates event to Python connector service
+              try {
+                if (realTimeUpdatesEnabled) {
+                  await publishSyncEvent(
+                    appConfig.connectorBackend,
+                    'gmailUpdatesEnabledEvent',
+                    {
+                      orgId,
+                      topicName: req.body.topicName,
+                    }
+                  );
+                } else {
+                  await publishSyncEvent(
+                    appConfig.connectorBackend,
+                    'gmailUpdatesDisabledEvent',
+                    {
+                      orgId,
+                    }
+                  );
+                }
+              } catch (error) {
+                logger.error('Failed to publish Gmail updates event to Python', { error });
+                // Don't fail the request if event publishing fails
               }
             }
           } else {
             if (realTimeUpdatesEnabled) {
-              await eventService.start();
-              const event: Event = {
-                eventType: EventType.GmailUpdatesEnabledEvent,
-                timestamp: Date.now(),
-                payload: {
-                  orgId,
-                  topicName: req.body.topicName,
-                } as GmailUpdatesEnabledEvent,
-              };
-              await eventService.publishEvent(event);
-              await eventService.stop();
+              // Publish Gmail updates enabled event to Python connector service
+              try {
+                await publishSyncEvent(
+                  appConfig.connectorBackend,
+                  'gmailUpdatesEnabledEvent',
+                  {
+                    orgId,
+                    topicName: req.body.topicName,
+                  }
+                );
+              } catch (error) {
+                logger.error('Failed to publish Gmail updates enabled event to Python', { error });
+                // Don't fail the request if event publishing fails
+              }
             }
           }
 
@@ -1328,7 +1271,7 @@ export const deleteGoogleWorkspaceCredentials =
 export const setGoogleWorkspaceOauthConfig =
   (
     keyValueStoreService: KeyValueStoreService,
-    eventService: SyncEventProducer,
+    appConfig: AppConfig,
     orgId: string,
   ) =>
   async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
@@ -1366,44 +1309,47 @@ export const setGoogleWorkspaceOauthConfig =
           googleWorkSpaceConfig.topicName != topicName ||
           googleWorkSpaceConfig.enableRealTimeUpdates != realTimeUpdatesEnabled
         ) {
-          if (realTimeUpdatesEnabled) {
-            await eventService.start();
-            const event: Event = {
-              eventType: EventType.GmailUpdatesEnabledEvent,
-              timestamp: Date.now(),
-              payload: {
-                orgId,
-                topicName: req.body.topicName,
-              } as GmailUpdatesEnabledEvent,
-            };
-            await eventService.publishEvent(event);
-            await eventService.stop();
-          } else {
-            await eventService.start();
-            const event: Event = {
-              eventType: EventType.GmailUpdatesDisabledEvent,
-              timestamp: Date.now(),
-              payload: {
-                orgId,
-              } as GmailUpdatesDisabledEvent,
-            };
-            await eventService.publishEvent(event);
-            await eventService.stop();
+          // Publish Gmail updates event to Python connector service
+          try {
+            if (realTimeUpdatesEnabled) {
+              await publishSyncEvent(
+                appConfig.connectorBackend,
+                'gmailUpdatesEnabledEvent',
+                {
+                  orgId,
+                  topicName: req.body.topicName,
+                }
+              );
+            } else {
+              await publishSyncEvent(
+                appConfig.connectorBackend,
+                'gmailUpdatesDisabledEvent',
+                {
+                  orgId,
+                }
+              );
+            }
+          } catch (error) {
+            logger.error('Failed to publish Gmail updates event to Python', { error });
+            // Don't fail the request if event publishing fails
           }
         }
       } else {
         if (realTimeUpdatesEnabled) {
-          await eventService.start();
-          const event: Event = {
-            eventType: EventType.GmailUpdatesEnabledEvent,
-            timestamp: Date.now(),
-            payload: {
-              orgId,
-              topicName: req.body.topicName,
-            } as GmailUpdatesEnabledEvent,
-          };
-          await eventService.publishEvent(event);
-          await eventService.stop();
+          // Publish Gmail updates enabled event to Python connector service
+          try {
+            await publishSyncEvent(
+              appConfig.connectorBackend,
+              'gmailUpdatesEnabledEvent',
+              {
+                orgId,
+                topicName: req.body.topicName,
+              }
+            );
+          } catch (error) {
+            logger.error('Failed to publish Gmail updates enabled event to Python', { error });
+            // Don't fail the request if event publishing fails
+          }
         }
       }
 
@@ -1935,7 +1881,7 @@ export const getConnectorPublicUrl =
 export const setConnectorPublicUrl =
   (
     keyValueStoreService: KeyValueStoreService,
-    eventService: SyncEventProducer,
+    appConfig: AppConfig,
   ) =>
   async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
     try {
@@ -1971,16 +1917,20 @@ export const setConnectorPublicUrl =
         JSON.stringify(parsedUrls),
       );
 
-      await eventService.start();
-      let event: Event = {
-        eventType: EventType.ConnectorPublicUrlChangedEvent,
-        timestamp: Date.now(),
-        payload: {
-          url,
-          orgId: req.user.orgId,
-        } as ConnectorPublicUrlChangedEvent,
-      };
-      await eventService.publishEvent(event);
+      // Publish connector public URL changed event to Python connector service
+      try {
+        await publishSyncEvent(
+          appConfig.connectorBackend,
+          'connectorPublicUrlChanged',
+          {
+            url,
+            orgId: req.user.orgId,
+          }
+        );
+      } catch (error) {
+        logger.error('Failed to publish connector URL changed event to Python', { error });
+        // Don't fail the request if event publishing fails
+      }
 
       res.status(200).json({
         message: 'Connector Url saved successfully',
@@ -2088,11 +2038,9 @@ export const setMetricsCollectionRemoteServer =
     }
   };
 
-async function sendEvent(eventService: EntitiesEventProducer, event: Event) {
+async function sendEvent(appConfig: AppConfig, eventType: string, payload: any) {
   try {
-    await eventService.start();
-    await eventService.publishEvent(event);
-    await eventService.stop();
+    await publishConfigEvent(appConfig.connectorBackend, eventType, payload);
   } catch (error) {
     logger.error('Error sending event', { error });
   }
@@ -2101,7 +2049,6 @@ async function sendEvent(eventService: EntitiesEventProducer, event: Event) {
 export const createAIModelsConfig =
   (
     keyValueStoreService: KeyValueStoreService,
-    eventService: EntitiesEventProducer,
     appConfig: AppConfig,
   ) =>
   async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
@@ -2191,15 +2138,10 @@ export const createAIModelsConfig =
       );
 
       // Send event to notify other services about the new AI config
-      const event: Event = {
-        eventType: EventType.LLMConfiguredEvent,
-        timestamp: Date.now(),
-        payload: {
-          credentialsRoute: `${appConfig.cmBackend}/${aiModelRoute}`,
-        } as LLMConfiguredEvent,
-      };
-
-      await sendEvent(eventService, event);
+      // Publish LLM configured event to Python connector service
+      await sendEvent(appConfig, 'llmConfigured', {
+        credentialsRoute: `${appConfig.cmBackend}/${aiModelRoute}`,
+      });
 
       res.status(200).json({ message: 'AI config created successfully' }).end();
     } catch (error: any) {
@@ -2473,7 +2415,6 @@ export const getAvailableModelsByType =
 export const addAIModelProvider =
   (
     keyValueStoreService: KeyValueStoreService,
-    eventService: EntitiesEventProducer,
     appConfig: AppConfig,
   ) =>
   async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
@@ -2626,14 +2567,10 @@ export const addAIModelProvider =
         encryptedUpdatedConfig,
       );
 
-      const event: Event = {
-        eventType: EventType.LLMConfiguredEvent,
-        timestamp: Date.now(),
-        payload: {
-          credentialsRoute: `${appConfig.cmBackend}/${aiModelRoute}`,
-        } as LLMConfiguredEvent,
-      };
-      await sendEvent(eventService, event);
+      // Publish LLM configured event to Python connector service
+      await sendEvent(appConfig, 'llmConfigured', {
+        credentialsRoute: `${appConfig.cmBackend}/${aiModelRoute}`,
+      });
 
       res.status(200).json({
         status: 'success',
@@ -2657,7 +2594,6 @@ export const addAIModelProvider =
 export const updateAIModelProvider =
   (
     keyValueStoreService: KeyValueStoreService,
-    eventService: EntitiesEventProducer,
     appConfig: AppConfig,
   ) =>
   async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
@@ -2810,14 +2746,10 @@ export const updateAIModelProvider =
         encryptedUpdatedConfig,
       );
 
-      const event: Event = {
-        eventType: EventType.LLMConfiguredEvent,
-        timestamp: Date.now(),
-        payload: {
-          credentialsRoute: `${appConfig.cmBackend}/${aiModelRoute}`,
-        } as LLMConfiguredEvent,
-      };
-      await sendEvent(eventService, event);
+      // Publish LLM configured event to Python connector service
+      await sendEvent(appConfig, 'llmConfigured', {
+        credentialsRoute: `${appConfig.cmBackend}/${aiModelRoute}`,
+      });
       res.status(200).json({
         status: 'success',
         message: `${targetModelType.toUpperCase()} provider updated successfully`,
@@ -2841,7 +2773,6 @@ export const updateAIModelProvider =
 export const deleteAIModelProvider =
   (
     keyValueStoreService: KeyValueStoreService,
-    eventService: EntitiesEventProducer,
     appConfig: AppConfig,
   ) =>
   async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
@@ -2930,14 +2861,10 @@ export const deleteAIModelProvider =
         encryptedUpdatedConfig,
       );
 
-      const event: Event = {
-        eventType: EventType.LLMConfiguredEvent,
-        timestamp: Date.now(),
-        payload: {
-          credentialsRoute: `${appConfig.cmBackend}/${aiModelRoute}`,
-        } as LLMConfiguredEvent,
-      };
-      await sendEvent(eventService, event);
+      // Publish LLM configured event to Python connector service
+      await sendEvent(appConfig, 'llmConfigured', {
+        credentialsRoute: `${appConfig.cmBackend}/${aiModelRoute}`,
+      });
 
       res.status(200).json({
         status: 'success',
@@ -2960,7 +2887,6 @@ export const deleteAIModelProvider =
 export const updateDefaultAIModel =
   (
     keyValueStoreService: KeyValueStoreService,
-    eventService: EntitiesEventProducer,
     appConfig: AppConfig,
   ) =>
   async (req: AuthenticatedUserRequest, res: Response, next: NextFunction) => {
@@ -3038,14 +2964,10 @@ export const updateDefaultAIModel =
         encryptedUpdatedConfig,
       );
 
-      const event: Event = {
-        eventType: EventType.LLMConfiguredEvent,
-        timestamp: Date.now(),
-        payload: {
-          credentialsRoute: `${appConfig.cmBackend}/${aiModelRoute}`,
-        } as LLMConfiguredEvent,
-      };
-      await sendEvent(eventService, event);
+      // Publish LLM configured event to Python connector service
+      await sendEvent(appConfig, 'llmConfigured', {
+        credentialsRoute: `${appConfig.cmBackend}/${aiModelRoute}`,
+      });
 
       res.status(200).json({
         status: 'success',
