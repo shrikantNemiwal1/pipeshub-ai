@@ -2055,14 +2055,10 @@ class OutlookConnector(BaseConnector):
                     if email_address and email_address not in processed_emails:
                         processed_emails.add(email_address)
 
-                        if email_address.lower() == inbox_owner_email_lower:
-                            permission_type = PermissionType.OWNER
-                        else:
-                            permission_type = PermissionType.READ
-
                         permission = Permission(
                             email=email_address,
-                            type=permission_type,
+                            # Each user has a copy of the email in their mailbox, so they are the owner of the email
+                            type=PermissionType.OWNER,
                             entity_type=EntityType.USER,
                         )
                         permissions.append(permission)
