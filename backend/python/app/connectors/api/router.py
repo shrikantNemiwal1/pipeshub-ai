@@ -2394,6 +2394,59 @@ async def create_connector_instance(
                     logger.debug(f"Pre-validation: New OAuth config with name '{oauth_instance_name}' can be created")
 
         # ============================================================
+        # 7b. Non-Admin OAuth Validation
+        # ============================================================
+        # Non-admins creating OAUTH connectors:
+        # - MUST select an existing OAuth App (oauthConfigId)
+        # - CANNOT provide OAuth credentials (clientId, clientSecret, etc.)
+        if not is_admin and selected_auth_type and selected_auth_type.upper() == "OAUTH":
+            # Check if non-admin provided OAuth credentials (not allowed)
+            if config and config.get("auth"):
+                oauth_field_names = _get_oauth_field_names_from_registry(connector_type)
+                provided_oauth_credentials = [
+                    field_name for field_name in oauth_field_names
+                    if config.get("auth", {}).get(field_name) or
+                       config.get("auth", {}).get(field_name.replace("Id", "_id").replace("Secret", "_secret"))
+                ]
+
+                if provided_oauth_credentials:
+                    logger.warning(f"Non-admin user {user_id} attempted to provide OAuth credentials: {provided_oauth_credentials}")
+                    raise HTTPException(
+                        status_code=HttpStatusCode.FORBIDDEN.value,
+                        detail="Non-admin users cannot provide OAuth credentials. Please select an existing OAuth App from the dropdown."
+                    )
+
+            # Check if oauthConfigId is provided (required for non-admins)
+            provided_oauth_config_id = oauth_config_id or (config.get("auth", {}).get("oauthConfigId") if config else None)
+
+            if not provided_oauth_config_id:
+                logger.error(f"Non-admin user {user_id} attempted to create OAUTH connector without selecting OAuth App")
+                raise HTTPException(
+                    status_code=HttpStatusCode.BAD_REQUEST.value,
+                    detail="OAuth App selection is required. Please select an existing OAuth App or contact your administrator to create one."
+                )
+
+            # Validate that the selected OAuth App exists and is accessible
+            oauth_config_path = _get_oauth_config_path(connector_type)
+            existing_oauth_configs = await config_service.get_config(oauth_config_path, default=[])
+
+            if not isinstance(existing_oauth_configs, list):
+                existing_oauth_configs = []
+
+            oauth_config_found = _find_oauth_config_by_id(
+                existing_oauth_configs, provided_oauth_config_id, org_id
+            )
+
+            if not oauth_config_found:
+                logger.error(f"Non-admin user {user_id} selected invalid OAuth App {provided_oauth_config_id}")
+                raise HTTPException(
+                    status_code=HttpStatusCode.NOT_FOUND.value,
+                    detail="Selected OAuth App not found or not accessible. Please select a valid OAuth App."
+                )
+
+            logger.info(f"Non-admin user {user_id} validated OAuth App {provided_oauth_config_id} for connector creation")
+
+        # ============================================================
         # 8. Create Connector Instance in Database
         # ============================================================
         try:
@@ -2423,6 +2476,8 @@ async def create_connector_instance(
         # ============================================================
         # 9. Store Initial Configuration
         # ============================================================
+        # Non-admin OAUTH validation is handled above (Section 7b)
+        # Admin OAuth config creation/update happens below
         if config or oauth_config_id:
             logger.info(f"Storing initial config for instance {connector_id}")
 
