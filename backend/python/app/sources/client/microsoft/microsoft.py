@@ -144,12 +144,9 @@ class MSGraphClientWithDelegatedAuth:
                 payload_b64 += "=" * (4 - len(payload_b64) % 4)
                 claims = json.loads(base64.urlsafe_b64decode(payload_b64))
                 self._user_oid = claims.get("oid", "me")
-                if self._user_oid != "me":
-                    self.logger.debug(f"Extracted user OID from JWT: {self._user_oid}")
             else:
                 self._user_oid = "me"
-        except Exception as jwt_err:
-            self.logger.warning(f"Could not decode JWT for user OID, using 'me': {jwt_err}")
+        except Exception:
             self._user_oid = "me"
 
         # Set user ID in path_parameters for URL template resolution
@@ -860,34 +857,13 @@ class MSGraphClient(IClient):
                     oid = claims.get("oid")
                     if oid:
                         user_id_for_graph = oid
-                        logger.info(
-                            f"Extracted user OID from JWT for Graph API: {oid}"
-                        )
-            except Exception as jwt_err:
-                logger.warning(
-                    f"Could not decode JWT for user OID, falling back to 'me': {jwt_err}"
-                )
+            except Exception:
+                pass
 
             # Set the user ID in path_parameters so all /me/* URL templates
             # resolve to /users/{oid}/* instead of /users/me-token-to-replace/*
             if hasattr(graph_client, "path_parameters"):
                 graph_client.path_parameters["user%2Did"] = user_id_for_graph
-                logger.debug(
-                    f"Set graph_client path_parameters['user%2Did'] = {user_id_for_graph}"
-                )
-            else:
-                logger.warning(
-                    "GraphServiceClient has no path_parameters attribute — "
-                    "/me resolution may fail"
-                )
-
-            # -----------------------------------------------------------------
-            # DEBUG: Log the actual base_url that the adapter will use
-            # -----------------------------------------------------------------
-            actual_base_url = getattr(adapter, 'base_url', 'UNKNOWN')
-            logger.debug(
-                f"HttpxRequestAdapter base_url = {actual_base_url}"
-            )
 
             # -----------------------------------------------------------------
             # Wrap in a shim that implements the same interface as other clients.
