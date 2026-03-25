@@ -1085,7 +1085,11 @@ const AuthSection = forwardRef<HTMLDivElement, AuthSectionProps>(
                             flexWrap: { xs: 'wrap', sm: 'nowrap' },
                           }}
                         >
-                          <FormControl fullWidth sx={{ flex: 1, minWidth: { xs: '100%', sm: 300 } }}>
+                          <FormControl 
+                            fullWidth 
+                            sx={{ flex: 1, minWidth: { xs: '100%', sm: 300 } }}
+                            error={!isAdmin && !!formErrors?.oauthConfigId}
+                          >
                             <InputLabel>OAuth App {!isAdmin && '(Required)'}</InputLabel>
                             <Select
                               value={selectedOAuthConfigId || ''}
@@ -1096,6 +1100,7 @@ const AuthSection = forwardRef<HTMLDivElement, AuthSectionProps>(
                               label={`OAuth App ${!isAdmin ? '(Required)' : ''}`}
                               disabled={loadingOAuthConfig}
                             required={!isAdmin}
+                            error={!isAdmin && !!formErrors?.oauthConfigId}
                             renderValue={(value) => {
                               if (!value && isAdmin && newOAuthAppName) {
                                 // Show preview of new OAuth app being created
@@ -1243,6 +1248,11 @@ const AuthSection = forwardRef<HTMLDivElement, AuthSectionProps>(
                               </MenuItem>
                             )}
                           </Select>
+                          {!isAdmin && formErrors?.oauthConfigId && (
+                            <FormHelperText error>
+                              {formErrors.oauthConfigId}
+                            </FormHelperText>
+                          )}
                           <Typography
                             variant="caption"
                             sx={{
@@ -1507,12 +1517,12 @@ const AuthSection = forwardRef<HTMLDivElement, AuthSectionProps>(
                       // For OAuth: Handle credential field visibility based on user role
                       const isOAuthCredentialField =
                         isOAuthSelected &&
-                        (field.name === 'clientId' || field.name === 'clientSecret');
+                        (field.name === 'clientId' || field.name === 'clientSecret' || field.name === 'tenantId');
 
                       const isOAuthMetadataField =
                         isOAuthSelected && (field.name === 'redirectUri' || field.name === 'scope');
 
-                      // Non-admin users: Always hide OAuth credential fields (clientId, clientSecret)
+                      // Non-admin users: Always hide OAuth credential fields (clientId, clientSecret, tenantId)
                       // They must select an existing OAuth App configured by admins
                       if (isOAuthSelected && !isAdmin && isOAuthCredentialField) {
                         return null;

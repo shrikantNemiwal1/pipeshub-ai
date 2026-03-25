@@ -3955,6 +3955,8 @@ async def _build_oauth_flow_config(
                 oauth_config_copy["clientId"] = oauth_config_copy.pop("client_id")
             if "client_secret" in oauth_config_copy and "clientSecret" not in oauth_config_copy:
                 oauth_config_copy["clientSecret"] = oauth_config_copy.pop("client_secret")
+            if "tenant_id" in oauth_config_copy and "tenantId" not in oauth_config_copy:
+                oauth_config_copy["tenantId"] = oauth_config_copy.pop("tenant_id")
             oauth_flow_config.update(oauth_config_copy)
 
         # Preserve connector-specific settings
@@ -3967,6 +3969,22 @@ async def _build_oauth_flow_config(
     else:
         # Use connector's auth config directly
         oauth_flow_config = auth_config.copy()
+
+        # Normalize field names for direct config
+        if "tenant_id" in oauth_flow_config and "tenantId" not in oauth_flow_config:
+            oauth_flow_config["tenantId"] = oauth_flow_config.pop("tenant_id")
+
+    # Apply tenant ID substitution for Microsoft OAuth URLs (single-tenant apps)
+    # If tenantId is provided in the OAuth config, replace /common with the tenant ID
+    tenant_id = oauth_flow_config.get("tenantId", "").strip()
+    if tenant_id:
+        base_authorize_url = oauth_flow_config.get("authorizeUrl", "")
+        base_token_url = oauth_flow_config.get("tokenUrl", "")
+
+        oauth_flow_config["authorizeUrl"] = _apply_tenant_to_microsoft_oauth_url(base_authorize_url, tenant_id)
+        oauth_flow_config["tokenUrl"] = _apply_tenant_to_microsoft_oauth_url(base_token_url, tenant_id)
+
+        logger.info(f"Applied tenant ID {tenant_id} to Microsoft OAuth URLs")
 
     return oauth_flow_config
 
@@ -6006,6 +6024,45 @@ async def get_all_oauth_configs(
             status_code=HttpStatusCode.INTERNAL_SERVER_ERROR.value,
             detail=f"Failed to get all OAuth configurations: {str(e)}"
         ) from e
+
+
+def _apply_tenant_to_microsoft_oauth_url(url: str, tenant_id: str | None) -> str:
+    """
+    Substitute the tenant segment in a Microsoft login URL.
+
+    Microsoft OAuth URLs are of the form:
+        https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize
+        https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token
+
+    If tenant_id is provided and is not empty / "common" / "organizations",
+    we replace the current tenant segment with the supplied value so that
+    single-tenant Azure AD applications (which cannot use the /common endpoint)
+    can authenticate successfully.
+
+    Args:
+        url: The OAuth URL to modify
+        tenant_id: The tenant ID to substitute (optional)
+
+    Returns:
+        Modified URL with tenant substituted, or original URL if not applicable
+    """
+    if not url or "login.microsoftonline.com" not in url:
+        return url
+
+    # Normalize – treat blank or "common" as no-op
+    tenant = (tenant_id or "").strip()
+    if not tenant or tenant.lower() == "common":
+        return url
+
+    # Replace the tenant segment — URL looks like:
+    #   https://login.microsoftonline.com/<current_tenant>/oauth2/...
+    import re
+    return re.sub(
+        r"(https://login\.microsoftonline\.com/)[^/]+(/)",
+        rf"\g<1>{tenant}\2",
+        url,
+        count=1,
+    )
 
 
 def _get_oauth_config_path(connector_type: str) -> str:
