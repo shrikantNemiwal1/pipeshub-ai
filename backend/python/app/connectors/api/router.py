@@ -3984,8 +3984,6 @@ async def _build_oauth_flow_config(
         oauth_flow_config["authorizeUrl"] = _apply_tenant_to_microsoft_oauth_url(base_authorize_url, tenant_id)
         oauth_flow_config["tokenUrl"] = _apply_tenant_to_microsoft_oauth_url(base_token_url, tenant_id)
 
-        logger.info(f"Applied tenant ID {tenant_id} to Microsoft OAuth URLs")
-
     return oauth_flow_config
 
 
