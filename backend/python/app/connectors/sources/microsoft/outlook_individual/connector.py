@@ -136,7 +136,7 @@ class OutlookCredentials:
             app_categories=["Email"],
             additional_params={
                 "response_mode": "query",
-                "prompt": "consent",
+                "prompt": "select_account",
             }
         )
     ])\
@@ -618,6 +618,34 @@ class OutlookIndividualConnector(BaseConnector):
             self.logger.error(f"Error getting child folders for '{parent_name}': {e}")
             return []
 
+    def _is_descendant_of(
+        self,
+        folder_id: str,
+        ancestor_ids: set[str],
+        folder_parent_map: dict[str, str]
+    ) -> bool:
+        """Check if a folder is a descendant of any folder in ancestor_ids.
+
+        Args:
+            folder_id: The folder ID to check
+            ancestor_ids: Set of potential ancestor folder IDs
+            folder_parent_map: Map of folder_id -> parent_folder_id
+
+        Returns:
+            True if folder_id is a descendant of any folder in ancestor_ids
+        """
+        current_id = folder_id
+        visited = set()
+
+        while current_id in folder_parent_map and current_id not in visited:
+            visited.add(current_id)
+            parent_id = folder_parent_map[current_id]
+            if parent_id in ancestor_ids:
+                return True
+            current_id = parent_id
+
+        return False
+
     async def _get_all_folders_for_user(
         self,
         selected_folder_ids: list[str] | None = None,
@@ -709,24 +737,49 @@ class OutlookIndividualConnector(BaseConnector):
             else:
                 self.logger.info(f"Total: {len(all_folders)} folders (no nested folders found)")
 
+            # Build folder parent map for hierarchy traversal
+            folder_parent_map = {}
+            for folder in all_folders:
+                folder_id = folder.get("id")
+                parent_id = self._safe_get_attr(folder, 'parent_folder_id')
+                if folder_id and parent_id:
+                    folder_parent_map[folder_id] = parent_id
+
             # Apply client-side folder ID filtering if specified
             if selected_folder_ids and filter_operator:
                 operator_str = filter_operator.value if hasattr(filter_operator, 'value') else str(filter_operator)
 
                 if operator_str == MultiselectOperator.IN.value:
-                    # Include only selected folders
+                    # Include selected folders AND all their descendants
+                    selected_ids_set = set(selected_folder_ids)
+
                     filtered_folders = [
                         folder for folder in all_folders
-                        if folder.get("id") in selected_folder_ids
+                        if folder.get("id") in selected_ids_set or 
+                           self._is_descendant_of(folder.get("id"), selected_ids_set, folder_parent_map)
                     ]
-                    self.logger.info(f"Including {len(filtered_folders)} selected folders out of {len(all_folders)} total")
+
+                    nested_count = len(filtered_folders) - len([f for f in filtered_folders if f.get("id") in selected_ids_set])
+                    self.logger.info(
+                        f"Including {len(filtered_folders)} folders "
+                        f"({len(selected_folder_ids)} selected + {nested_count} nested) "
+                        f"out of {len(all_folders)} total"
+                    )
                 elif operator_str == MultiselectOperator.NOT_IN.value:
-                    # Exclude selected folders
+                    # Exclude selected folders AND all their descendants
+                    excluded_ids_set = set(selected_folder_ids)
+
                     filtered_folders = [
                         folder for folder in all_folders
-                        if folder.get("id") not in selected_folder_ids
+                        if folder.get("id") not in excluded_ids_set and 
+                           not self._is_descendant_of(folder.get("id"), excluded_ids_set, folder_parent_map)
                     ]
-                    self.logger.info(f"Excluding {len(selected_folder_ids)} folders, {len(filtered_folders)} remaining out of {len(all_folders)} total")
+
+                    excluded_count = len(all_folders) - len(filtered_folders)
+                    self.logger.info(
+                        f"Excluding {excluded_count} folders (selected + descendants), "
+                        f"{len(filtered_folders)} remaining out of {len(all_folders)} total"
+                    )
                 else:
                     # Unknown operator, return all folders
                     self.logger.warning(f"Unknown folder filter operator: {operator_str}, returning all folders")
