@@ -857,8 +857,11 @@ class MSGraphClient(IClient):
                     oid = claims.get("oid")
                     if oid:
                         user_id_for_graph = oid
-            except Exception:
-                pass
+            except Exception as jwt_err:
+                logger.warning(
+                    "Could not decode JWT for user OID, falling back to 'me': %s",
+                    jwt_err,
+                )
 
             # Set the user ID in path_parameters so all /me/* URL templates
             # resolve to /users/{oid}/* instead of /users/me-token-to-replace/*

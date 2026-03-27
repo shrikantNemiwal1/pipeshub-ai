@@ -6,6 +6,7 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import tempfile
 import time
 from collections.abc import AsyncGenerator
@@ -6054,7 +6055,6 @@ def _apply_tenant_to_microsoft_oauth_url(url: str, tenant_id: str | None) -> str
 
     # Replace the tenant segment — URL looks like:
     #   https://login.microsoftonline.com/<current_tenant>/oauth2/...
-    import re
     return re.sub(
         r"(https://login\.microsoftonline\.com/)[^/]+(/)",
         rf"\g<1>{tenant}\2",
