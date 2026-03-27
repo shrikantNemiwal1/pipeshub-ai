@@ -360,7 +360,11 @@ class TestGetUserIdFromEmail:
 class TestRunSync:
 
     @pytest.mark.asyncio
-    async def test_run_sync_raises_when_clients_not_initialized(self):
+    @patch("app.connectors.sources.microsoft.outlook.connector.load_connector_filters", new_callable=AsyncMock)
+    async def test_run_sync_raises_when_clients_not_initialized(self, mock_filters):
+        from app.connectors.core.registry.filters import FilterCollection
+        mock_filters.return_value = (FilterCollection(), FilterCollection())
+        
         connector = _make_connector()
         connector.external_outlook_client = None
         connector.external_users_client = None
@@ -369,7 +373,11 @@ class TestRunSync:
             await connector.run_sync()
 
     @pytest.mark.asyncio
-    async def test_run_sync_calls_sync_steps(self):
+    @patch("app.connectors.sources.microsoft.outlook.connector.load_connector_filters", new_callable=AsyncMock)
+    async def test_run_sync_calls_sync_steps(self, mock_filters):
+        from app.connectors.core.registry.filters import FilterCollection
+        mock_filters.return_value = (FilterCollection(), FilterCollection())
+        
         connector = _make_connector()
         connector.external_outlook_client = MagicMock()
         connector.external_users_client = MagicMock()
