@@ -31,6 +31,8 @@ def mock_logger():
 
 @pytest.fixture()
 def mock_data_entities_processor():
+    from app.models.entities import AppMetadata
+    
     proc = MagicMock(spec=AzureBlobDataSourceEntitiesProcessor)
     proc.org_id = "org-az-1"
     proc.on_new_app_users = AsyncMock()
@@ -38,6 +40,16 @@ def mock_data_entities_processor():
     proc.on_new_records = AsyncMock()
     proc.get_all_active_users = AsyncMock(return_value=[])
     proc.account_name = "teststorage"
+    proc.get_app_by_id = AsyncMock(return_value=AppMetadata(
+        connector_id="az-blob-1",
+        name="Azure Blob",
+        type="azure_blob",
+        app_group="STORAGE",
+        scope="PERSONAL",
+        created_by="user-1",
+        created_at_timestamp=1234567890,
+        updated_at_timestamp=1234567890,
+    ))
     return proc
 
 
@@ -46,7 +58,7 @@ def mock_data_store_provider():
     provider = MagicMock()
     mock_tx = MagicMock()
     mock_tx.get_record_by_external_id = AsyncMock(return_value=None)
-    mock_tx.get_user_by_id = AsyncMock(return_value={"email": "user@test.com"})
+    mock_tx.get_user_by_user_id = AsyncMock(return_value={"email": "user@test.com"})
     mock_tx.__aenter__ = AsyncMock(return_value=mock_tx)
     mock_tx.__aexit__ = AsyncMock(return_value=None)
     provider.transaction.return_value = mock_tx
