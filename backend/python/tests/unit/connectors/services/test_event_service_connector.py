@@ -283,10 +283,13 @@ class TestProcessEvent:
 
 
 class TestHandleInit:
+    _APP_DOC = {"_key": "c1", "scope": "personal", "createdBy": "user-1"}
+
     @pytest.mark.asyncio
     async def test_success(self, service):
         mock_conn = AsyncMock()
         mock_conn.init = AsyncMock(return_value=True)
+        service.graph_provider.get_document = AsyncMock(return_value=self._APP_DOC)
         with patch("app.connectors.services.event_service.ConnectorFactory") as mock_factory, \
              patch("app.connectors.services.event_service.GraphDataStore"), \
              patch.object(service, "_store_connector"):
@@ -301,6 +304,7 @@ class TestHandleInit:
 
     @pytest.mark.asyncio
     async def test_factory_fails(self, service):
+        service.graph_provider.get_document = AsyncMock(return_value=self._APP_DOC)
         with patch("app.connectors.services.event_service.ConnectorFactory") as mock_factory, \
              patch("app.connectors.services.event_service.GraphDataStore"):
             mock_factory.create_connector = AsyncMock(return_value=None)
@@ -311,6 +315,7 @@ class TestHandleInit:
     async def test_init_returns_false(self, service):
         mock_conn = AsyncMock()
         mock_conn.init = AsyncMock(return_value=False)
+        service.graph_provider.get_document = AsyncMock(return_value=self._APP_DOC)
         with patch("app.connectors.services.event_service.ConnectorFactory") as mock_factory, \
              patch("app.connectors.services.event_service.GraphDataStore"):
             mock_factory.create_connector = AsyncMock(return_value=mock_conn)

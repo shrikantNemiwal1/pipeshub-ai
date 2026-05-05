@@ -69,6 +69,9 @@ class TestHandleInitException:
     @pytest.mark.asyncio
     async def test_init_general_exception(self, service):
         """Lines 209-211: exception during init logs error with org_id."""
+        service.graph_provider.get_document = AsyncMock(
+            return_value={"_key": "c1", "scope": "personal", "createdBy": "u1"}
+        )
         with patch("app.connectors.services.event_service.ConnectorFactory") as mock_factory, \
              patch("app.connectors.services.event_service.GraphDataStore"):
             mock_factory.create_connector = AsyncMock(side_effect=Exception("unexpected error"))
