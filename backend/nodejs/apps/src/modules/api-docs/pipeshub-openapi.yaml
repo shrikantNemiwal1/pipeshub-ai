@@ -3863,6 +3863,9 @@ components:
         isAuthenticated:
           type: boolean
           description: Whether authentication is complete and valid
+        pendingFullSync:
+          type: boolean
+          description: Whether a full sync is pending due to filter changes or other configuration updates
         syncEnabled:
           type: boolean
           description: Whether sync is enabled

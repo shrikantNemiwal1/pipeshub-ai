@@ -21,6 +21,9 @@ import pytest
 
 from app.connectors.services.event_service import EventService
 
+from app.config.constants.arangodb import CollectionNames
+from app.connectors.core.constants import ConnectorStateKeys
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -369,6 +372,164 @@ class TestHandleStartSync:
              patch.object(service, "_get_connector", return_value=None):
             result = await service._handle_start_sync("gmail", {"orgId": "org1", "connectorId": "c1"})
             assert result is False
+
+    @pytest.mark.asyncio
+    async def test_pending_full_sync_triggers_full_sync(self, service):
+        """Verify that pendingFullSync from connector doc triggers full sync even if payload is false."""
+
+        mock_conn = AsyncMock()
+        mock_conn.run_sync = AsyncMock()
+        
+        # Mock connector document with pendingFullSync=True
+        connector_doc = {
+            "_key": "c1",
+            ConnectorStateKeys.PENDING_FULL_SYNC: True
+        }
+        service.graph_provider.get_document = AsyncMock(return_value=connector_doc)
+        service.graph_provider.update_node = AsyncMock()
+        
+        with patch.object(service, "_ensure_connector", new_callable=AsyncMock, return_value=mock_conn), \
+             patch.object(service, "_get_connector", return_value=mock_conn), \
+             patch.object(service, "_update_app_status", new_callable=AsyncMock), \
+             patch("app.connectors.services.event_service.sync_task_manager") as mock_stm:
+            mock_stm.start_sync = AsyncMock()
+            
+            # Call with fullSync=False in payload, but pendingFullSync=True in doc
+            result = await service._handle_start_sync("gmail", {
+                "orgId": "org1", "connectorId": "c1", "fullSync": False
+            })
+            
+            assert result is True
+            
+            # Verify get_document was called to fetch connector doc
+            service.graph_provider.get_document.assert_awaited_once_with(
+                document_key="c1",
+                collection=CollectionNames.APPS.value,
+            )
+            
+            # Verify full sync path was taken (delete sync points called)
+            service.graph_provider.delete_sync_points_by_connector_id.assert_awaited_once_with(
+                connector_id="c1"
+            )
+            service.graph_provider.delete_connector_sync_edges.assert_awaited_once_with(
+                connector_id="c1"
+            )
+            
+            # Verify pendingFullSync was cleared after successful schedule
+            service.graph_provider.update_node.assert_awaited_once_with(
+                "c1",
+                CollectionNames.APPS.value,
+                {ConnectorStateKeys.PENDING_FULL_SYNC: False},
+            )
+
+    @pytest.mark.asyncio
+    async def test_pending_full_sync_cleared_on_payload_full_sync_true(self, service):
+        """Verify that pendingFullSync is cleared even when payload fullSync is true."""
+
+        mock_conn = AsyncMock()
+        mock_conn.run_sync = AsyncMock()
+        
+        # Mock connector document without pendingFullSync
+        connector_doc = {
+            "_key": "c1",
+            ConnectorStateKeys.PENDING_FULL_SYNC: False
+        }
+        service.graph_provider.get_document = AsyncMock(return_value=connector_doc)
+        service.graph_provider.update_node = AsyncMock()
+        
+        with patch.object(service, "_ensure_connector", new_callable=AsyncMock, return_value=mock_conn), \
+             patch.object(service, "_get_connector", return_value=mock_conn), \
+             patch.object(service, "_update_app_status", new_callable=AsyncMock), \
+             patch("app.connectors.services.event_service.sync_task_manager") as mock_stm:
+            mock_stm.start_sync = AsyncMock()
+            
+            # Call with fullSync=True in payload
+            result = await service._handle_start_sync("gmail", {
+                "orgId": "org1", "connectorId": "c1", "fullSync": True
+            })
+            
+            assert result is True
+            
+            # Verify pendingFullSync was cleared after successful schedule
+            service.graph_provider.update_node.assert_awaited_once_with(
+                "c1",
+                CollectionNames.APPS.value,
+                {ConnectorStateKeys.PENDING_FULL_SYNC: False},
+            )
+
+    @pytest.mark.asyncio
+    async def test_pending_full_sync_not_cleared_on_prep_failure(self, service):
+        """Verify that pendingFullSync is NOT cleared if full sync prep fails."""
+
+        mock_conn = AsyncMock()
+        
+        # Mock connector document with pendingFullSync=True
+        connector_doc = {
+            "_key": "c1",
+            ConnectorStateKeys.PENDING_FULL_SYNC: True
+        }
+        service.graph_provider.get_document = AsyncMock(return_value=connector_doc)
+        service.graph_provider.update_node = AsyncMock()
+        
+        # Mock failure during sync point deletion
+        service.graph_provider.delete_sync_points_by_connector_id = AsyncMock(
+            side_effect=Exception("delete failed")
+        )
+        
+        with patch.object(service, "_ensure_connector", new_callable=AsyncMock, return_value=mock_conn), \
+             patch.object(service, "_get_connector", return_value=mock_conn), \
+             patch.object(service, "_update_app_status", new_callable=AsyncMock):
+            
+            result = await service._handle_start_sync("gmail", {
+                "orgId": "org1", "connectorId": "c1", "fullSync": False
+            })
+            
+            assert result is False
+            
+            # Verify pendingFullSync was NOT cleared since prep failed
+            # update_node should not have been called with pendingFullSync=False
+            for call in service.graph_provider.update_node.call_args_list:
+                kwargs = call[1]
+                updates = kwargs.get("node_updates") if kwargs else None
+                if updates is None and call[0]:
+                    # Positional: update_node(key, collection, node_updates)
+                    if len(call[0]) >= 3:
+                        updates = call[0][2]
+                if isinstance(updates, dict) and updates.get(ConnectorStateKeys.PENDING_FULL_SYNC) is not None:
+                    pytest.fail("pendingFullSync should not be cleared on prep failure")
+
+    @pytest.mark.asyncio
+    async def test_no_pending_full_sync_normal_sync(self, service):
+        """Verify that normal sync works when no pendingFullSync flag is set."""
+
+        mock_conn = AsyncMock()
+        mock_conn.run_sync = AsyncMock()
+        
+        # Mock connector document without pendingFullSync
+        connector_doc = {
+            "_key": "c1"
+        }
+        service.graph_provider.get_document = AsyncMock(return_value=connector_doc)
+        service.graph_provider.update_node = AsyncMock()
+        
+        with patch.object(service, "_ensure_connector", new_callable=AsyncMock, return_value=mock_conn), \
+             patch.object(service, "_get_connector", return_value=mock_conn), \
+             patch.object(service, "_update_app_status", new_callable=AsyncMock), \
+             patch("app.connectors.services.event_service.sync_task_manager") as mock_stm:
+            mock_stm.start_sync = AsyncMock()
+            
+            result = await service._handle_start_sync("gmail", {
+                "orgId": "org1", "connectorId": "c1", "fullSync": False
+            })
+            
+            assert result is True
+            
+            # Verify normal sync path was taken (delete NOT called)
+            service.graph_provider.delete_sync_points_by_connector_id.assert_not_awaited()
+            service.graph_provider.delete_connector_sync_edges.assert_not_awaited()
+            
+            # Verify pendingFullSync was NOT cleared (not in full sync path)
+            service.graph_provider.update_node.assert_not_awaited()
 
 
 # ===========================================================================
