@@ -39,7 +39,7 @@ def mock_logger():
 def mock_graph_provider():
     gp = AsyncMock()
     gp.batch_upsert_nodes = AsyncMock()
-    gp.get_document = AsyncMock()
+    gp.get_document = AsyncMock(return_value=None)
     gp.delete_sync_points_by_connector_id = AsyncMock(return_value=(5, True))
     gp.delete_connector_sync_edges = AsyncMock(return_value=(3, True))
     gp.delete_connector_instance = AsyncMock(return_value={"success": True, "virtual_record_ids": [], "deleted_records_count": 0})
@@ -372,6 +372,7 @@ class TestHandleStartSync:
              patch.object(service, "_get_connector", return_value=None):
             result = await service._handle_start_sync("gmail", {"orgId": "org1", "connectorId": "c1"})
             assert result is False
+            service.graph_provider.get_document.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_pending_full_sync_triggers_full_sync(self, service):
@@ -423,43 +424,41 @@ class TestHandleStartSync:
             )
 
     @pytest.mark.asyncio
-    async def test_pending_full_sync_cleared_on_payload_full_sync_true(self, service):
-        """Verify that pendingFullSync is cleared even when payload fullSync is true."""
+    async def test_manual_full_sync_without_pending_skips_flag_clear(self, service):
+        """Manual fullSync with no pendingFullSync in DB should not write pendingFullSync=False."""
 
         mock_conn = AsyncMock()
         mock_conn.run_sync = AsyncMock()
-        
-        # Mock connector document without pendingFullSync
+
         connector_doc = {
             "_key": "c1",
-            ConnectorStateKeys.PENDING_FULL_SYNC: False
+            ConnectorStateKeys.PENDING_FULL_SYNC: False,
         }
         service.graph_provider.get_document = AsyncMock(return_value=connector_doc)
         service.graph_provider.update_node = AsyncMock()
-        
+
         with patch.object(service, "_ensure_connector", new_callable=AsyncMock, return_value=mock_conn), \
              patch.object(service, "_get_connector", return_value=mock_conn), \
              patch.object(service, "_update_app_status", new_callable=AsyncMock), \
              patch("app.connectors.services.event_service.sync_task_manager") as mock_stm:
             mock_stm.start_sync = AsyncMock()
-            
-            # Call with fullSync=True in payload
+
             result = await service._handle_start_sync("gmail", {
-                "orgId": "org1", "connectorId": "c1", "fullSync": True
+                "orgId": "org1",
+                "connectorId": "c1",
+                "fullSync": True,
             })
-            
+
             assert result is True
-            
-            # Verify pendingFullSync was cleared after successful schedule
-            service.graph_provider.update_node.assert_awaited_once_with(
-                "c1",
-                CollectionNames.APPS.value,
-                {ConnectorStateKeys.PENDING_FULL_SYNC: False},
-            )
+            service.graph_provider.update_node.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_pending_full_sync_not_cleared_on_prep_failure(self, service):
-        """Verify that pendingFullSync is NOT cleared if full sync prep fails."""
+        """Verify that pendingFullSync is NOT cleared if full sync prep fails catastrophically.
+
+        Sync point deletion errors are caught and logged (prep continues); use start_sync failure
+        to hit the outer prep except block (same as losing the race before clearing pending).
+        """
 
         mock_conn = AsyncMock()
         
@@ -471,14 +470,11 @@ class TestHandleStartSync:
         service.graph_provider.get_document = AsyncMock(return_value=connector_doc)
         service.graph_provider.update_node = AsyncMock()
         
-        # Mock failure during sync point deletion
-        service.graph_provider.delete_sync_points_by_connector_id = AsyncMock(
-            side_effect=Exception("delete failed")
-        )
-        
         with patch.object(service, "_ensure_connector", new_callable=AsyncMock, return_value=mock_conn), \
              patch.object(service, "_get_connector", return_value=mock_conn), \
-             patch.object(service, "_update_app_status", new_callable=AsyncMock):
+             patch.object(service, "_update_app_status", new_callable=AsyncMock), \
+             patch("app.connectors.services.event_service.sync_task_manager") as mock_stm:
+            mock_stm.start_sync = AsyncMock(side_effect=Exception("schedule failed"))
             
             result = await service._handle_start_sync("gmail", {
                 "orgId": "org1", "connectorId": "c1", "fullSync": False

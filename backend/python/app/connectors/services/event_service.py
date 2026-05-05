@@ -245,7 +245,12 @@ class EventService:
         if not connector:
             self.logger.error(f"{connector_name.capitalize()} {connector_id} connector could not be initialized")
 
-        # Check if connector instance has pendingFullSync flag set (e.g., from filter changes)
+        connector = self._get_connector(connector_id)
+        if not connector:
+            self.logger.error(f"{connector_name.capitalize()} {connector_id} connector not initialized")
+            return False
+
+        # Load apps document only after connector is valid (avoids extra I/O on init failure).
         connector_doc = await self.graph_provider.get_document(
             document_key=connector_id,
             collection=CollectionNames.APPS.value,
@@ -261,11 +266,6 @@ class EventService:
             self.logger.info(f"Connector {connector_id} has pendingFullSync flag set, will perform full sync")
 
         self.logger.info(f"Starting {connector_name} sync service for org_id: {org_id}, full_sync: {effective_full_sync} (payload: {full_sync}, pending: {pending_full_sync})")
-
-        connector = self._get_connector(connector_id)
-        if not connector:
-            self.logger.error(f"{connector_name.capitalize()} {connector_id} connector not initialized")
-            return False
 
         if effective_full_sync:
             # --- Full sync: acquire lock for the prep phase ---
@@ -311,7 +311,8 @@ class EventService:
                 await sync_task_manager.start_sync(connector_id, self._run_sync_and_clear_status(connector, connector_id))
                 self.logger.info(f"Started full sync task for {connector_name} {connector_id}")
 
-                if pending_full_sync or full_sync:
+                # Clear only when we consumed a persisted pending flag (avoids redundant writes on manual full sync).
+                if pending_full_sync:
                     try:
                         await self.graph_provider.update_node(
                             connector_id,
