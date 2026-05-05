@@ -12237,6 +12237,10 @@ paths:
           description: Unauthorized
         '404':
           description: Record not found
+        '409':
+          description: |
+            Conflict — the connector instance for this record is disabled. Enable it from Connector Settings and try again.
+            Response body is JSON with a `detail` string (FastAPI error shape), not a binary stream.
 
   # -------------------- Folder Endpoints --------------------
   /knowledgeBase/{kbId}/folder:
@@ -12872,6 +12876,8 @@ paths:
           description: Unauthorized
         '404':
           description: Record not found
+        '409':
+          description: Conflict — the connector instance for this record is disabled. Enable it from Connector Settings and try again.
 
   /knowledgeBase/reindex/record-group/{recordGroupId}:
     post:
@@ -12912,6 +12918,8 @@ paths:
           description: Unauthorized
         '404':
           description: Record group not found
+        '409':
+          description: Conflict — the connector instance is disabled. Enable it from Connector Settings and try again.
 
   /knowledgeBase/resync/connector:
     post:
@@ -12952,6 +12960,8 @@ paths:
           description: Invalid connector parameters
         '401':
           description: Unauthorized
+        '409':
+          description: Conflict — the connector instance is disabled. Enable it from Connector Settings and try again.
 
   /knowledgeBase/stats/{connectorId}:
     get:
@@ -13019,6 +13029,8 @@ paths:
           description: Unauthorized
         '404':
           description: Connector not found
+        '409':
+          description: Conflict — the connector instance is disabled. Enable it from Connector Settings and try again.
 
   /knowledgeBase/{kbId}/record/{recordId}/move:
     put:
