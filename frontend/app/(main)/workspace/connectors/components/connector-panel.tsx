@@ -18,6 +18,7 @@ import { AuthorizeTab } from './authorize-tab';
 import { ConfigureTab } from './configure-tab';
 import { SelectRecordsPage } from './select-records-page';
 import { useUserStore, selectIsAdmin, selectIsProfileInitialized } from '@/lib/store/user-store';
+import { useToastStore } from '@/lib/store/toast-store';
 import { useConnectorsStore } from '../store';
 import { ConnectorsApi } from '../api';
 import {
@@ -84,6 +85,7 @@ export function ConnectorPanel() {
   const { t } = useTranslation();
   const isAdmin = useUserStore(selectIsAdmin);
   const isProfileInitialized = useUserStore(selectIsProfileInitialized);
+  const addToast = useToastStore((s) => s.addToast);
   const {
     isPanelOpen,
     panelConnector,
@@ -387,6 +389,30 @@ export function ConnectorPanel() {
           .querySelector('[data-ph-oauth-app-select]')
           ?.scrollIntoView({ behavior: 'smooth', block: 'center' });
       });
+      if (
+        isCreateMode &&
+        selectedScope === 'personal' &&
+        selectedAuthType === 'OAUTH' &&
+        isProfileInitialized &&
+        isAdmin === false &&
+        connectorType
+      ) {
+        const oauthSnap = useConnectorsStore.getState();
+        const listReady =
+          oauthSnap.oauthAppsListPhase === 'ready' &&
+          oauthSnap.oauthAppsListConnectorType === connectorType &&
+          oauthSnap.oauthAppsListFetchError == null;
+        if (listReady && oauthSnap.oauthAppsList.length === 0) {
+          addToast({
+            variant: 'warning',
+            title: t('workspace.connectors.toasts.oauthAppUnavailableTitle'),
+            description: t('workspace.connectors.toasts.oauthAppUnavailableDescription', {
+              name: connectorTypeName || t('workspace.connectors.toasts.thisConnectorFallback'),
+            }),
+            duration: 4500,
+          });
+        }
+      }
       return false;
     }
 
@@ -427,10 +453,14 @@ export function ConnectorPanel() {
     isProfileInitialized,
     isAdmin,
     isCreateMode,
+    selectedScope,
+    connectorType,
+    connectorTypeName,
     instanceName,
     mergeFormErrors,
     setInstanceNameError,
     setSaveError,
+    addToast,
     t,
   ]);
 
@@ -438,11 +468,11 @@ export function ConnectorPanel() {
     if (!resolveAuthenticateOrReturn()) {
       return;
     }
+    setIsSavingAuth(true);
 
     if (isCreateMode) {
       // Create mode: POST /connectors
       try {
-        setIsSavingAuth(true);
         setSaveError(null);
 
         const result = (await ConnectorsApi.createConnectorInstance({
@@ -508,7 +538,6 @@ export function ConnectorPanel() {
     } else {
       // Edit mode: PUT /config/auth
       try {
-        setIsSavingAuth(true);
         setSaveError(null);
 
         await ConnectorsApi.saveAuthConfig(panelConnectorId!, {
@@ -558,6 +587,7 @@ export function ConnectorPanel() {
     }
   }, [
     isCreateMode,
+    selectedScope,
     resolveAuthenticateOrReturn,
     instanceName,
     connectorType,
