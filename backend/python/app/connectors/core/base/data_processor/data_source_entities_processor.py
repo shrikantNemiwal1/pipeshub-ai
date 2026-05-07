@@ -772,6 +772,7 @@ class DataSourceEntitiesProcessor:
 
     async def _process_record(self, record: Record, permissions: list[Permission], tx_store: TransactionStore) -> Record | None:
         self.logger.info(f"Processing record: {record.record_name} ({record.id})")
+        incoming_weburl = record.weburl
         existing_record = await tx_store.get_record_by_external_id(connector_id=record.connector_id,
                                                                    external_id=record.external_record_id)
 
@@ -786,10 +787,12 @@ class DataSourceEntitiesProcessor:
             await self._handle_new_record(record, tx_store)
         else:
             record.id = existing_record.id
-            record.weburl = existing_record.weburl
-            # pass
-            #check if revision Id is same as existing record
-            if record.external_revision_id != existing_record.external_revision_id:
+            # Prefer connector-provided webUrl when present. Legacy DB rows often have empty
+            # webUrl; the previous unconditional overwrite discarded fresh URLs on every sync.
+            record.weburl = incoming_weburl if incoming_weburl else existing_record.weburl
+            revision_changed = record.external_revision_id != existing_record.external_revision_id
+            weburl_changed = (record.weburl or "") != (existing_record.weburl or "")
+            if revision_changed or weburl_changed:
                 await self._handle_updated_record(record, existing_record, tx_store)
 
         # Link record to group AFTER saving (when record.id is available for edges)

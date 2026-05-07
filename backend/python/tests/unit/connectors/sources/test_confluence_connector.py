@@ -11,6 +11,7 @@ from app.config.constants.arangodb import Connectors, ProgressStatus
 from app.config.constants.http_status_code import HttpStatusCode
 from app.connectors.sources.atlassian.confluence_cloud.connector import (
     CONTENT_EXPAND_PARAMS,
+    FOLDER_EXPAND_PARAMS,
     PSEUDO_USER_GROUP_PREFIX,
     TIME_OFFSET_HOURS,
     ConfluenceConnector,
@@ -89,6 +90,33 @@ def _make_mock_response(status=200, data=None):
     return resp
 
 
+def _folder_data(folder_id="folder1", title="Test Folder", space_id="123", parent_id=None, parent_type=None):
+    """Create mock folder data from Confluence API."""
+    data = {
+        "id": folder_id,
+        "type": "folder",
+        "title": title,
+        "space": {"id": space_id, "key": "TEST"},
+        "version": {"number": 1, "when": "2024-01-01T10:00:00.000Z"},
+        "history": {
+            "createdDate": "2024-01-01T09:00:00.000Z",
+            "lastUpdated": {"when": "2024-01-01T10:00:00.000Z", "number": 1},
+        },
+        "_links": {
+            "webui": "/spaces/TEST/pages/folder1",
+            "self": "https://example.atlassian.net/wiki/rest/api/content/folder1",
+        },
+    }
+
+    if parent_id:
+        ancestor = {"id": parent_id}
+        if parent_type:
+            ancestor["type"] = parent_type
+        data["ancestors"] = [ancestor]
+
+    return data
+
+
 # ===========================================================================
 # Constants
 # ===========================================================================
@@ -104,8 +132,240 @@ class TestConfluenceConstants:
         assert "history.lastUpdated" in CONTENT_EXPAND_PARAMS
         assert "space" in CONTENT_EXPAND_PARAMS
 
+    def test_folder_expand_params(self):
+        assert "ancestors" in FOLDER_EXPAND_PARAMS
+        assert "history.lastUpdated" in FOLDER_EXPAND_PARAMS
+        assert "space" in FOLDER_EXPAND_PARAMS
+        assert "children.attachment" not in FOLDER_EXPAND_PARAMS
+        assert "childTypes.comment" not in FOLDER_EXPAND_PARAMS
+
     def test_pseudo_user_group_prefix(self):
         assert PSEUDO_USER_GROUP_PREFIX == "[Pseudo-User]"
+
+
+# ===========================================================================
+# Folder sync
+# ===========================================================================
+
+
+class TestTransformToFolderFileRecord:
+    """Test _transform_to_folder_file_record for folders."""
+
+    def test_transform_folder_basic(self):
+        c = _make_connector()
+        data = _folder_data()
+
+        rec = c._transform_to_folder_file_record(data)
+
+        assert rec is not None
+        assert isinstance(rec, FileRecord)
+        assert rec.record_type == RecordType.FILE
+        assert rec.is_file is False
+        assert rec.record_name == "Test Folder"
+        assert rec.external_record_id == "folder1"
+        assert rec.mime_type == MimeTypes.FOLDER.value
+        assert rec.external_record_group_id == "123"
+        assert rec.size_in_bytes == 0
+        assert rec.parent_external_record_id is None
+        assert rec.parent_record_type is None
+
+    def test_transform_folder_with_folder_parent(self):
+        c = _make_connector()
+        data = _folder_data(parent_id="parent-folder1", parent_type="folder")
+
+        rec = c._transform_to_folder_file_record(data)
+
+        assert rec is not None
+        assert rec.record_type == RecordType.FILE
+        assert rec.is_file is False
+        assert rec.parent_external_record_id == "parent-folder1"
+        assert rec.parent_record_type == RecordType.FILE
+
+    def test_transform_folder_with_page_parent(self):
+        c = _make_connector()
+        data = _folder_data(parent_id="parent-page1", parent_type="page")
+
+        rec = c._transform_to_folder_file_record(data)
+
+        assert rec is not None
+        assert rec.parent_external_record_id == "parent-page1"
+        assert rec.parent_record_type == RecordType.CONFLUENCE_PAGE
+
+    def test_transform_folder_missing_type_fallback(self):
+        c = _make_connector()
+        data = _folder_data(parent_id="parent1", parent_type=None)
+
+        rec = c._transform_to_folder_file_record(data)
+
+        assert rec is not None
+        assert rec.parent_external_record_id == "parent1"
+        assert rec.parent_record_type == RecordType.FILE
+
+
+class TestTransformPageWithFolderParent:
+    """Test that pages with folder parents get correct parent_record_type."""
+
+    def test_transform_page_with_folder_parent(self):
+        c = _make_connector()
+        data = {
+            "id": "page1",
+            "type": "page",
+            "title": "Test Page",
+            "space": {"id": "123", "key": "TEST"},
+            "version": {"number": 1, "when": "2024-01-01T10:00:00.000Z"},
+            "history": {
+                "createdDate": "2024-01-01T09:00:00.000Z",
+                "lastUpdated": {"when": "2024-01-01T10:00:00.000Z", "number": 1},
+            },
+            "ancestors": [{"id": "folder1", "type": "folder"}],
+            "_links": {
+                "webui": "/spaces/TEST/pages/page1",
+                "self": "https://example.atlassian.net/wiki/rest/api/content/page1",
+            },
+        }
+
+        rec = c._transform_to_webpage_record(data, RecordType.CONFLUENCE_PAGE)
+
+        assert rec is not None
+        assert rec.record_type == RecordType.CONFLUENCE_PAGE
+        assert rec.parent_external_record_id == "folder1"
+        assert rec.parent_record_type == RecordType.FILE
+
+    def test_transform_page_with_page_parent(self):
+        c = _make_connector()
+        data = {
+            "id": "page1",
+            "type": "page",
+            "title": "Test Page",
+            "space": {"id": "123", "key": "TEST"},
+            "version": {"number": 1, "when": "2024-01-01T10:00:00.000Z"},
+            "history": {
+                "createdDate": "2024-01-01T09:00:00.000Z",
+                "lastUpdated": {"when": "2024-01-01T10:00:00.000Z", "number": 1},
+            },
+            "ancestors": [{"id": "parent-page1", "type": "page"}],
+            "_links": {
+                "webui": "/spaces/TEST/pages/page1",
+                "self": "https://example.atlassian.net/wiki/rest/api/content/page1",
+            },
+        }
+
+        rec = c._transform_to_webpage_record(data, RecordType.CONFLUENCE_PAGE)
+
+        assert rec is not None
+        assert rec.record_type == RecordType.CONFLUENCE_PAGE
+        assert rec.parent_external_record_id == "parent-page1"
+        assert rec.parent_record_type == RecordType.CONFLUENCE_PAGE
+
+
+@pytest.mark.asyncio
+class TestSyncFolders:
+    """Test _sync_folders method."""
+
+    async def test_sync_folders_basic(self):
+        c = _make_connector()
+        c.sync_filters = MagicMock()
+        c.sync_filters.get = MagicMock(return_value=None)
+        c.indexing_filters = MagicMock()
+        c.indexing_filters.is_enabled = MagicMock(return_value=False)
+        c.pages_sync_point = MagicMock()
+        c.pages_sync_point.read_sync_point = AsyncMock(return_value=None)
+        c.pages_sync_point.update_sync_point = AsyncMock()
+
+        mock_datasource = MagicMock()
+        folders_response = _make_mock_response(
+            200,
+            {
+                "results": [
+                    _folder_data("folder1", "Folder 1"),
+                    _folder_data("folder2", "Folder 2"),
+                ],
+                "_links": {},
+            },
+        )
+        mock_datasource.get_folders_v1 = AsyncMock(return_value=folders_response)
+
+        with patch.object(c, "_get_fresh_datasource", return_value=mock_datasource):
+            with patch.object(c, "_fetch_page_permissions", return_value=[]):
+                await c._sync_folders("TEST")
+
+        mock_datasource.get_folders_v1.assert_called_once()
+        call_args = mock_datasource.get_folders_v1.call_args[1]
+        assert call_args["space_key"] == "TEST"
+        assert call_args["expand"] == FOLDER_EXPAND_PARAMS
+        assert call_args["time_offset_hours"] == TIME_OFFSET_HOURS
+
+        c.data_entities_processor.on_new_records.assert_called_once()
+        saved_records = c.data_entities_processor.on_new_records.call_args[0][0]
+        assert len(saved_records) == 2
+
+        for record_tuple in saved_records:
+            record, perms = record_tuple
+            assert isinstance(record, FileRecord)
+            assert record.record_type == RecordType.FILE
+            assert record.is_file is False
+            assert record.mime_type == MimeTypes.FOLDER.value
+            assert record.indexing_status == ProgressStatus.AUTO_INDEX_OFF.value
+
+    async def test_sync_folders_with_permissions(self):
+        c = _make_connector()
+        c.sync_filters = MagicMock()
+        c.sync_filters.get = MagicMock(return_value=None)
+        c.indexing_filters = MagicMock()
+        c.indexing_filters.is_enabled = MagicMock(return_value=False)
+        c.pages_sync_point = MagicMock()
+        c.pages_sync_point.read_sync_point = AsyncMock(return_value=None)
+        c.pages_sync_point.update_sync_point = AsyncMock()
+
+        mock_datasource = MagicMock()
+        folders_response = _make_mock_response(
+            200,
+            {"results": [_folder_data("folder1", "Folder 1")], "_links": {}},
+        )
+        mock_datasource.get_folders_v1 = AsyncMock(return_value=folders_response)
+
+        test_permission = Permission(
+            permission_type=PermissionType.READ,
+            entity_type=EntityType.USER,
+            entity_external_id="user1",
+        )
+
+        with patch.object(c, "_get_fresh_datasource", return_value=mock_datasource):
+            with patch.object(c, "_fetch_page_permissions", return_value=[test_permission]):
+                await c._sync_folders("TEST")
+
+        c._fetch_page_permissions.assert_called_once_with("folder1")
+
+        saved_records = c.data_entities_processor.on_new_records.call_args[0][0]
+        assert len(saved_records) == 1
+        record, perms = saved_records[0]
+        assert len(perms) == 1
+        assert perms[0] == test_permission
+
+    async def test_sync_folders_indexing_enabled(self):
+        c = _make_connector()
+        c.sync_filters = MagicMock()
+        c.sync_filters.get = MagicMock(return_value=None)
+        c.indexing_filters = MagicMock()
+        c.indexing_filters.is_enabled = MagicMock(return_value=True)
+        c.pages_sync_point = MagicMock()
+        c.pages_sync_point.read_sync_point = AsyncMock(return_value=None)
+        c.pages_sync_point.update_sync_point = AsyncMock()
+
+        mock_datasource = MagicMock()
+        folders_response = _make_mock_response(
+            200,
+            {"results": [_folder_data("folder1", "Folder 1")], "_links": {}},
+        )
+        mock_datasource.get_folders_v1 = AsyncMock(return_value=folders_response)
+
+        with patch.object(c, "_get_fresh_datasource", return_value=mock_datasource):
+            with patch.object(c, "_fetch_page_permissions", return_value=[]):
+                await c._sync_folders("TEST")
+
+        saved_records = c.data_entities_processor.on_new_records.call_args[0][0]
+        record, _ = saved_records[0]
+        assert record.indexing_status != ProgressStatus.AUTO_INDEX_OFF.value
 
 
 # ===========================================================================
