@@ -4825,11 +4825,6 @@ class TestSyncSpacesIncludeFilter:
         call_kwargs = mock_ds.get_spaces.call_args
         assert call_kwargs[1].get("keys") == ["ENG"]
 
-
-# ===========================================================================
-# NEW COVERAGE TESTS – targeting uncovered lines in connector.py
-# ===========================================================================
-
 # ---------------------------------------------------------------------------
 # Helpers shared by new tests
 # ---------------------------------------------------------------------------
@@ -7338,14 +7333,6 @@ class TestFetchAttachmentContent:
             async for _ in gen:
                 pass
         assert exc_info.value.status_code == 500
-
-
-# ===========================================================================
-# Tests for GetFreshDatasource, TestConnection, StreamRecord, FilterOptions
-# (Named TestGetFreshDatasourceExtra — a second class named TestGetFreshDatasource
-# would shadow the earlier TestGetFreshDatasource and drop those tests.)
-# ===========================================================================
-
 
 class TestGetFreshDatasourceExtra:
     """Test _get_fresh_datasource paths (lines 382-416)."""

@@ -14,6 +14,7 @@ Execution order:
 
 Test cases:
   TC-SYNC-001   — Full sync + graph validation
+  TC-CF-009     — Folder + page-in-folder validation (fixture seeds before first sync)
   TC-INCR-001   — Incremental sync (create new pages)
   TC-UPDATE-001 — Content change detection (update page)
   TC-RENAME-001 — Rename detection (page title change)
@@ -34,6 +35,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from app.config.constants.arangodb import MimeTypes  # type: ignore[import-not-found]  # noqa: E402
 from app.models.entities import (  # type: ignore[import-not-found]  # noqa: E402
     RecordGroupType,
     RecordType,
@@ -363,6 +365,84 @@ class TestConfluenceValidation:
             group_name, actual_member_count, len(set(member_emails))
         )
 
+    @pytest.mark.order(7)
+    async def test_tc_cf_009_folder_and_page_hierarchy(
+        self,
+        confluence_connector: Dict[str, Any],
+        confluence_datasource: ConfluenceDataSource,
+        connector_assertions: ConnectorAssertions,
+        graph_provider: GraphProviderProtocol,
+    ) -> None:
+        """TC-CF-009: Verify folder and page-in-folder synced correctly (fixture creates both before first sync)."""
+        connector_id = confluence_connector["connector_id"]
+        space_id = confluence_connector["space_id"]
+        space_key = confluence_connector["space_key"]
+        folder_id = confluence_connector["test_folder_id"]
+        folder_title = confluence_connector["test_folder_title"]
+        page_id = confluence_connector["test_page_in_folder_id"]
+        page_title = confluence_connector["test_page_in_folder_title"]
+
+        folder_resp = await confluence_datasource.get_folder_by_id(int(folder_id))
+        assert folder_resp.status == 200, (
+            f"TC-CF-009: Folder {folder_id} not found in Confluence API: HTTP {folder_resp.status}"
+        )
+
+        folder_record = await graph_provider.get_record_by_external_id(
+            connector_id, folder_id
+        )
+        assert folder_record is not None, (
+            f"Folder {folder_id} ({folder_title!r}) not found in graph for connector {connector_id}"
+        )
+        assert folder_record.record_type == RecordType.FILE, (
+            f"Folder should have record_type=FILE, got {folder_record.record_type}"
+        )
+        assert folder_record.mime_type == MimeTypes.FOLDER.value, (
+            f"Folder should have mime_type=FOLDER, got {folder_record.mime_type!r}"
+        )
+        assert folder_record.external_record_group_id == space_id, (
+            f"Folder should belong to space {space_id}, got {folder_record.external_record_group_id}"
+        )
+        assert folder_record.record_name == folder_title, (
+            f"Folder name should be {folder_title!r}, got {folder_record.record_name!r}"
+        )
+
+        logger.info("✅ TC-CF-009: Folder %s validated in graph", folder_id)
+
+        await assert_confluence_page_in_v1_space_content_search(
+            confluence_datasource,
+            space_key,
+            page_id,
+            context="TC-CF-009",
+        )
+        await assert_confluence_page_v1_ancestors_contain_id(
+            confluence_datasource,
+            page_id,
+            folder_id,
+            context="TC-CF-009",
+        )
+
+        expected = RecordAssertion(
+            external_record_id=page_id,
+            record_type=RecordType.CONFLUENCE_PAGE.value,
+            mime_type="text/html",
+            record_name=page_title,
+            external_record_group_id=space_id,
+        )
+        page_record = await connector_assertions.assert_record_exists(
+            connector_id, page_id, expected
+        )
+
+        assert page_record.parent_external_record_id == folder_id, (
+            f"Page {page_id} should have folder {folder_id} as parent, "
+            f"got parent_external_record_id={page_record.parent_external_record_id!r}"
+        )
+        if page_record.parent_record_type is not None:
+            assert page_record.parent_record_type == RecordType.FILE, (
+                f"Page parent_record_type should be FILE (folder), got {page_record.parent_record_type}"
+            )
+
+        logger.info("✅ TC-CF-009: Page-folder hierarchy validated successfully")
+
 
 @pytest.mark.integration
 @pytest.mark.confluence
@@ -370,7 +450,7 @@ class TestConfluenceValidation:
 class TestConfluenceIncrementalSync:
     """Incremental sync tests for Confluence (TC-CF-011 to TC-CF-034)."""
     
-    @pytest.mark.order(11)
+    @pytest.mark.order(12)
     async def test_tc_cf_024_page_added(
         self,
         confluence_connector: Dict[str, Any],
@@ -444,7 +524,7 @@ class TestConfluenceIncrementalSync:
         
         logger.info("✅ TC-CF-024: Page added and verified successfully")
     
-    @pytest.mark.order(12)
+    @pytest.mark.order(13)
     async def test_tc_cf_026_page_content_updated(
         self,
         confluence_connector: Dict[str, Any],
@@ -531,7 +611,7 @@ class TestConfluenceIncrementalSync:
 class TestConfluenceFilters:
     """Filter tests for Confluence (TC-CF-036 to TC-CF-045)."""
     
-    @pytest.mark.order(13)
+    @pytest.mark.order(14)
     async def test_tc_cf_036_space_filter_include(
         self,
         confluence_connector: Dict[str, Any],
@@ -572,6 +652,7 @@ class TestConfluenceFilters:
             connector_id,
             space_key,
             phase="TC-CF-036 after filter sync",
+            extra_non_page_records=1,
         )
         
         # Verify only content from filtered space exists
@@ -587,7 +668,7 @@ class TestConfluenceFilters:
 class TestConfluenceReindex:
     """Reindex tests for Confluence (TC-CF-046 to TC-CF-051)."""
     
-    @pytest.mark.order(14)
+    @pytest.mark.order(15)
     async def test_tc_cf_046_reindex_unchanged_page(
         self,
         confluence_connector: Dict[str, Any],
@@ -664,7 +745,7 @@ class TestConfluenceReindex:
         
         logger.info("✅ TC-CF-046: Reindex unchanged page completed successfully")
     
-    @pytest.mark.order(15)
+    @pytest.mark.order(16)
     async def test_tc_cf_047_reindex_updated_page(
         self,
         confluence_connector: Dict[str, Any],
@@ -762,7 +843,7 @@ class TestConfluenceReindex:
 class TestConfluenceStream:
     """Stream tests for Confluence (TC-CF-052 to TC-CF-056)."""
     
-    @pytest.mark.order(16)
+    @pytest.mark.order(17)
     async def test_tc_cf_052_stream_page_html(
         self,
         confluence_connector: Dict[str, Any],
@@ -843,7 +924,7 @@ class TestConfluenceConnector:
         logger.info("Graph summary after full sync: %s (connector %s)", summary, connector_id)
 
     # TC-INCR-001 — Incremental sync
-    @pytest.mark.order(7)
+    @pytest.mark.order(8)
     async def test_tc_incr_001_incremental_sync_new_pages(
         self,
         confluence_connector: Dict[str, Any],
@@ -925,6 +1006,7 @@ class TestConfluenceConnector:
             connector_id,
             space_key,
             phase="TC-INCR-001 after incremental sync",
+            extra_non_page_records=1,
         )
 
         after_count = await graph_provider.count_records(connector_id)
@@ -940,7 +1022,7 @@ class TestConfluenceConnector:
         )
 
     # TC-UPDATE-001 — Content change detection
-    @pytest.mark.order(8)
+    @pytest.mark.order(9)
     async def test_tc_update_001_content_change_detection(
         self,
         confluence_connector: Dict[str, Any],
@@ -995,7 +1077,7 @@ class TestConfluenceConnector:
             f"Record count should be stable after update; before={before_count}, after={after_count}"
         )
 
-    @pytest.mark.order(9)
+    @pytest.mark.order(10)
     async def test_tc_rename_001_rename_detection(
         self,
         confluence_connector: Dict[str, Any],
@@ -1045,7 +1127,7 @@ class TestConfluenceConnector:
 
         confluence_connector["renamed_page_id"] = str(page_id)
 
-    @pytest.mark.order(10)
+    @pytest.mark.order(11)
     async def test_tc_move_001_move_detection(
         self,
         confluence_connector: Dict[str, Any],

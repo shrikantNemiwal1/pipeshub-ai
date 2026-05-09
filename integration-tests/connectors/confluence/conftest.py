@@ -136,6 +136,59 @@ async def confluence_connector(
             logger.error("SETUP: Failed to create page '%s': HTTP %s", title, resp.status)
     
     assert page_count >= 3, f"Expected at least 3 initial pages, got {page_count}"
+
+    # Folder + page-in-folder for TC-CF-009 (present before first connector sync).
+    logger.info("SETUP: Creating test folder for TC-CF-009")
+    folder_title = f"TestFolder-{uuid.uuid4().hex[:6]}"
+    folder_resp = await confluence_datasource.create_folder(
+        body={
+            "spaceId": state["space_id"],
+            "title": folder_title,
+            "body": {
+                "representation": "storage",
+                "value": "<p>Test folder for hierarchy validation</p>",
+            },
+            "status": "current",
+        }
+    )
+    if folder_resp.status not in (200, 201):
+        raise RuntimeError(f"Failed to create test folder: HTTP {folder_resp.status} {folder_resp.text()[:400]}")
+    folder_data = folder_resp.json()
+    state["test_folder_id"] = str(folder_data.get("id"))
+    state["test_folder_title"] = folder_title
+    logger.info("SETUP: Created folder '%s' (id=%s)", folder_title, state["test_folder_id"])
+
+    logger.info("SETUP: Creating test page inside folder for TC-CF-009")
+    page_in_folder_title = f"PageInFolder-{uuid.uuid4().hex[:6]}"
+    page_in_folder_resp = await confluence_datasource.create_page(
+        root_level=False,
+        body={
+            "spaceId": state["space_id"],
+            "status": "current",
+            "title": page_in_folder_title,
+            "parentId": state["test_folder_id"],
+            "body": {
+                "representation": "storage",
+                "value": "<p>Test page inside folder for hierarchy validation</p>",
+            },
+        },
+    )
+    if page_in_folder_resp.status not in (200, 201):
+        raise RuntimeError(
+            "Failed to create page in folder: HTTP "
+            f"{page_in_folder_resp.status} {page_in_folder_resp.text()[:400]}"
+        )
+    page_in_folder_data = page_in_folder_resp.json()
+    state["test_page_in_folder_id"] = str(page_in_folder_data.get("id"))
+    state["test_page_in_folder_title"] = page_in_folder_title
+    logger.info(
+        "SETUP: Created page '%s' (id=%s) inside folder %s",
+        page_in_folder_title,
+        state["test_page_in_folder_id"],
+        state["test_folder_id"],
+    )
+    page_count += 1
+
     state["uploaded_count"] = page_count
     
     # Create connector (filters must match etcd layout and SyncFilterKey.SPACE_KEYS — see
@@ -200,6 +253,7 @@ async def confluence_connector(
         connector_id,
         space_key,
         phase="SETUP after initial sync",
+        extra_non_page_records=1,
     )
 
     # One verification sync: lets the connector finish background work and leaves it
@@ -223,6 +277,7 @@ async def confluence_connector(
         connector_id,
         space_key,
         phase="SETUP after verification sync",
+        extra_non_page_records=1,
     )
 
     state["full_sync_count"] = verified_count

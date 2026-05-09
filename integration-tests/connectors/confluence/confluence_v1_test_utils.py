@@ -85,15 +85,21 @@ async def assert_confluence_pages_match_graph_records(
     space_key: str,
     *,
     phase: str,
+    extra_non_page_records: int = 0,
 ) -> None:
-    """Assert v1 page count for the space equals graph Record count for the connector."""
+    """Assert v1 page count + extra non-page records equals graph Record count.
+
+    ``extra_non_page_records`` covers synced entities not counted by v1 page search
+    (e.g. Confluence folders stored as FILE records with folder mime type).
+    """
     api_count = await count_confluence_space_pages_v1_search(datasource, space_key)
     graph_count = await graph_provider.count_records(connector_id)
-    if api_count != graph_count:
+    expected_graph_count = api_count + extra_non_page_records
+    if graph_count != expected_graph_count:
         raise AssertionError(
-            f"{phase}: Confluence v1 content/search page count ({api_count}) != "
-            f"graph Record count ({graph_count}) for connector {connector_id} "
-            f"space_key={space_key!r}"
+            f"{phase}: expected graph Record count {expected_graph_count} "
+            f"(v1 pages={api_count} + extra_non_page={extra_non_page_records}), "
+            f"got {graph_count} for connector {connector_id} space_key={space_key!r}"
         )
 
 
