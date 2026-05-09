@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import TYPE_CHECKING, Awaitable, Callable, TypeVar, Dict, Any
+from typing import TYPE_CHECKING, Awaitable, Callable, TypeVar
 
 from app.config.constants.arangodb import AppStatus
 if TYPE_CHECKING:
@@ -98,6 +98,11 @@ async def async_wait_for_stable_record_count(
     return prev
 
 
+_SYNC_ACTIVE_STATUSES = frozenset(
+    {AppStatus.SYNCING.value, AppStatus.FULL_SYNCING.value}
+)
+
+
 async def wait_for_sync_completion(
     pipeshub_client: "PipeshubClient",
     graph_provider: "GraphProviderProtocol",
@@ -108,11 +113,12 @@ async def wait_for_sync_completion(
     min_records: int | None = None,
 ) -> int:
     """
-    Wait for sync to complete by polling connector status until IDLE, then read record count.
+    Wait until a connector sync finishes and the graph reflects it.
 
-    1. Poll connector.status until it becomes IDLE (not SYNCING/FULL_SYNCING).
-    2. Query graph record count once (sync is awaited before IDLE; no extra settle wait).
-    3. Optionally assert min_records threshold.
+    Avoids a race where the previous run left ``status=IDLE`` and Kafka has not yet
+    flipped the connector to SYNCING: we do **not** treat IDLE alone as completion
+    unless we have seen SYNCING/FULL_SYNCING for this wait, or ``min_records`` is
+    already satisfied while IDLE (very fast sync where we might miss SYNCING).
 
     Args:
         pipeshub_client: Client for accessing connector API
@@ -120,14 +126,14 @@ async def wait_for_sync_completion(
         connector_id: Connector ID to monitor
         timeout: Maximum seconds to wait for completion (default 300)
         poll_interval: Seconds between status polls (default 5)
-        min_records: Minimum record count threshold (optional)
+        min_records: Minimum record count before returning when sync was observed
 
     Returns:
-        Record count after connector reports IDLE
+        Record count after sync completes
 
     Raises:
         TimeoutError: If sync doesn't complete within timeout
-        AssertionError: If min_records threshold not met
+        AssertionError: If ``min_records`` was set and count stayed below threshold
 
     Example:
         final_count = await wait_for_sync_completion(
@@ -138,32 +144,82 @@ async def wait_for_sync_completion(
     deadline = time.time() + timeout
     logger.info("⏳ Waiting for sync completion for connector %s", connector_id)
 
+    seen_sync_active = False
+
     while time.time() < deadline:
         connector = pipeshub_client.get_connector(connector_id)
-        status = connector.get("status", "IDLE")
+        # Do not default missing status to IDLE — that masked stale IDLE after toggle.
+        status = connector.get("status")
+
+        if status in _SYNC_ACTIVE_STATUSES:
+            seen_sync_active = True
 
         if status == AppStatus.IDLE.value:
-            logger.info("✅ Connector %s status is IDLE", connector_id)
-            break
+            final_count = await graph_provider.count_records(connector_id)
 
-        logger.info(
-            "⏳ Connector %s status: %s, waiting... (%.0fs remaining)",
-            connector_id, status, deadline - time.time(),
-        )
+            if seen_sync_active:
+                if min_records is None or final_count >= min_records:
+                    logger.info("✅ Connector %s status is IDLE", connector_id)
+                    logger.info(
+                        "✅ Sync complete for connector %s: %d records",
+                        connector_id,
+                        final_count,
+                    )
+                    return final_count
+                logger.info(
+                    "⏳ Connector %s IDLE but record count %d < min_records %d; waiting... (%.0fs left)",
+                    connector_id,
+                    final_count,
+                    min_records,
+                    deadline - time.time(),
+                )
+            elif min_records is not None and final_count >= min_records:
+                # Missed SYNCING in the poll window but graph already at threshold.
+                logger.info(
+                    "✅ Connector %s IDLE with record count %d >= min_records %d (fast sync)",
+                    connector_id,
+                    final_count,
+                    min_records,
+                )
+                logger.info(
+                    "✅ Sync complete for connector %s: %d records",
+                    connector_id,
+                    final_count,
+                )
+                return final_count
+            else:
+                logger.info(
+                    "⏳ Connector %s status IDLE but sync not observed yet "
+                    "(waiting for SYNCING/FULL_SYNCING)... %.0fs remaining",
+                    connector_id,
+                    deadline - time.time(),
+                )
+        else:
+            logger.info(
+                "⏳ Connector %s status: %s, waiting... (%.0fs remaining)",
+                connector_id,
+                status,
+                deadline - time.time(),
+            )
+
         await asyncio.sleep(poll_interval)
-    else:
-        raise TimeoutError(f"Connector {connector_id} did not reach IDLE status within {timeout}s")
 
+    connector = pipeshub_client.get_connector(connector_id)
+    status = connector.get("status")
     final_count = await graph_provider.count_records(connector_id)
-
-    if min_records is not None and final_count < min_records:
+    if (
+        seen_sync_active
+        and status == AppStatus.IDLE.value
+        and min_records is not None
+        and final_count < min_records
+    ):
         raise AssertionError(
-            f"Expected at least {min_records} records, got {final_count} "
+            f"Expected at least {min_records} records after sync, got {final_count} "
             f"for connector {connector_id}"
         )
 
-    logger.info(
-        "✅ Sync complete for connector %s: %d records",
-        connector_id, final_count
+    raise TimeoutError(
+        f"Connector {connector_id} did not complete sync within {timeout}s "
+        f"(seen_sync_active={seen_sync_active}, last_status={status!r}, "
+        f"records={final_count}, min_records={min_records})"
     )
-    return final_count

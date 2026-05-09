@@ -975,6 +975,10 @@ class TestConfluenceConnector:
 
         page_id_1 = str(new_page_1["id"])
         page_id_2 = str(new_page_2["id"])
+
+        # Persist before sync wait so downstream tests don't KeyError if sync assertion fails.
+        confluence_connector["test_page_id"] = page_id_1
+        confluence_connector["test_page_title"] = new_page_1["title"]
         
         # Wait for both pages to be visible in Confluence v1 search
         await wait_until_confluence_condition(
@@ -997,6 +1001,7 @@ class TestConfluenceConnector:
             pipeshub_client,
             graph_provider,
             connector_id,
+            min_records=before_count + 2,
             timeout=180,
         )
 
@@ -1011,8 +1016,6 @@ class TestConfluenceConnector:
 
         after_count = await graph_provider.count_records(connector_id)
 
-        confluence_connector["test_page_id"] = str(new_page_1["id"])
-        confluence_connector["test_page_title"] = new_page_1["title"]
         logger.info(
             "TC-INCR-001 passed: %d -> %d records (v1 pages %d -> %d)",
             before_count,
