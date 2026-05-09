@@ -290,29 +290,30 @@ function KnowledgeBasePageContent() {
 
     if (allRecords) {
       const parsed = parseAllRecordsParams(searchParams);
-      if (Object.keys(parsed.filter).length > 0) store.hydrateAllRecordsFilter(parsed.filter);
-      if (parsed.sort.field !== 'updatedAt' || parsed.sort.order !== 'desc') {
-        store.setAllRecordsSort(parsed.sort);
-      }
-      // Set page/limit after sort (sort resets page to 1)
-      if (parsed.limit !== 50) store.setAllRecordsLimit(parsed.limit);
-      if (parsed.page !== 1) store.setAllRecordsPage(parsed.page);
+      // Always replace from URL (even empty/default) — URL is source of truth on load
+      store.hydrateAllRecordsFilter(parsed.filter);
+      store.setAllRecordsSort(parsed.sort);
+      store.setAllRecordsLimit(parsed.limit);
+      store.setAllRecordsSearchQuery(parsed.searchQuery);
+      // After search query (which resets page to 1), restore page from URL
+      store.setAllRecordsPage(parsed.page);
       if (parsed.searchQuery) {
-        store.setAllRecordsSearchQuery(parsed.searchQuery);
         setIsSearchOpen(true);
+      } else {
+        setIsSearchOpen(false);
       }
     } else {
       const parsed = parseCollectionsParams(searchParams);
-      if (Object.keys(parsed.filter).length > 0) store.hydrateFilter(parsed.filter);
-      if (parsed.sort.field !== 'updatedAt' || parsed.sort.order !== 'desc') {
-        store.setSort(parsed.sort);
-      }
-      // Set page/limit after sort (sort resets page to 1)
-      if (parsed.limit !== 50) store.setCollectionsLimit(parsed.limit);
-      if (parsed.page !== 1) store.setCollectionsPage(parsed.page);
+      store.hydrateFilter(parsed.filter);
+      store.setSort(parsed.sort);
+      store.setCollectionsLimit(parsed.limit);
+      store.setSearchQuery(parsed.searchQuery);
+      // After search query (which resets page to 1), restore page from URL
+      store.setCollectionsPage(parsed.page);
       if (parsed.searchQuery) {
-        store.setSearchQuery(parsed.searchQuery);
         setIsSearchOpen(true);
+      } else {
+        setIsSearchOpen(false);
       }
     }
   }, [searchParams]);
