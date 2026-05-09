@@ -154,9 +154,6 @@ function KnowledgeBasePageContent() {
     // Sidebar → Page action bridge
     pendingSidebarAction,
     clearPendingSidebarAction,
-    // Filter reset
-    clearFilter,
-    clearAllRecordsFilter,
   } = useKnowledgeBaseStore();
 
   // Extract filter and sort separately to create stable references
@@ -264,83 +261,59 @@ function KnowledgeBasePageContent() {
   // URL ↔ Store Sync for Filters, Sort, Pagination, Search
   // ========================================
 
-  const hasHydratedFromUrl = useRef(false);
-  const isFirstUrlSyncRender = useRef(true);
-  /** Prevents URL sync from router.replace()-ing before router.push applies (drill-down race). */
-  const skipNextUrlReplaceRef = useRef(false);
+  const lastHydratedUrl = useRef('');
+  const isUrlSyncPaused = useRef(false);
 
-  // Hydration: Parse URL params into store once the URL is readable.
-  // useSearchParams() can mount empty before the real query is available; defer until it matches
-  // the browser URL so we never mark hydrated without applying view=all-records filters.
+  // Read URL → Store: Always apply URL params to store when URL changes
   useEffect(() => {
-    if (hasHydratedFromUrl.current) return;
-
-    const qs = searchParams.toString();
-    const locationSearch =
-      typeof window !== 'undefined' ? window.location.search.replace(/^\?/, '') : '';
-    // Next can mount with empty useSearchParams while location already has the query — wait one tick.
-    if (!qs && locationSearch.length > 0) {
-      return;
-    }
-
-    hasHydratedFromUrl.current = true;
-
+    const currentUrl = searchParams.toString();
+    
+    // Skip if we already processed this exact URL
+    if (currentUrl === lastHydratedUrl.current) return;
+    
+    // On initial mount, Next.js may have empty searchParams while location has the real query
+    const locationSearch = typeof window !== 'undefined' ? window.location.search.replace(/^\?/, '') : '';
+    if (!currentUrl && locationSearch.length > 0) return;
+    
+    lastHydratedUrl.current = currentUrl;
+    
+    // Pause URL sync while we hydrate to avoid echo: hydrate→store change→URL sync→same URL
+    isUrlSyncPaused.current = true;
+    
     const store = useKnowledgeBaseStore.getState();
     const allRecords = getIsAllRecordsMode(searchParams);
 
     if (allRecords) {
       const parsed = parseAllRecordsParams(searchParams);
-      // Always replace from URL (even empty/default) — URL is source of truth on load
       store.hydrateAllRecordsFilter(parsed.filter);
       store.setAllRecordsSort(parsed.sort);
       store.setAllRecordsLimit(parsed.limit);
       store.setAllRecordsSearchQuery(parsed.searchQuery);
-      // After search query (which resets page to 1), restore page from URL
       store.setAllRecordsPage(parsed.page);
-      if (parsed.searchQuery) {
-        setIsSearchOpen(true);
-      } else {
-        setIsSearchOpen(false);
-      }
+      setIsSearchOpen(!!parsed.searchQuery);
     } else {
       const parsed = parseCollectionsParams(searchParams);
       store.hydrateFilter(parsed.filter);
       store.setSort(parsed.sort);
       store.setCollectionsLimit(parsed.limit);
       store.setSearchQuery(parsed.searchQuery);
-      // After search query (which resets page to 1), restore page from URL
       store.setCollectionsPage(parsed.page);
-      if (parsed.searchQuery) {
-        setIsSearchOpen(true);
-      } else {
-        setIsSearchOpen(false);
-      }
+      setIsSearchOpen(!!parsed.searchQuery);
     }
+    
+    // Resume URL sync after hydration completes
+    isUrlSyncPaused.current = false;
   }, [searchParams]);
 
-  // URL sync: Write store state to URL when filter/sort/pagination/search changes
+  // Write Store → URL: Sync filter/sort/pagination changes to URL
   useEffect(() => {
-    // Skip first render (before hydration completes)
-    if (isFirstUrlSyncRender.current) {
-      isFirstUrlSyncRender.current = false;
-      return;
-    }
-    if (!hasHydratedFromUrl.current) return;
-
-    // Avoid replacing the URL in the same turn as clearing filters + router.push: searchParams still
-    // reflect the old location, so baseParams would omit nodeType/nodeId and strip drill-down.
-    if (skipNextUrlReplaceRef.current) {
-      skipNextUrlReplaceRef.current = false;
-      return;
-    }
-
-    // Always read the latest store snapshot here. This effect can run in the same commit as
-    // hydration; React closures may still hold the pre-hydration filter, which would serialize
-    // an empty filter and router.replace() would strip connectorIds / indexingStatus from the URL.
+    // Skip while hydrating (to avoid echo)
+    if (isUrlSyncPaused.current) return;
+    
     const store = useKnowledgeBaseStore.getState();
     const allRecords = getIsAllRecordsMode(searchParams);
 
-    // Build base navigation params (preserve view, nodeType, nodeId)
+    // Build URL from current store state
     const baseParams: Record<string, string> = {};
     if (allRecords) baseParams.view = 'all-records';
     const nodeType = searchParams.get('nodeType');
@@ -348,27 +321,26 @@ function KnowledgeBasePageContent() {
     if (nodeType) baseParams.nodeType = nodeType;
     if (nodeId) baseParams.nodeId = nodeId;
 
-    let filterParams: Record<string, string>;
-    if (allRecords) {
-      filterParams = serializeAllRecordsParams(
-        store.allRecordsFilter,
-        store.allRecordsSort,
-        { page: store.allRecordsPagination.page, limit: store.allRecordsPagination.limit },
-        debouncedAllRecordsSearchQuery
-      );
-    } else {
-      filterParams = serializeCollectionsParams(
-        store.filter,
-        store.sort,
-        { page: store.collectionsPagination.page, limit: store.collectionsPagination.limit },
-        debouncedSearchQuery
-      );
-    }
+    const filterParams = allRecords
+      ? serializeAllRecordsParams(
+          store.allRecordsFilter,
+          store.allRecordsSort,
+          { page: store.allRecordsPagination.page, limit: store.allRecordsPagination.limit },
+          debouncedAllRecordsSearchQuery
+        )
+      : serializeCollectionsParams(
+          store.filter,
+          store.sort,
+          { page: store.collectionsPagination.page, limit: store.collectionsPagination.limit },
+          debouncedSearchQuery
+        );
 
     const newUrl = buildFilterUrl(baseParams, filterParams);
     const currentUrl = `/knowledge-base${searchParams.toString() ? `?${searchParams.toString()}` : ''}`;
 
+    // Only replace if URL actually changed (prevents infinite loops)
     if (newUrl !== currentUrl) {
+      lastHydratedUrl.current = newUrl.replace('/knowledge-base?', '').replace('/knowledge-base', '');
       router.replace(newUrl);
     }
   }, [
@@ -1783,38 +1755,24 @@ function KnowledgeBasePageContent() {
           (item.nodeType === 'record' && item.hasChildren);
 
         if (isNavigableContainer) {
-          // Reset filters and search when navigating into a container
-          if (isAllRecordsMode) {
-            skipNextUrlReplaceRef.current = true;
-            clearAllRecordsFilter();
-            setAllRecordsSearchQuery('');
-          } else {
-            clearFilter();
-            setSearchQuery('');
-          }
+          // Navigate into container - URL hydration will reset filters/search
           setIsSearchOpen(false);
-          // Navigate into container using the helper to preserve view mode
           router.push(buildNavUrl({ nodeType: item.nodeType, nodeId: item.id }));
         } else if (item.nodeType === 'record') {
-          // Open file preview for records
           handlePreviewFile(item);
         }
       } else {
         // Handle legacy KnowledgeBaseItem format
         if (item.type === 'folder') {
-          // Reset filters and search when navigating into a folder
-          clearFilter();
-          setSearchQuery('');
           setIsSearchOpen(false);
           setCurrentFolderId(item.id);
           router.push(buildNavUrl({ kbId: selectedKbId || '', folderId: item.id }));
         } else {
-          // Open file preview
           handlePreviewFile(item);
         }
       }
     },
-    [selectedKbId, router, setCurrentFolderId, handlePreviewFile, buildNavUrl, isAllRecordsMode, clearFilter, clearAllRecordsFilter, setSearchQuery, setAllRecordsSearchQuery, setIsSearchOpen]
+    [selectedKbId, router, setCurrentFolderId, handlePreviewFile, buildNavUrl, setIsSearchOpen]
   );
 
 
@@ -1898,26 +1856,17 @@ function KnowledgeBasePageContent() {
   }, [selectedKbId, refreshData]);
 
   // Handle breadcrumb click - navigate to the clicked breadcrumb
+  // URL hydration will reset filters/search when the new URL loads
   const handleBreadcrumbClick = useCallback(
     (breadcrumb: Breadcrumb) => {
-      // Reset filters and search when navigating via breadcrumbs
-      if (isAllRecordsMode) {
-        skipNextUrlReplaceRef.current = true;
-        clearAllRecordsFilter();
-        setAllRecordsSearchQuery('');
-      } else {
-        clearFilter();
-        setSearchQuery('');
-      }
       setIsSearchOpen(false);
-
       if (breadcrumb.id === 'all-records-root') {
         router.push(buildNavUrl({}));
         return;
       }
       router.push(buildNavUrl({ nodeType: breadcrumb.nodeType, nodeId: breadcrumb.id }));
     },
-    [router, buildNavUrl, isAllRecordsMode, clearFilter, clearAllRecordsFilter, setSearchQuery, setAllRecordsSearchQuery, setIsSearchOpen]
+    [router, buildNavUrl, setIsSearchOpen]
   );
 
   // Handle reindex - directly reindexes the item with loading/success/error toasts

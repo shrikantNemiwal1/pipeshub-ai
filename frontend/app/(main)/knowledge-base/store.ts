@@ -774,8 +774,10 @@ export const useKnowledgeBaseStore = create<KnowledgeBaseStore>()(
         set((state) => {
           state.allRecordsSidebarSelection = selection;
           state.selectedRecords.clear();
-          // Different sidebar parent → restart pagination
-          state.allRecordsPagination.page = 1;
+          // Only reset pagination when explicitly switching to a different parent (not during auto-expansion sync)
+          if (selection.type !== 'explorer') {
+            state.allRecordsPagination.page = 1;
+          }
         }),
 
       selectRecord: (id) =>

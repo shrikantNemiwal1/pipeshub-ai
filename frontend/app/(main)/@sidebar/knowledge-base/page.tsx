@@ -59,7 +59,6 @@ function KnowledgeBaseSidebarSlotContent() {
     clearNodeCacheEntries,
     reMergeCachedChildrenIntoTree,
     setPendingSidebarAction,
-    clearFiltersForNavigation,
   } = useKnowledgeBaseStore();
 
   const kbApp = useMemo(() => appNodes.find((n) => n.connector === 'KB'), [appNodes]);
@@ -71,7 +70,6 @@ function KnowledgeBaseSidebarSlotContent() {
 
   const handleSelectKb = useCallback(
     (id: string) => {
-      clearFiltersForNavigation(isAllRecordsMode);
       if (id) {
         router.push(buildNavUrl(isAllRecordsMode, { kbId: id }));
       } else {
@@ -79,7 +77,7 @@ function KnowledgeBaseSidebarSlotContent() {
       }
       closeOnMobile();
     },
-    [router, isAllRecordsMode, clearFiltersForNavigation, closeOnMobile]
+    [router, isAllRecordsMode, closeOnMobile]
   );
 
   const handleNodeExpand = useCallback(
@@ -220,52 +218,40 @@ function KnowledgeBaseSidebarSlotContent() {
       if (isAllRecordsMode) {
         setAllRecordsSidebarSelection({ type: 'explorer' });
       }
-      clearFiltersForNavigation(isAllRecordsMode);
       router.push(buildNavUrl(isAllRecordsMode, { nodeType, nodeId }));
       closeOnMobile();
     },
-    [
-      router,
-      isAllRecordsMode,
-      setCurrentFolderId,
-      setAllRecordsSidebarSelection,
-      clearFiltersForNavigation,
-      closeOnMobile,
-    ]
+    [router, isAllRecordsMode, setCurrentFolderId, setAllRecordsSidebarSelection, closeOnMobile]
   );
 
   // --- All Records mode handlers ---
   const handleAllRecordsSelectAll = useCallback(() => {
-    clearFiltersForNavigation(true);
     router.push('/knowledge-base?view=all-records');
     closeOnMobile();
-  }, [router, clearFiltersForNavigation, closeOnMobile]);
+  }, [router, closeOnMobile]);
 
   const handleAllRecordsSelectCollection = useCallback(
     (id: string) => {
-      clearFiltersForNavigation(true);
       router.push(buildNavUrl(isAllRecordsMode, { nodeType: 'recordGroup', nodeId: id }));
       closeOnMobile();
     },
-    [router, isAllRecordsMode, clearFiltersForNavigation, closeOnMobile]
+    [router, isAllRecordsMode, closeOnMobile]
   );
 
   const handleAllRecordsSelectConnectorItem = useCallback(
     (nodeType: string, nodeId: string) => {
-      clearFiltersForNavigation(true);
       router.push(buildNavUrl(isAllRecordsMode, { nodeType, nodeId }));
       closeOnMobile();
     },
-    [router, isAllRecordsMode, clearFiltersForNavigation, closeOnMobile]
+    [router, isAllRecordsMode, closeOnMobile]
   );
 
   const handleAllRecordsSelectApp = useCallback(
     (appId: string) => {
-      clearFiltersForNavigation(true);
       router.push(buildNavUrl(isAllRecordsMode, { nodeType: 'app', nodeId: appId }));
       closeOnMobile();
     },
-    [router, isAllRecordsMode, clearFiltersForNavigation, closeOnMobile]
+    [router, isAllRecordsMode, closeOnMobile]
   );
 
   const handleSidebarReindex = useCallback((nodeId: string) => {
