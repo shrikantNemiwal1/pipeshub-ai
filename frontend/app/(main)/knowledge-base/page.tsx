@@ -62,7 +62,7 @@ import {
   buildFilterUrl,
   buildNavUrl as buildNavUrlFn,
 } from './url-params';
-import { getIsAllRecordsMode } from './utils/nav';
+import { getIsAllRecordsMode, buildNavUrl as buildCleanNavUrl } from './utils/nav';
 import { FOLDER_REINDEX_DEPTH, SIDEBAR_PAGINATION_PAGE_SIZE } from './constants';
 import { refreshKbTree } from './utils/refresh-kb-tree';
 import { getReindexSuccessTitle } from './utils/reindex-label';
@@ -262,24 +262,20 @@ function KnowledgeBasePageContent() {
   // ========================================
 
   const lastHydratedUrl = useRef('');
-  const isUrlSyncPaused = useRef(false);
 
   // Read URL → Store: Always apply URL params to store when URL changes
   useEffect(() => {
     const currentUrl = searchParams.toString();
-    
-    // Skip if we already processed this exact URL
+
+    // Skip if we already processed this exact URL (prevents echo from the write-effect below)
     if (currentUrl === lastHydratedUrl.current) return;
-    
+
     // On initial mount, Next.js may have empty searchParams while location has the real query
     const locationSearch = typeof window !== 'undefined' ? window.location.search.replace(/^\?/, '') : '';
     if (!currentUrl && locationSearch.length > 0) return;
-    
+
     lastHydratedUrl.current = currentUrl;
-    
-    // Pause URL sync while we hydrate to avoid echo: hydrate→store change→URL sync→same URL
-    isUrlSyncPaused.current = true;
-    
+
     const store = useKnowledgeBaseStore.getState();
     const allRecords = getIsAllRecordsMode(searchParams);
 
@@ -300,16 +296,10 @@ function KnowledgeBasePageContent() {
       store.setCollectionsPage(parsed.page);
       setIsSearchOpen(!!parsed.searchQuery);
     }
-    
-    // Resume URL sync after hydration completes
-    isUrlSyncPaused.current = false;
   }, [searchParams]);
 
   // Write Store → URL: Sync filter/sort/pagination changes to URL
   useEffect(() => {
-    // Skip while hydrating (to avoid echo)
-    if (isUrlSyncPaused.current) return;
-    
     const store = useKnowledgeBaseStore.getState();
     const allRecords = getIsAllRecordsMode(searchParams);
 
@@ -340,7 +330,8 @@ function KnowledgeBasePageContent() {
 
     // Only replace if URL actually changed (prevents infinite loops)
     if (newUrl !== currentUrl) {
-      lastHydratedUrl.current = newUrl.replace('/knowledge-base?', '').replace('/knowledge-base', '');
+      // Update the hydration ref so the read-effect skips this URL (it came from us, not navigation)
+      lastHydratedUrl.current = new URL(newUrl, 'http://x').searchParams.toString();
       router.replace(newUrl);
     }
   }, [
@@ -1755,9 +1746,9 @@ function KnowledgeBasePageContent() {
           (item.nodeType === 'record' && item.hasChildren);
 
         if (isNavigableContainer) {
-          // Navigate into container - URL hydration will reset filters/search
+          // Use clean nav URL — filters don't carry over when drilling into a new container
           setIsSearchOpen(false);
-          router.push(buildNavUrl({ nodeType: item.nodeType, nodeId: item.id }));
+          router.push(buildCleanNavUrl(isAllRecordsMode, { nodeType: item.nodeType, nodeId: item.id }));
         } else if (item.nodeType === 'record') {
           handlePreviewFile(item);
         }
@@ -1772,7 +1763,7 @@ function KnowledgeBasePageContent() {
         }
       }
     },
-    [selectedKbId, router, setCurrentFolderId, handlePreviewFile, buildNavUrl, setIsSearchOpen]
+    [selectedKbId, router, isAllRecordsMode, setCurrentFolderId, handlePreviewFile, buildNavUrl, setIsSearchOpen]
   );
 
 
@@ -1856,17 +1847,17 @@ function KnowledgeBasePageContent() {
   }, [selectedKbId, refreshData]);
 
   // Handle breadcrumb click - navigate to the clicked breadcrumb
-  // URL hydration will reset filters/search when the new URL loads
+  // Use clean nav URL so filters don't carry over when navigating up the tree
   const handleBreadcrumbClick = useCallback(
     (breadcrumb: Breadcrumb) => {
       setIsSearchOpen(false);
       if (breadcrumb.id === 'all-records-root') {
-        router.push(buildNavUrl({}));
+        router.push(buildCleanNavUrl(isAllRecordsMode, {}));
         return;
       }
-      router.push(buildNavUrl({ nodeType: breadcrumb.nodeType, nodeId: breadcrumb.id }));
+      router.push(buildCleanNavUrl(isAllRecordsMode, { nodeType: breadcrumb.nodeType, nodeId: breadcrumb.id }));
     },
-    [router, buildNavUrl, setIsSearchOpen]
+    [router, isAllRecordsMode, setIsSearchOpen]
   );
 
   // Handle reindex - directly reindexes the item with loading/success/error toasts

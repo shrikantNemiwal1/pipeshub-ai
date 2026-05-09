@@ -248,7 +248,6 @@ interface KnowledgeBaseActions {
   setAllRecordsFilter: (filter: Partial<AllRecordsFilter>) => void;
   hydrateAllRecordsFilter: (filter: AllRecordsFilter) => void;
   clearAllRecordsFilter: () => void;
-  clearFiltersForNavigation: (isAllRecordsMode: boolean) => void;
   setAllRecordsSort: (sort: AllRecordsSortConfig) => void;
   setAllRecordsSearchQuery: (query: string) => void;
 
@@ -843,19 +842,6 @@ export const useKnowledgeBaseStore = create<KnowledgeBaseStore>()(
         set((state) => {
           state.allRecordsFilter = {};
           state.allRecordsPagination.page = 1;
-        }),
-
-      clearFiltersForNavigation: (isAllRecordsMode) =>
-        set((state) => {
-          if (isAllRecordsMode) {
-            state.allRecordsFilter = {};
-            state.allRecordsSearchQuery = '';
-            state.allRecordsPagination.page = 1;
-          } else {
-            state.filter = {};
-            state.searchQuery = '';
-            state.collectionsPagination.page = 1;
-          }
         }),
 
       setAllRecordsSort: (sort) =>
