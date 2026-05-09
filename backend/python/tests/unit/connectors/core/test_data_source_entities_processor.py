@@ -2544,7 +2544,7 @@ class TestProcessRecordSQLTypes:
 
     @pytest.mark.asyncio
     async def test_existing_record_weburl_preserved(self):
-        """Existing record's weburl is set on the incoming record."""
+        """When incoming webUrl is empty, merged record keeps the existing DB webUrl."""
         proc = _make_processor()
         tx_store = _make_tx_store()
 
@@ -2557,6 +2557,8 @@ class TestProcessRecordSQLTypes:
 
         record = _make_record()
         record.external_revision_id = "rev-new"
+        # Incoming empty webUrl: merged record should keep DB URL (connector-provided URL wins when truthy).
+        record.weburl = ""
 
         result = await proc._process_record(record, [], tx_store)
 
