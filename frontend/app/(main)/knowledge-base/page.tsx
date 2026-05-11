@@ -1757,13 +1757,14 @@ function KnowledgeBasePageContent() {
         if (item.type === 'folder') {
           setIsSearchOpen(false);
           setCurrentFolderId(item.id);
-          router.push(buildNavUrl({ kbId: selectedKbId || '', folderId: item.id }));
+          // Use clean nav URL to clear search params when navigating into folders
+          router.push(buildCleanNavUrl(false, { kbId: selectedKbId || '', folderId: item.id }));
         } else {
           handlePreviewFile(item);
         }
       }
     },
-    [selectedKbId, router, isAllRecordsMode, setCurrentFolderId, handlePreviewFile, buildNavUrl, setIsSearchOpen]
+    [selectedKbId, router, isAllRecordsMode, setCurrentFolderId, handlePreviewFile, setIsSearchOpen]
   );
 
 
