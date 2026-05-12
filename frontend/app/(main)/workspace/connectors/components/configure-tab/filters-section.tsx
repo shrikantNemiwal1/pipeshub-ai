@@ -233,8 +233,11 @@ function isMeaningfulCommitted(field: FilterSchemaField, raw: unknown): boolean 
   const row = raw;
   const ft = String(field.filterType ?? '').toLowerCase();
   if (ft === 'list' || ft === 'multiselect' || isListLikeField(field)) {
-    if (Array.isArray(row.value) && row.value.length > 0) return true;
-    if (Array.isArray(row.value) && field.defaultOperator) return true;
+    if (Array.isArray(row.value)) {
+      if (row.value.length > 0 || field.defaultOperator) {
+        return true;
+      }
+    }
     return false;
   }
   if (ft === 'boolean') {
