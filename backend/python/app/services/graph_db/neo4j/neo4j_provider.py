@@ -15058,31 +15058,21 @@ class Neo4jProvider(IGraphDBProvider):
             """
         return None
 
-    def _build_phase1a_count_query(
+    def _build_permission_paths_cypher(
         self,
         scope_filter_rg: str,
         scope_filter_record: str,
-        scope_filter_rg_inline: str,
-        scope_filter_record_inline: str,
-        children_intersection_cypher: str,
-        filter_clause: str,
     ) -> str:
         """
-        Build Phase 1a query: Count total accessible nodes matching filters.
+        Build the common permission paths logic (Paths 1-7) used by both count and pagination queries.
         
-        This query:
-        - Includes all 7 permission paths
-        - Applies scope filters and children intersection
-        - Applies all user filters
-        - Returns only: count(DISTINCT node.id) AS total
-        - Does NOT build full node structures (memory efficient)
-        
-        Following Neo4j best practices for large dataset pagination:
-        - Separate count query gets cached by Neo4j after first run
-        - Avoids collect() memory barrier
-        - Enables streaming in Phase 1b
+        Returns Cypher that:
+        - Matches user and their accessible apps
+        - Finds accessible RecordGroups via 4 permission paths
+        - Finds accessible Records via direct permissions (3 paths)
+        - Outputs: accessible_rgs and accessible_records variables
         """
-        query_template = """
+        cypher = """
         MATCH (u:User {id: $user_key})
         WITH u
 
@@ -15231,11 +15221,25 @@ class Neo4jProvider(IGraphDBProvider):
              (CASE WHEN user_org_records IS NOT NULL THEN user_org_records ELSE [] END) AS all_records_raw
 
         WITH accessible_rgs, [r IN all_records_raw WHERE r IS NOT NULL] AS accessible_records
+        """
+        
+        # Replace placeholders
+        cypher = cypher.replace("{scope_filter_rg}", scope_filter_rg)
+        cypher = cypher.replace("{scope_filter_record}", scope_filter_record)
+        return cypher
 
-        // ========== CHILDREN INTERSECTION ==========
-        {children_intersection_cypher}
-
-        // ========== BUILD MINIMAL NODE INFO FOR COUNTING ==========
+    def _build_minimal_node_construction_cypher(self, filter_clause: str) -> str:
+        """
+        Build Cypher for constructing minimal node structures for filtering/sorting.
+        
+        Takes accessible_rgs and accessible_records (after children intersection) and:
+        - Builds minimal RecordGroup nodes with fields needed for filtering
+        - Builds minimal Record nodes with fields needed for filtering
+        - Applies filter_clause and only_containers filter
+        - Returns filtered nodes ready for counting or pagination
+        """
+        cypher = """
+        // ========== BUILD MINIMAL NODE INFO ==========
         WITH final_accessible_rgs, final_accessible_records,
              CASE WHEN size(final_accessible_rgs) > 0 THEN final_accessible_rgs ELSE [null] END AS rgs_with_fallback,
              CASE WHEN size(final_accessible_records) > 0 THEN final_accessible_records ELSE [null] END AS records_with_fallback
@@ -15322,18 +15326,52 @@ class Neo4jProvider(IGraphDBProvider):
         WITH node
         WHERE (toBoolean($only_containers) = false)
            OR node.nodeType IN ['app', 'recordGroup', 'folder']
+        """
+        
+        # Replace placeholders
+        cypher = cypher.replace("{filter_clause}", filter_clause)
+        return cypher
+
+    def _build_phase1a_count_query(
+        self,
+        scope_filter_rg: str,
+        scope_filter_record: str,
+        scope_filter_rg_inline: str,
+        scope_filter_record_inline: str,
+        children_intersection_cypher: str,
+        filter_clause: str,
+    ) -> str:
+        """
+        Build Phase 1a query: Count total accessible nodes matching filters.
+        
+        This query:
+        - Includes all 7 permission paths
+        - Applies scope filters and children intersection
+        - Applies all user filters
+        - Returns only: count(DISTINCT node.id) AS total
+        - Does NOT build full node structures (memory efficient)
+        
+        Following Neo4j best practices for large dataset pagination:
+        - Separate count query gets cached by Neo4j after first run
+        - Avoids collect() memory barrier
+        - Enables streaming in Phase 1b
+        """
+        permission_paths = self._build_permission_paths_cypher(scope_filter_rg, scope_filter_record)
+        node_construction = self._build_minimal_node_construction_cypher(filter_clause)
+        
+        query_template = f"""
+        {permission_paths}
+
+        // ========== CHILDREN INTERSECTION ==========
+        {children_intersection_cypher}
+
+        {node_construction}
 
         // Count distinct nodes
         RETURN count(DISTINCT node.id) AS total
         """
 
-        # Replace placeholders
-        query = query_template.replace("{scope_filter_rg}", scope_filter_rg)
-        query = query.replace("{scope_filter_record}", scope_filter_record)
-        query = query.replace("{children_intersection_cypher}", children_intersection_cypher)
-        query = query.replace("{filter_clause}", filter_clause)
-
-        return query
+        return query_template
 
     def _build_phase1b_paginated_ids_query(
         self,
@@ -15356,246 +15394,16 @@ class Neo4jProvider(IGraphDBProvider):
         Critical: NO collect() before ORDER BY to avoid memory barrier.
         Only collect the final 50 IDs after SKIP/LIMIT.
         """
-        query_template = """
-        MATCH (u:User {id: $user_key})
-        WITH u
-
-        // Get user's accessible apps
-        WITH u, $user_accessible_app_ids AS user_accessible_app_ids
-
-        // ========== RECORDGROUP-BASED ACCESS (Paths 1-4) ==========
+        permission_paths = self._build_permission_paths_cypher(scope_filter_rg, scope_filter_record)
+        node_construction = self._build_minimal_node_construction_cypher(filter_clause)
         
-        // Path 1: User -> RecordGroup
-        CALL {
-            WITH u, user_accessible_app_ids
-            MATCH (u)-[:PERMISSION {type: 'USER'}]->(rg:RecordGroup)
-            WHERE rg.orgId = $org_id
-              AND (rg.connectorName = 'KB' OR rg.connectorId IN user_accessible_app_ids)
-              {scope_filter_rg}
-            RETURN collect(rg) AS path1_rgs
-        }
-
-        // Path 2: User -> Group/Role -> RecordGroup
-        CALL {
-            WITH u, user_accessible_app_ids
-            MATCH (u)-[:PERMISSION {type: 'USER'}]->(grp)
-            WHERE grp:Group OR grp:Role
-            MATCH (grp)-[:PERMISSION]->(rg:RecordGroup)
-            WHERE rg.orgId = $org_id
-              AND (rg.connectorName = 'KB' OR rg.connectorId IN user_accessible_app_ids)
-              {scope_filter_rg}
-            RETURN collect(rg) AS path2_rgs
-        }
-
-        // Path 3: User -> Org -> RecordGroup
-        CALL {
-            WITH u, user_accessible_app_ids
-            MATCH (u)-[:BELONGS_TO {entityType: 'ORGANIZATION'}]->(org)
-            MATCH (org)-[:PERMISSION {type: 'ORG'}]->(rg:RecordGroup)
-            WHERE rg.orgId = $org_id
-              AND (rg.connectorName = 'KB' OR rg.connectorId IN user_accessible_app_ids)
-              {scope_filter_rg}
-            RETURN collect(rg) AS path3_rgs
-        }
-
-        // Path 4: User -> Team -> RecordGroup
-        CALL {
-            WITH u, user_accessible_app_ids
-            MATCH (u)-[:PERMISSION {type: 'USER'}]->(team:Teams)
-            MATCH (team)-[:PERMISSION {type: 'TEAM'}]->(rg:RecordGroup)
-            WHERE rg.orgId = $org_id
-              AND (rg.connectorName = 'KB' OR rg.connectorId IN user_accessible_app_ids)
-              {scope_filter_rg}
-            RETURN collect(rg) AS path4_rgs
-        }
-
-        // Combine all accessible RecordGroups (parent level)
-        WITH u, user_accessible_app_ids,
-             path1_rgs + path2_rgs + path3_rgs + path4_rgs AS all_parent_rgs
-
-        // Find nested RecordGroups via INHERIT_PERMISSIONS
-        CALL {
-            WITH all_parent_rgs, user_accessible_app_ids
-            UNWIND all_parent_rgs AS parent_rg
-            MATCH (parent_rg)<-[:INHERIT_PERMISSIONS*1..5]-(rg:RecordGroup)
-            WHERE rg.orgId = $org_id
-              AND (rg.connectorName = 'KB' OR rg.connectorId IN user_accessible_app_ids)
-              {scope_filter_rg}
-            RETURN collect(DISTINCT rg) AS nested_rgs
-        }
-
-        // Combine parent and nested RecordGroups
-        WITH u, user_accessible_app_ids,
-             all_parent_rgs + (CASE WHEN nested_rgs IS NOT NULL THEN nested_rgs ELSE [] END) AS all_accessible_rgs
-
-        // Find all Records that inherit from accessible RecordGroups
-        WITH u, user_accessible_app_ids, all_accessible_rgs,
-             [rg IN all_accessible_rgs |
-               [(record:Record)-[:INHERIT_PERMISSIONS]->(rg)
-                WHERE record.orgId = $org_id
-               | record]
-             ] AS records_lists
-
-        // Flatten and deduplicate records from RecordGroups
-        WITH u, user_accessible_app_ids,
-             all_accessible_rgs AS accessible_rgs,
-             reduce(acc = [], list IN records_lists | acc + list) AS rg_inherited_records
-
-        // ========== DIRECT RECORD ACCESS (Paths 5-7) ==========
-
-        // Path 5: User -> Record (direct)
-        CALL {
-            WITH u, user_accessible_app_ids
-            MATCH (u)-[:PERMISSION {type: 'USER'}]->(record:Record)
-            WHERE record.orgId = $org_id
-              {scope_filter_record}
-
-            OPTIONAL MATCH (record_app:App {id: record.connectorId})
-            OPTIONAL MATCH (record_rg:RecordGroup {id: record.connectorId})
-            WITH record, record_app, record_rg, user_accessible_app_ids
-            WHERE (record_app IS NOT NULL AND record_app.id IN user_accessible_app_ids)
-               OR (record_rg IS NOT NULL AND (record_rg.connectorName = 'KB' OR record_rg.connectorId IN user_accessible_app_ids))
-
-            RETURN collect(record) AS user_direct_records
-        }
-
-        // Path 6: User -> Group/Role -> Record (direct)
-        CALL {
-            WITH u, user_accessible_app_ids
-            MATCH (u)-[:PERMISSION {type: 'USER'}]->(grp)
-            WHERE grp:Group OR grp:Role
-            MATCH (grp)-[:PERMISSION]->(record:Record)
-            WHERE record.orgId = $org_id
-              {scope_filter_record}
-
-            OPTIONAL MATCH (record_app:App {id: record.connectorId})
-            OPTIONAL MATCH (record_rg:RecordGroup {id: record.connectorId})
-            WITH record, record_app, record_rg, user_accessible_app_ids
-            WHERE (record_app IS NOT NULL AND record_app.id IN user_accessible_app_ids)
-               OR (record_rg IS NOT NULL AND (record_rg.connectorName = 'KB' OR record_rg.connectorId IN user_accessible_app_ids))
-
-            RETURN collect(record) AS user_group_records
-        }
-
-        // Path 7: User -> Org -> Record (direct)
-        CALL {
-            WITH u, user_accessible_app_ids
-            MATCH (u)-[:BELONGS_TO {entityType: 'ORGANIZATION'}]->(org)
-            MATCH (org)-[:PERMISSION {type: 'ORG'}]->(record:Record)
-            WHERE record.orgId = $org_id
-              {scope_filter_record}
-
-            OPTIONAL MATCH (record_app:App {id: record.connectorId})
-            OPTIONAL MATCH (record_rg:RecordGroup {id: record.connectorId})
-            WITH record, record_app, record_rg, user_accessible_app_ids
-            WHERE (record_app IS NOT NULL AND record_app.id IN user_accessible_app_ids)
-               OR (record_rg IS NOT NULL AND (record_rg.connectorName = 'KB' OR record_rg.connectorId IN user_accessible_app_ids))
-
-            RETURN collect(record) AS user_org_records
-        }
-
-        // Combine all record sources
-        WITH accessible_rgs, rg_inherited_records,
-             user_direct_records, user_group_records, user_org_records
-
-        WITH accessible_rgs,
-             rg_inherited_records +
-             (CASE WHEN user_direct_records IS NOT NULL THEN user_direct_records ELSE [] END) +
-             (CASE WHEN user_group_records IS NOT NULL THEN user_group_records ELSE [] END) +
-             (CASE WHEN user_org_records IS NOT NULL THEN user_org_records ELSE [] END) AS all_records_raw
-
-        WITH accessible_rgs, [r IN all_records_raw WHERE r IS NOT NULL] AS accessible_records
+        query_template = f"""
+        {permission_paths}
 
         // ========== CHILDREN INTERSECTION ==========
         {children_intersection_cypher}
 
-        // ========== BUILD MINIMAL NODE INFO FOR PAGINATION ==========
-        WITH final_accessible_rgs, final_accessible_records,
-             CASE WHEN size(final_accessible_rgs) > 0 THEN final_accessible_rgs ELSE [null] END AS rgs_with_fallback,
-             CASE WHEN size(final_accessible_records) > 0 THEN final_accessible_records ELSE [null] END AS records_with_fallback
-
-        // Build minimal RecordGroup nodes
-        UNWIND rgs_with_fallback AS rg_data
-        WITH rg_data, final_accessible_records, records_with_fallback
-
-        OPTIONAL MATCH (rg:RecordGroup)
-        WHERE rg_data IS NOT NULL AND rg.id = rg_data.id
-
-        WITH final_accessible_records, records_with_fallback,
-             collect(
-               CASE WHEN rg IS NOT NULL THEN
-                 {
-                   id: rg.id,
-                   name: rg.groupName,
-                   nodeType: 'recordGroup',
-                   origin: CASE WHEN rg.connectorName = 'KB' THEN 'COLLECTION' ELSE 'CONNECTOR' END,
-                   connector: rg.connectorName,
-                   connectorId: CASE WHEN rg.connectorName <> 'KB' THEN rg.connectorId ELSE null END,
-                   createdAt: CASE WHEN rg.connectorName = 'KB'
-                       THEN COALESCE(rg.createdAtTimestamp, 0)
-                       ELSE COALESCE(rg.sourceCreatedAtTimestamp, 0) END,
-                   updatedAt: CASE WHEN rg.connectorName = 'KB'
-                       THEN COALESCE(rg.updatedAtTimestamp, 0)
-                       ELSE COALESCE(rg.sourceLastModifiedTimestamp, 0) END,
-                   recordType: null,
-                   sizeInBytes: null,
-                   indexingStatus: null
-                 }
-               ELSE null END
-             ) AS rg_nodes_with_nulls
-
-        WITH final_accessible_records, records_with_fallback,
-             [n IN rg_nodes_with_nulls WHERE n IS NOT NULL] AS rg_nodes
-
-        // Build minimal Record nodes
-        UNWIND records_with_fallback AS rec_data
-        WITH rec_data, rg_nodes
-
-        OPTIONAL MATCH (record:Record)
-        WHERE rec_data IS NOT NULL AND record.id = rec_data.id
-
-        OPTIONAL MATCH (record)-[:IS_OF_TYPE]->(file_info:File)
-
-        WITH rg_nodes,
-             collect(
-               CASE WHEN record IS NOT NULL THEN
-                 {
-                   id: record.id,
-                   name: record.recordName,
-                   nodeType: CASE WHEN file_info IS NOT NULL AND file_info.isFile = false THEN 'folder' ELSE 'record' END,
-                   origin: CASE
-                     WHEN record IS NULL THEN null
-                     WHEN record.connectorName = 'KB' THEN 'COLLECTION'
-                     ELSE 'CONNECTOR'
-                   END,
-                   connector: record.connectorName,
-                   connectorId: CASE WHEN record.connectorName = 'KB' THEN null ELSE record.connectorId END,
-                   createdAt: COALESCE(record.sourceCreatedAtTimestamp, 0),
-                   updatedAt: COALESCE(record.sourceLastModifiedTimestamp, 0),
-                   recordType: record.recordType,
-                   sizeInBytes: COALESCE(record.sizeInBytes,
-                                        CASE WHEN file_info IS NOT NULL THEN file_info.sizeInBytes ELSE null END),
-                   indexingStatus: record.indexingStatus
-                 }
-               ELSE null END
-             ) AS record_nodes_with_nulls
-
-        WITH rg_nodes,
-             [n IN record_nodes_with_nulls WHERE n IS NOT NULL] AS record_nodes
-
-        // Combine RG and record nodes
-        WITH rg_nodes + record_nodes AS all_nodes
-
-        // Apply filters
-        WITH CASE WHEN size(all_nodes) > 0 THEN all_nodes ELSE [null] END AS all_nodes_safe
-        UNWIND all_nodes_safe AS node
-        WITH node
-        WHERE node IS NOT NULL AND ({filter_clause})
-
-        // Apply only_containers filter
-        WITH node
-        WHERE (toBoolean($only_containers) = false)
-           OR node.nodeType IN ['app', 'recordGroup', 'folder']
+        {node_construction}
 
         // Deduplicate by node.id
         WITH node.id AS node_id, collect(node)[0] AS node
@@ -15625,13 +15433,7 @@ class Neo4jProvider(IGraphDBProvider):
         RETURN collect(node.id) AS paginated_ids
         """
 
-        # Replace placeholders
-        query = query_template.replace("{scope_filter_rg}", scope_filter_rg)
-        query = query.replace("{scope_filter_record}", scope_filter_record)
-        query = query.replace("{children_intersection_cypher}", children_intersection_cypher)
-        query = query.replace("{filter_clause}", filter_clause)
-
-        return query
+        return query_template
 
     def _build_phase2_hydration_query(self) -> str:
         """
@@ -15647,9 +15449,9 @@ class Neo4jProvider(IGraphDBProvider):
         Safe to collect() here since we're only processing 50 nodes max.
         """
         return """
-        // Match paginated nodes by ID
+        // Match paginated nodes by ID with labels for index efficiency
         MATCH (matched_node)
-        WHERE matched_node.id IN $paginated_ids
+        WHERE (matched_node:Record OR matched_node:RecordGroup) AND matched_node.id IN $paginated_ids
 
         // Collect matched nodes for processing
         WITH collect(matched_node) AS matched_nodes
@@ -15661,25 +15463,21 @@ class Neo4jProvider(IGraphDBProvider):
         WITH matched_nodes,
              CASE WHEN size(rg_list) > 0 THEN rg_list ELSE [null] END AS rgs_with_fallback
 
-        UNWIND rgs_with_fallback AS rg_data
-        WITH matched_nodes, rg_data
-
-        // Re-match the actual RecordGroup node
-        OPTIONAL MATCH (rg:RecordGroup)
-        WHERE rg_data IS NOT NULL AND rg.id = rg_data.id
+        UNWIND rgs_with_fallback AS rg
+        WITH matched_nodes, rg
 
         // Compute sharingStatus for KB recordGroups only
         OPTIONAL MATCH (kb_user_perm:User)-[kb_up:PERMISSION {type: $user_permission_type}]->(rg)
-        WHERE rg.connectorName = 'KB'
+        WHERE rg IS NOT NULL AND rg.connectorName = 'KB'
 
         OPTIONAL MATCH ()-[kb_tp:PERMISSION {type: $team_permission_type}]->(rg)
-        WHERE rg.connectorName = 'KB'
+        WHERE rg IS NOT NULL AND rg.connectorName = 'KB'
 
-        WITH matched_nodes, rg_data, rg,
+        WITH matched_nodes, rg,
              collect(DISTINCT kb_up) AS kb_user_perms,
              collect(DISTINCT kb_tp) AS kb_team_perms
 
-        WITH matched_nodes, rg_data, rg,
+        WITH matched_nodes, rg,
              CASE
                  WHEN rg IS NOT NULL AND rg.connectorName = 'KB' THEN
                      CASE WHEN (size(kb_user_perms) > 1 OR size(kb_team_perms) > 0)
@@ -15732,14 +15530,11 @@ class Neo4jProvider(IGraphDBProvider):
         WITH matched_nodes, rg_nodes,
              CASE WHEN size(record_list) > 0 THEN record_list ELSE [null] END AS records_with_fallback
 
-        UNWIND records_with_fallback AS rec_data
-        WITH matched_nodes, rg_nodes, rec_data
-
-        // Re-match the actual Record node
-        OPTIONAL MATCH (record:Record)
-        WHERE rec_data IS NOT NULL AND record.id = rec_data.id
+        UNWIND records_with_fallback AS record
+        WITH matched_nodes, rg_nodes, record
 
         OPTIONAL MATCH (record)-[:IS_OF_TYPE]->(file_info:File)
+        WHERE record IS NOT NULL
         WITH matched_nodes, rg_nodes, record, file_info
 
         OPTIONAL MATCH (record)-[rr:RECORD_RELATION]->(child:Record)
