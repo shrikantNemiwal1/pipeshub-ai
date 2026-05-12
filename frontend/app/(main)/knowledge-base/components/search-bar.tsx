@@ -110,7 +110,7 @@ export function SearchBar({
           }}
         >
           <Text size="1" color="red">
-            Minimum 2 characters required for search
+            {t('kb.searchMinChars')}
           </Text>
         </Flex>
       )}
