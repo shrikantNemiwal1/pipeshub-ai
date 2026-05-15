@@ -31,7 +31,7 @@ class ConfluenceRESTClientViaUsernamePassword(HTTPClient):
 
     def __init__(self, base_url: str, username: str, password: str, token_type: str = "Basic") -> None:
         credentials = base64.b64encode(f"{username}:{password}".encode()).decode()
-        super().__init__(credentials, "Basic")
+        super().__init__(credentials, token_type)
         self.base_url = base_url
         self.username = username
 

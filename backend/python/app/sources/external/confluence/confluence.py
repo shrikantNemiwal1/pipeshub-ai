@@ -72,7 +72,6 @@ class ConfluenceDataSource:
             raise ValueError('HTTP client is not initialized')
         try:
             self.base_url = self._client.get_base_url().rstrip('/') # type: ignore [valid method]
-            print(f"Base URL: {self.base_url}")
         except AttributeError as exc:
             raise ValueError('HTTP client does not have get_base_url method') from exc
 
@@ -144,7 +143,7 @@ class ConfluenceDataSource:
     async def get_spaces_v1(
         self,
         keys: Optional[list[str]] = None,
-        type: Optional[str] = None,
+        space_type: Optional[str] = None,
         status: Optional[str] = None,
         limit: int = 100,
         expand: str = "permissions,history",
@@ -161,8 +160,8 @@ class ConfluenceDataSource:
         _query: Dict[str, Any] = {}
         if keys:
             _query["spaceKey"] = ",".join(keys)
-        if type is not None:
-            _query["type"] = type
+        if space_type is not None:
+            _query["type"] = space_type
         if status is not None:
             _query["status"] = status
         if limit is not None:
@@ -8220,7 +8219,7 @@ class ConfluenceDataSource:
             _query['limit'] = limit
 
         base = self._v1_rest_api_base()
-        url = f"{base}/group/{group_id}/membersByGroupId"
+        url = f"{base}/group/{quote(str(group_id), safe='')}/membersByGroupId"
 
         req = HTTPRequest(
             method='GET',
