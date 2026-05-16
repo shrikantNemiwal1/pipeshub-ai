@@ -803,9 +803,8 @@ export function FiltersSection() {
       const key = field.name;
       const existing = snapshotForm.filters.indexing[key];
       if (existing === undefined || existing === null) {
-        const ft = String(field.filterType ?? '').toLowerCase();
-        if (ft === 'datetime' && !field.defaultOperator?.trim()) continue;
-        if (ft === 'boolean' && typeof field.defaultValue !== 'boolean') continue;
+        if (field.filterType === 'datetime' && !field.defaultOperator?.trim()) continue;
+        if (field.filterType === 'boolean' && typeof field.defaultValue !== 'boolean') continue;
         const row = getRow(field, undefined);
         patchFilter('indexing', key, {
           operator: row.operator,
@@ -823,12 +822,11 @@ export function FiltersSection() {
       const key = field.name;
       const existing = snapshotForm.filters.sync[key];
       if (existing === undefined) {
-        const ft = String(field.filterType ?? '').toLowerCase();
-        if (ft === 'datetime' && !field.defaultOperator?.trim()) continue;
+        if (field.filterType === 'datetime' && !field.defaultOperator?.trim()) continue;
         // Boolean: skip unless backend explicitly provided a defaultValue (true or false).
         // booleanDefaultValue() silently falls back to false which makes isMeaningfulCommitted
         // return true even with no real default, causing the filter to appear auto-selected.
-        if (ft === 'boolean' && typeof field.defaultValue !== 'boolean') continue;
+        if (field.filterType === 'boolean' && typeof field.defaultValue !== 'boolean') continue;
         const row = getRow(field, undefined);
         patchFilter('sync', key, {
           operator: row.operator,
@@ -848,8 +846,7 @@ export function FiltersSection() {
     // behaviour via hasActiveFilterRow (operator presence is enough for those).
     const seedIndexingActive = (fields: FilterSchemaField[], vals: Record<string, unknown>) =>
       fields.filter((f) => {
-        const ft = String(f.filterType ?? '').toLowerCase();
-        if (ft === 'datetime') return isMeaningfulCommitted(f, vals[f.name]);
+        if (f.filterType === 'datetime') return isMeaningfulCommitted(f, vals[f.name]);
         return hasActiveFilterRow(vals[f.name]);
       }).map((f) => f.name);
 

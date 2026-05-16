@@ -89,7 +89,6 @@ export class MailController {
         bodyData.emailTemplateType!,
         bodyData.templateData!,
       );
-      this.logger.debug('emailContent', emailContent);
       const transporter = nodemailer.createTransport({
         host: smtpConfig.host,
         port: smtpConfig.port || 587,
