@@ -181,15 +181,12 @@ class TestSyncUsers:
     async def test_single_page_users(self):
         connector = _make_connector()
         ds = MagicMock()
-        ds.search_users = AsyncMock(return_value=_resp(200, {
+        ds.get_user_list_v1 = AsyncMock(return_value=_resp(200, {
             "results": [
-                {"user": {"accountId": "u1", "displayName": "User1"}, "email": "u1@x.com"},
+                {"userKey": "u1", "displayName": "User1", "email": "u1@x.com"},
             ],
         }))
         connector._get_fresh_datasource = AsyncMock(return_value=ds)
-        connector._transform_to_app_user = MagicMock(return_value=MagicMock(
-            email="u1@x.com", source_user_id="u1"
-        ))
 
         await connector._sync_users()
         connector.data_entities_processor.on_new_app_users.assert_awaited_once()
@@ -200,23 +197,23 @@ class TestSyncUsers:
 
         call_count = 0
 
-        async def mock_search(**kw):
+        async def mock_user_list(**kw):
             nonlocal call_count
             call_count += 1
             if call_count == 1:
                 return _resp(200, {
-                    "results": [{"user": {"accountId": f"u{i}"}, "email": f"u{i}@x.com"} for i in range(100)],
+                    "results": [
+                        {"userKey": f"u{i}", "displayName": f"U{i}", "email": f"u{i}@x.com"}
+                        for i in range(200)
+                    ],
                 })
             return _resp(200, {
-                "results": [{"user": {"accountId": "u100"}, "email": "u100@x.com"}],
+                "results": [{"userKey": "u200", "displayName": "U200", "email": "u200@x.com"}],
             })
 
         ds = MagicMock()
-        ds.search_users = AsyncMock(side_effect=mock_search)
+        ds.get_user_list_v1 = AsyncMock(side_effect=mock_user_list)
         connector._get_fresh_datasource = AsyncMock(return_value=ds)
-        connector._transform_to_app_user = MagicMock(return_value=MagicMock(
-            email="u@x.com", source_user_id="u1"
-        ))
 
         await connector._sync_users()
         assert call_count == 2
@@ -225,16 +222,13 @@ class TestSyncUsers:
     async def test_skips_users_without_email(self):
         connector = _make_connector()
         ds = MagicMock()
-        ds.search_users = AsyncMock(return_value=_resp(200, {
+        ds.get_user_list_v1 = AsyncMock(return_value=_resp(200, {
             "results": [
-                {"user": {"accountId": "u1", "displayName": "NoEmail"}, "email": ""},
-                {"user": {"accountId": "u2", "displayName": "HasEmail"}, "email": "u2@x.com"},
+                {"userKey": "u1", "displayName": "NoEmail", "email": ""},
+                {"userKey": "u2", "displayName": "HasEmail", "email": "u2@x.com"},
             ],
         }))
         connector._get_fresh_datasource = AsyncMock(return_value=ds)
-        connector._transform_to_app_user = MagicMock(return_value=MagicMock(
-            email="u2@x.com", source_user_id="u2"
-        ))
 
         await connector._sync_users()
         # Only one user should be passed
@@ -245,7 +239,7 @@ class TestSyncUsers:
     async def test_api_failure_breaks_loop(self):
         connector = _make_connector()
         ds = MagicMock()
-        ds.search_users = AsyncMock(return_value=_resp(500, {}))
+        ds.get_user_list_v1 = AsyncMock(return_value=_resp(500, {}))
         connector._get_fresh_datasource = AsyncMock(return_value=ds)
 
         # Should not raise but break the loop
