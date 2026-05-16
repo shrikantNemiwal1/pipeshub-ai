@@ -526,7 +526,7 @@ class TestFetchGroupMembers:
     async def test_success(self):
         c = _c()
         mock_ds = MagicMock()
-        mock_ds.get_group_members = AsyncMock(return_value=_resp(200, {
+        mock_ds.get_group_members_by_name = AsyncMock(return_value=_resp(200, {
             "results": [{"email": "u@t.com", "displayName": "U"}], "size": 1,
         }))
         c._get_fresh_datasource = AsyncMock(return_value=mock_ds)
@@ -537,7 +537,7 @@ class TestFetchGroupMembers:
     async def test_api_failure(self):
         c = _c()
         mock_ds = MagicMock()
-        mock_ds.get_group_members = AsyncMock(return_value=_resp(500, {}))
+        mock_ds.get_group_members_by_name = AsyncMock(return_value=_resp(500, {}))
         c._get_fresh_datasource = AsyncMock(return_value=mock_ds)
         assert await c._fetch_group_members("g1", "devs") == []
 
@@ -545,7 +545,7 @@ class TestFetchGroupMembers:
     async def test_skips_no_email(self):
         c = _c()
         mock_ds = MagicMock()
-        mock_ds.get_group_members = AsyncMock(return_value=_resp(200, {
+        mock_ds.get_group_members_by_name = AsyncMock(return_value=_resp(200, {
             "results": [{"email": "", "displayName": "NoEmail"}], "size": 1,
         }))
         c._get_fresh_datasource = AsyncMock(return_value=mock_ds)

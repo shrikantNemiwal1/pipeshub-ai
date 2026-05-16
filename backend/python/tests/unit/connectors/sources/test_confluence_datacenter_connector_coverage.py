@@ -930,7 +930,7 @@ class TestFetchGroupMembers:
     async def test_success(self):
         c = _conn()
         mock_ds = MagicMock()
-        mock_ds.get_group_members = AsyncMock(return_value=_resp(200, {
+        mock_ds.get_group_members_by_name = AsyncMock(return_value=_resp(200, {
             "results": [
                 {"email": "a@t.com", "displayName": "A"},
                 {"email": "", "displayName": "NoEmail"},
@@ -945,7 +945,7 @@ class TestFetchGroupMembers:
     async def test_api_failure(self):
         c = _conn()
         mock_ds = MagicMock()
-        mock_ds.get_group_members = AsyncMock(return_value=_resp(500))
+        mock_ds.get_group_members_by_name = AsyncMock(return_value=_resp(500))
         c._get_fresh_datasource = AsyncMock(return_value=mock_ds)
         emails = await c._fetch_group_members("g1", "G")
         assert emails == []
@@ -1770,7 +1770,7 @@ class TestSyncUsers:
     async def test_no_response(self):
         c = _conn()
         ds = MagicMock()
-        ds.search_users = AsyncMock(return_value=None)
+        ds.get_user_list_v1 = AsyncMock(return_value=None)
         c._get_fresh_datasource = AsyncMock(return_value=ds)
         await c._sync_users()
 
@@ -1778,7 +1778,7 @@ class TestSyncUsers:
     async def test_error_response(self):
         c = _conn()
         ds = MagicMock()
-        ds.search_users = AsyncMock(return_value=_resp(500))
+        ds.get_user_list_v1 = AsyncMock(return_value=_resp(500))
         c._get_fresh_datasource = AsyncMock(return_value=ds)
         await c._sync_users()
 
@@ -1786,7 +1786,7 @@ class TestSyncUsers:
     async def test_empty_results(self):
         c = _conn()
         ds = MagicMock()
-        ds.search_users = AsyncMock(return_value=_resp(200, {"results": []}))
+        ds.get_user_list_v1 = AsyncMock(return_value=_resp(200, {"results": []}))
         c._get_fresh_datasource = AsyncMock(return_value=ds)
         await c._sync_users()
 
