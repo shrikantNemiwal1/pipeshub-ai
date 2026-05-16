@@ -1,5 +1,9 @@
 """Unit tests for Confluence Data Center v1 migration helpers (no live API)."""
 
+import pytest
+
+pytestmark = pytest.mark.confluence_datacenter
+
 from app.connectors.sources.atlassian.confluence_datacenter.connector import (
     ConfluenceDataCenterConnector,
 )
