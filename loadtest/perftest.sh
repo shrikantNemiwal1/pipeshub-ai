@@ -100,9 +100,15 @@ else
 fi
 [ ${#QUERIES[@]} -gt 0 ] || { say "ABORT: $QUERY_FILE contains no queries."; exit 1; }
 mapfile -t BODIES < <(printf '%s\n' "${QUERIES[@]}" | "$PYTHON" -c '
-import json, sys
+import json, os, sys
+# The reasoning effort changes how much work a turn is, so an A/B across arms
+# has to pin it — leaving it unset lets the service default drift between runs.
+effort = os.environ.get("PIPESHUB_REASONING_EFFORT") or None
 for line in sys.stdin.read().splitlines():
-    print(json.dumps({"query": line, "chatMode": "internal_search"}))
+    body = {"query": line, "chatMode": "internal_search"}
+    if effort:
+        body["reasoningEffort"] = effort
+    print(json.dumps(body))
 ')
 
 say "== $LABEL: $USERS users, ${SECS}s, ${#QUERIES[@]} quer$([ ${#QUERIES[@]} -eq 1 ] && echo y || echo ies), host $HOST, mode $PIPESHUB_MODE"
