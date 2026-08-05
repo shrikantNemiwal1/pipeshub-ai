@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import hashlib
 import logging
 import re
 from collections import defaultdict
@@ -1478,7 +1479,18 @@ async def get_flattened_results(result_set: List[Dict[str, Any]], blob_store: Bl
     except Exception as e:
         logger.warning(f"Failed to fetch frontend URL from config service: {str(e)}")
 
-    await asyncio.gather(*[get_record(virtual_record_id,virtual_record_id_to_result,blob_store,org_id,virtual_to_record_map,graph_provider,frontend_url) for virtual_record_id in records_to_fetch])
+    # One mapping query for the whole batch instead of one (plus a fallback) per
+    # record; each get_record then goes straight to the download.
+    batched_lookups: dict[str, Any] = {}
+    if records_to_fetch:
+        try:
+            batched_lookups = await blob_store.get_document_ids_by_virtual_record_ids(
+                list(records_to_fetch)
+            )
+        except Exception as e:
+            logger.warning("Batch virtual-record lookup failed, resolving per record: %s", str(e))
+
+    await asyncio.gather(*[get_record(virtual_record_id,virtual_record_id_to_result,blob_store,org_id,virtual_to_record_map,graph_provider,frontend_url,batched_lookups.get(virtual_record_id)) for virtual_record_id in records_to_fetch])
     # Prefetch reconciliation metadata in parallel (records were fully fetched above).
     vrids_needing_recon: set = set[Any]()
 
@@ -2144,9 +2156,9 @@ def extract_bounding_boxes(citation_metadata) -> list[dict[str, float]]:
         except Exception as e:
             raise e
 
-async def get_record(virtual_record_id: str,virtual_record_id_to_result: dict[str, dict[str, Any]],blob_store: BlobStorage,org_id: str,virtual_to_record_map: dict[str, dict[str, Any]]=None,graph_provider: IGraphDBProvider | None = None,frontend_url: str | None = None) -> None:
+async def get_record(virtual_record_id: str,virtual_record_id_to_result: dict[str, dict[str, Any]],blob_store: BlobStorage,org_id: str,virtual_to_record_map: dict[str, dict[str, Any]]=None,graph_provider: IGraphDBProvider | None = None,frontend_url: str | None = None,lookup_result: dict[str, Any] | None = None) -> None:
     try:
-        record = await blob_store.get_record_from_storage(virtual_record_id=virtual_record_id, org_id=org_id)
+        record = await blob_store.get_record_from_storage(virtual_record_id=virtual_record_id, org_id=org_id, lookup_result=lookup_result)
         if record:
             graphDb_record = (virtual_to_record_map or {}).get(virtual_record_id)
             if graphDb_record:
@@ -3537,11 +3549,13 @@ def count_tokens(messages: list[Any], message_contents: list[list[dict[str, Any]
 
 FRAGMENT_WORD_COUNT = 4
 
+_FRAGMENT_WORD_PATTERN = re.compile(r"(?:(?<= )|^)[A-Za-z]+(?: [A-Za-z]+)+(?![A-Za-z'-])")
+
 def extract_start_end_text(snippet: str | None) -> tuple[str, str]:
     if not snippet:
         return "", ""
-        
-    PATTERN = re.compile(r"(?:(?<= )|^)[A-Za-z]+(?: [A-Za-z]+)+(?![A-Za-z'-])")
+
+    PATTERN = _FRAGMENT_WORD_PATTERN
 
     # --- Find start_text: first match with at least FRAGMENT_WORD_COUNT words, else longest ---
     all_matches = list(PATTERN.finditer(snippet))
@@ -3588,7 +3602,36 @@ def extract_start_end_text(snippet: str | None) -> tuple[str, str]:
 
     return start_text, end_text.strip()
 
+_FRAGMENT_URL_CACHE: dict[tuple[str, bytes], str] = {}
+_FRAGMENT_URL_CACHE_MAXSIZE = 8192
+
+
 def generate_text_fragment_url(base_url: str, text_snippet: str) -> str:
+    """Memoized wrapper over `_build_text_fragment_url`.
+
+    The live citation overlay re-derives every citation's URL on each refresh,
+    so the same (base_url, snippet) pair is re-scanned many times per turn.
+    Snippets are keyed by digest rather than by value so the cache cannot pin
+    whole record blocks in memory. Cleared wholesale when full: eviction
+    bookkeeping would cost more than the recompute it saves, and the working
+    set for a turn is far below the bound.
+    """
+    if not isinstance(base_url, str) or not isinstance(text_snippet, str):
+        return _build_text_fragment_url(base_url, text_snippet)
+
+    key = (base_url, hashlib.sha1(text_snippet.encode("utf-8", "surrogatepass")).digest())
+    cached = _FRAGMENT_URL_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    result = _build_text_fragment_url(base_url, text_snippet)
+    if len(_FRAGMENT_URL_CACHE) >= _FRAGMENT_URL_CACHE_MAXSIZE:
+        _FRAGMENT_URL_CACHE.clear()
+    _FRAGMENT_URL_CACHE[key] = result
+    return result
+
+
+def _build_text_fragment_url(base_url: str, text_snippet: str) -> str:
     """
     Generate a URL with text fragment for direct navigation to specific text.
 

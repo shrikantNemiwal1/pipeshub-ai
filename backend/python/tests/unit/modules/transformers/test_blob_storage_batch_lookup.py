@@ -1,0 +1,175 @@
+"""Batched virtual-record → document mapping resolution.
+
+The batch must be indistinguishable from calling the per-id path once per id,
+including its by-key fallback for rows that carry no ``virtualRecordId``.
+"""
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from app.config.constants.arangodb import CollectionNames
+from app.modules.transformers.blob_storage import BlobStorage
+
+COLLECTION = CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value
+
+
+def _make_blob_storage(graph_provider=None) -> BlobStorage:
+    return BlobStorage(
+        logger=MagicMock(),
+        config_service=MagicMock(),
+        graph_provider=graph_provider if graph_provider is not None else MagicMock(),
+    )
+
+
+def _node(vrid: str, doc_id: str, size: int = 100, metadata_id: str | None = None) -> dict:
+    node = {"virtualRecordId": vrid, "record_doc_id": doc_id, "fileSizeBytes": size}
+    if metadata_id:
+        node["record_metadata_doc_id"] = metadata_id
+    return node
+
+
+class TestBatchLookup:
+    @pytest.mark.asyncio
+    async def test_resolves_all_ids_in_one_query(self) -> None:
+        graph = MagicMock()
+        graph.get_nodes_by_field_in = AsyncMock(
+            return_value=[_node("vr-1", "doc-1"), _node("vr-2", "doc-2", 200)]
+        )
+        graph.get_document = AsyncMock()
+        blob = _make_blob_storage(graph)
+
+        out = await blob.get_document_ids_by_virtual_record_ids(["vr-1", "vr-2"])
+
+        assert out == {
+            "vr-1": {"record_doc_id": "doc-1", "fileSizeBytes": 100},
+            "vr-2": {"record_doc_id": "doc-2", "fileSizeBytes": 200},
+        }
+        graph.get_nodes_by_field_in.assert_awaited_once_with(COLLECTION, "virtualRecordId", ["vr-1", "vr-2"])
+        graph.get_document.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_shape_matches_the_per_id_path(self) -> None:
+        """Batch and single-id resolution must return identical dicts."""
+        node = _node("vr-1", "doc-1", 42, metadata_id="meta-1")
+
+        graph_batch = MagicMock()
+        graph_batch.get_nodes_by_field_in = AsyncMock(return_value=[node])
+        graph_batch.get_document = AsyncMock()
+
+        graph_single = MagicMock()
+        graph_single.get_nodes_by_filters = AsyncMock(return_value=[node])
+        graph_single.get_document = AsyncMock()
+
+        batched = await _make_blob_storage(graph_batch).get_document_ids_by_virtual_record_ids(["vr-1"])
+        single = await _make_blob_storage(graph_single).get_document_id_by_virtual_record_id("vr-1")
+
+        assert batched["vr-1"] == single
+        assert single["record_metadata_doc_id"] == "meta-1"
+
+    @pytest.mark.asyncio
+    async def test_documentid_alias_is_honoured(self) -> None:
+        graph = MagicMock()
+        graph.get_nodes_by_field_in = AsyncMock(
+            return_value=[{"virtualRecordId": "vr-1", "documentId": "legacy-doc", "fileSizeBytes": 7}]
+        )
+        graph.get_document = AsyncMock()
+
+        out = await _make_blob_storage(graph).get_document_ids_by_virtual_record_ids(["vr-1"])
+
+        assert out["vr-1"]["record_doc_id"] == "legacy-doc"
+
+    @pytest.mark.asyncio
+    async def test_ids_missing_from_batch_fall_back_per_id(self) -> None:
+        """Rows keyed by virtual record id carry no virtualRecordId field."""
+        graph = MagicMock()
+        graph.get_nodes_by_field_in = AsyncMock(return_value=[_node("vr-1", "doc-1")])
+        graph.get_document = AsyncMock(return_value={"record_doc_id": "doc-2", "fileSizeBytes": 55})
+
+        out = await _make_blob_storage(graph).get_document_ids_by_virtual_record_ids(["vr-1", "vr-2"])
+
+        assert out["vr-1"]["record_doc_id"] == "doc-1"
+        assert out["vr-2"]["record_doc_id"] == "doc-2"
+        graph.get_document.assert_awaited_once_with("vr-2", COLLECTION)
+
+    @pytest.mark.asyncio
+    async def test_unresolvable_ids_are_absent_not_empty(self) -> None:
+        graph = MagicMock()
+        graph.get_nodes_by_field_in = AsyncMock(return_value=[])
+        graph.get_document = AsyncMock(return_value=None)
+
+        out = await _make_blob_storage(graph).get_document_ids_by_virtual_record_ids(["vr-missing"])
+
+        assert out == {}, "callers must be able to tell 'no mapping' from 'not looked up'"
+
+    @pytest.mark.asyncio
+    async def test_batch_query_failure_degrades_to_per_id(self) -> None:
+        graph = MagicMock()
+        graph.get_nodes_by_field_in = AsyncMock(side_effect=RuntimeError("bolt down"))
+        graph.get_document = AsyncMock(return_value={"record_doc_id": "doc-1", "fileSizeBytes": 1})
+
+        out = await _make_blob_storage(graph).get_document_ids_by_virtual_record_ids(["vr-1"])
+
+        assert out["vr-1"]["record_doc_id"] == "doc-1"
+
+    @pytest.mark.asyncio
+    async def test_one_failed_fallback_does_not_sink_the_batch(self) -> None:
+        graph = MagicMock()
+        graph.get_nodes_by_field_in = AsyncMock(return_value=[])
+        graph.get_document = AsyncMock(
+            side_effect=[RuntimeError("boom"), {"record_doc_id": "doc-2", "fileSizeBytes": 2}]
+        )
+
+        out = await _make_blob_storage(graph).get_document_ids_by_virtual_record_ids(["vr-1", "vr-2"])
+
+        assert "vr-1" not in out
+        assert out["vr-2"]["record_doc_id"] == "doc-2"
+
+    @pytest.mark.asyncio
+    async def test_duplicates_and_blanks_are_collapsed(self) -> None:
+        graph = MagicMock()
+        graph.get_nodes_by_field_in = AsyncMock(return_value=[_node("vr-1", "doc-1")])
+        graph.get_document = AsyncMock()
+
+        out = await _make_blob_storage(graph).get_document_ids_by_virtual_record_ids(
+            ["vr-1", "vr-1", "", None]
+        )
+
+        assert out == {"vr-1": {"record_doc_id": "doc-1", "fileSizeBytes": 100}}
+        graph.get_nodes_by_field_in.assert_awaited_once_with(COLLECTION, "virtualRecordId", ["vr-1"])
+
+    @pytest.mark.asyncio
+    async def test_empty_input_makes_no_queries(self) -> None:
+        graph = MagicMock()
+        graph.get_nodes_by_field_in = AsyncMock()
+        graph.get_document = AsyncMock()
+
+        assert await _make_blob_storage(graph).get_document_ids_by_virtual_record_ids([]) == {}
+        graph.get_nodes_by_field_in.assert_not_called()
+        graph.get_document.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ids_are_chunked(self) -> None:
+        chunk = BlobStorage.VIRTUAL_RECORD_LOOKUP_CHUNK_SIZE
+        vrids = [f"vr-{i}" for i in range(chunk + 10)]
+
+        graph = MagicMock()
+        graph.get_nodes_by_field_in = AsyncMock(
+            side_effect=lambda _c, _f, values: [_node(v, f"doc-{v}") for v in values]
+        )
+        graph.get_document = AsyncMock()
+
+        out = await _make_blob_storage(graph).get_document_ids_by_virtual_record_ids(vrids)
+
+        assert len(out) == len(vrids)
+        assert graph.get_nodes_by_field_in.await_count == 2
+        assert len(graph.get_nodes_by_field_in.await_args_list[0].args[2]) == chunk
+        assert len(graph.get_nodes_by_field_in.await_args_list[1].args[2]) == 10
+        graph.get_document.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_missing_graph_provider_raises(self) -> None:
+        blob = _make_blob_storage(graph_provider=None)
+        blob.graph_provider = None
+        with pytest.raises(Exception, match="GraphProvider not initialized"):
+            await blob.get_document_ids_by_virtual_record_ids(["vr-1"])

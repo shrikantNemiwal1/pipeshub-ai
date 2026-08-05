@@ -43,6 +43,7 @@ from app.models.entities import (
     WebpageRecord,
 )
 from app.models.permission import EntityType, Permission, PermissionType
+from app.services.cache.invalidation_hooks import notify_kb_records_changed
 from app.services.messaging.messaging_factory import MessagingFactory
 from app.services.messaging.utils import MessagingUtils
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
@@ -1379,6 +1380,10 @@ class DataSourceEntitiesProcessor:
         async with self.data_store_provider.transaction() as tx_store:
             result = await tx_store.delete_records_recursive(record_ids, connector_id)
         await self._publish_delete_events((result or {}).get("eventData"))
+        if (result or {}).get("successfully_deleted"):
+            # No-ops unless connector_id is a KB; connectors invalidate on sync
+            # completion instead, so a mid-sync delete does not thrash the cache.
+            await notify_kb_records_changed(connector_id)
         return result
 
 

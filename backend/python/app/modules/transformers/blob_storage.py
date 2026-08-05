@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import time
 from typing import Any, Dict, TypedDict
 
@@ -19,6 +20,76 @@ from app.modules.transformers.transformer import TransformContext, Transformer
 from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 from app.utils.request_context import inject_request_headers
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
+
+COMPRESSION_THRESHOLD_BYTES_DEFAULT = 20 * 1024 * 1024
+DOWNLOAD_CONNECTION_LIMIT_DEFAULT = 100
+_COMPRESSION_THRESHOLD_ENV = "PIPESHUB_RECORD_COMPRESSION_THRESHOLD_BYTES"
+
+
+def compression_threshold_bytes() -> int:
+    """Records whose JSON form exceeds this are stored compressed; 0 compresses everything."""
+    raw = os.getenv(_COMPRESSION_THRESHOLD_ENV)
+    if raw is None:
+        return COMPRESSION_THRESHOLD_BYTES_DEFAULT
+    try:
+        return max(int(raw), 0)
+    except ValueError:
+        return COMPRESSION_THRESHOLD_BYTES_DEFAULT
+
+
+_shared_sessions: "dict[asyncio.AbstractEventLoop, aiohttp.ClientSession]" = {}
+
+
+def download_connection_limit() -> int:
+    """Max simultaneous connections to the storage API, 0 for unbounded."""
+    raw = os.getenv("PIPESHUB_STORAGE_CONNECTION_LIMIT", "").strip()
+    if raw:
+        try:
+            value = int(raw)
+        except ValueError:
+            pass
+        else:
+            if value >= 0:
+                return value
+    return DOWNLOAD_CONNECTION_LIMIT_DEFAULT
+
+
+def get_shared_session() -> aiohttp.ClientSession:
+    """Process-wide download session, one per running event loop.
+
+    ``BlobStorage`` is constructed ad hoc at ~20 call sites (per request, per
+    tool call), so a per-instance session would build and leak a connection
+    pool per request. Keyed by loop because a session binds to the loop that
+    created it.
+
+    The pool is bounded: record fetches fan out per concurrent turn, and an
+    unbounded pool opened ~1,400 simultaneous sockets to the Node API at 32
+    concurrent users, past its 511-deep listen backlog, so connections were
+    refused and record fetches failed. Queueing above the limit is strictly
+    better than a refused connection.
+    """
+    loop = asyncio.get_running_loop()
+    session = _shared_sessions.get(loop)
+    if session is not None and not session.closed:
+        return session
+
+    if len(_shared_sessions) > 1:
+        for stale_loop in [lp for lp in _shared_sessions if lp.is_closed()]:
+            _shared_sessions.pop(stale_loop, None)
+
+    session = aiohttp.ClientSession(
+        connector=aiohttp.TCPConnector(limit=download_connection_limit())
+    )
+    _shared_sessions[loop] = session
+    return session
+
+
+async def close_shared_session() -> None:
+    """Close the pooled session for the running loop; call from service shutdown."""
+    loop = asyncio.get_running_loop()
+    session = _shared_sessions.pop(loop, None)
+    if session is not None and not session.closed:
+        await session.close()
 
 
 class CustomMetadataEntry(TypedDict):
@@ -58,18 +129,23 @@ class BlobStorage(Transformer):
             "orgId": org_id,
             "scopes": [TokenScopes.STORAGE_TOKEN.value],
         }
+        # use_cache: these three reads are otherwise an etcd round trip each, on
+        # every record download (~100 per chat turn). The config cache is
+        # invalidated by the etcd watch and Pub/Sub, so reads stay current.
         secret_keys = await self.config_service.get_config(
-            config_node_constants.SECRET_KEYS.value
+            config_node_constants.SECRET_KEYS.value, use_cache=True
         )
         scoped_jwt_secret = secret_keys.get("scopedJwtSecret")
         if not scoped_jwt_secret:
             raise ValueError("Missing scoped JWT secret")
 
         jwt_token = jwt.encode(payload, scoped_jwt_secret, algorithm="HS256")
+        # Headers are rebuilt per call, never cached: inject_request_headers
+        # stamps the caller's request id from a ContextVar.
         headers = inject_request_headers({"Authorization": f"Bearer {jwt_token}"})
 
         endpoints = await self.config_service.get_config(
-            config_node_constants.ENDPOINTS.value
+            config_node_constants.ENDPOINTS.value, use_cache=True
         )
         nodejs_endpoint = endpoints.get("cm", {}).get(
             "endpoint", DefaultEndpoints.NODEJS_ENDPOINT.value
@@ -78,7 +154,7 @@ class BlobStorage(Transformer):
             raise ValueError("Missing CM endpoint configuration")
 
         storage = await self.config_service.get_config(
-            config_node_constants.STORAGE.value
+            config_node_constants.STORAGE.value, use_cache=True
         )
         storage_type = storage.get("storageType")
         if not storage_type:
@@ -108,6 +184,34 @@ class BlobStorage(Transformer):
             or endpoints.get("storage", {}).get("endpoint")
             or DefaultEndpoints.FRONTEND_ENDPOINT.value
         )
+
+    def _maybe_compress_record(self, record: dict, *, label: str = "record") -> tuple[str | None, bool]:
+        """Decide whether a record is worth compressing, and compress it if so.
+
+        Returns ``(compressed_base64_or_None, is_compressed)``.
+
+        Compression is not free on the read side: the blob is base64'd into a
+        JSON envelope, so every reader parses megabytes of base64 before it can
+        even start the zstd+msgpack decode. Below the threshold that costs more
+        than the bytes it saves, so small records are stored as plain JSON —
+        a shape ``_process_downloaded_record`` already accepts.
+        """
+        try:
+            serialized_size = len(json.dumps(record).encode("utf-8"))
+        except (TypeError, ValueError) as e:
+            # Not JSON-serializable, so the uncompressed envelope would fail to
+            # build. msgpack accepts more types — compress regardless of size.
+            self.logger.debug("%s is not JSON-serializable (%s); compressing", label, str(e))
+            serialized_size = None
+
+        if serialized_size is not None and serialized_size <= compression_threshold_bytes():
+            return None, False
+
+        try:
+            return self._compress_record(record), True
+        except Exception as e:
+            self.logger.warning("⚠️ Compression failed, uploading uncompressed: %s", str(e))
+            return None, False
 
     def _compress_record(self, record: dict) -> str:
         """
@@ -630,14 +734,7 @@ class BlobStorage(Transformer):
         try:
             headers, nodejs_endpoint, storage_type = await self._get_auth_and_config(org_id)
 
-            # Compress record for both local and S3 storage
-            try:
-                compressed_record = self._compress_record(record)
-                use_compression = True
-            except Exception as e:
-                self.logger.warning("⚠️ Compression failed, uploading uncompressed: %s", str(e))
-                compressed_record = None
-                use_compression = False
+            compressed_record, use_compression = self._maybe_compress_record(record)
 
             if storage_type == "local":
                 try:
@@ -892,17 +989,7 @@ class BlobStorage(Transformer):
                     nodes = [doc]
 
             if nodes:
-                doc = nodes[0]
-                record_doc_id = doc.get("record_doc_id") or doc.get("documentId")
-                file_size_bytes = doc.get("fileSizeBytes")
-                record_metadata_doc_id = doc.get("record_metadata_doc_id")
-                result = {
-                    "record_doc_id": record_doc_id,
-                    "fileSizeBytes": file_size_bytes,
-                }
-                if record_metadata_doc_id:
-                    result["record_metadata_doc_id"] = record_metadata_doc_id
-                return result
+                return self._shape_document_lookup(nodes[0])
             else:
                 self.logger.info("No document ID found for virtual record ID: %s", virtual_record_id)
                 return None
@@ -913,100 +1000,187 @@ class BlobStorage(Transformer):
             )
             raise e
 
-    async def get_record_from_storage(self, virtual_record_id: str, org_id: str) -> dict | None:
-            """
-            Retrieve a record's content from blob storage using the virtual_record_id.
-            Returns:
-                str: The content of the record if found, else an empty string.
-            """
-            try:
-                headers, nodejs_endpoint, _ = await self._get_auth_and_config(org_id)
+    @staticmethod
+    def _shape_document_lookup(doc: dict) -> dict:
+        """Project a virtual-record mapping node onto the lookup result shape."""
+        result = {
+            "record_doc_id": doc.get("record_doc_id") or doc.get("documentId"),
+            "fileSizeBytes": doc.get("fileSizeBytes"),
+        }
+        record_metadata_doc_id = doc.get("record_metadata_doc_id")
+        if record_metadata_doc_id:
+            result["record_metadata_doc_id"] = record_metadata_doc_id
+        return result
 
+    VIRTUAL_RECORD_LOOKUP_CHUNK_SIZE = 500
+
+    async def get_document_ids_by_virtual_record_ids(
+        self, virtual_record_ids: list[str]
+    ) -> dict[str, dict]:
+        """Resolve many virtual-record → document mappings with one query per chunk.
+
+        Answering a chat turn fetches ~100 records, each of which otherwise costs
+        its own mapping query. Ids the batch query does not return fall back to
+        the per-id path, which also covers legacy rows keyed by virtual record id
+        with no ``virtualRecordId`` field. Ids with no mapping at all are absent
+        from the result rather than present-and-empty, so callers can tell the
+        difference between "not found" and "not looked up".
+        """
+        if not self.graph_provider:
+            self.logger.error("❌ GraphProvider not initialized, cannot resolve virtual record IDs.")
+            raise Exception("GraphProvider not initialized, cannot resolve virtual record IDs.")
+
+        unique_ids = list(dict.fromkeys(vrid for vrid in virtual_record_ids if vrid))
+        if not unique_ids:
+            return {}
+
+        collection_name = CollectionNames.VIRTUAL_RECORD_TO_DOC_ID_MAPPING.value
+        resolved: dict[str, dict] = {}
+
+        chunk_size = self.VIRTUAL_RECORD_LOOKUP_CHUNK_SIZE
+        for start in range(0, len(unique_ids), chunk_size):
+            chunk = unique_ids[start:start + chunk_size]
+            try:
+                nodes = await self.graph_provider.get_nodes_by_field_in(
+                    collection_name, "virtualRecordId", chunk
+                )
+            except Exception as e:
+                # Degrade to the per-id path for this chunk rather than failing the turn.
+                self.logger.warning("Batch virtual-record lookup failed, falling back: %s", str(e))
+                nodes = []
+
+            for node in nodes or []:
+                vrid = node.get("virtualRecordId")
+                if vrid and vrid not in resolved:
+                    resolved[vrid] = self._shape_document_lookup(node)
+
+        missing = [vrid for vrid in unique_ids if vrid not in resolved]
+        if missing:
+            fallbacks = await asyncio.gather(
+                *[
+                    self.graph_provider.get_document(vrid, collection_name)
+                    for vrid in missing
+                ],
+                return_exceptions=True,
+            )
+            for vrid, doc in zip(missing, fallbacks):
+                if isinstance(doc, Exception):
+                    self.logger.warning(
+                        "Virtual-record mapping fallback failed for %s: %s", vrid, str(doc)
+                    )
+                    continue
+                if doc:
+                    resolved[vrid] = self._shape_document_lookup(doc)
+
+        return resolved
+
+    async def get_record_from_storage(
+        self,
+        virtual_record_id: str,
+        org_id: str,
+        lookup_result: dict | None = None,
+    ) -> dict | None:
+        """
+        Retrieve a record's content from blob storage using the virtual_record_id.
+
+        Args:
+            lookup_result: pre-resolved virtual-record → document mapping. Callers
+                fetching many records resolve the whole batch in one graph query
+                (see ``get_document_ids_by_virtual_record_ids``) and pass the entry
+                in, which skips the per-record lookup below.
+
+        Returns:
+            str: The content of the record if found, else an empty string.
+        """
+        try:
+            headers, nodejs_endpoint, _ = await self._get_auth_and_config(org_id)
+
+            if lookup_result is None:
                 lookup_result = await self.get_document_id_by_virtual_record_id(virtual_record_id)
 
-                if not lookup_result:
-                    self.logger.info("No document ID found for virtual record ID: %s", virtual_record_id)
-                    return None
+            if not lookup_result:
+                self.logger.info("No document ID found for virtual record ID: %s", virtual_record_id)
+                return None
 
-                document_id = lookup_result.get("record_doc_id")
-                file_size_bytes = lookup_result.get("fileSizeBytes")
+            document_id = lookup_result.get("record_doc_id")
+            file_size_bytes = lookup_result.get("fileSizeBytes")
 
-                if not document_id:
-                    self.logger.debug("No document ID found for virtual record ID: %s", virtual_record_id)
-                    return None
+            if not document_id:
+                self.logger.debug("No document ID found for virtual record ID: %s", virtual_record_id)
+                return None
 
-                download_url = f"{nodejs_endpoint}{Routes.STORAGE_DOWNLOAD.value.format(documentId=document_id)}"
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(download_url, headers=headers) as resp:
-                        if resp.status == HttpStatusCode.SUCCESS.value:
-                            data = await resp.json()
+            download_url = f"{nodejs_endpoint}{Routes.STORAGE_DOWNLOAD.value.format(documentId=document_id)}"
+            session = get_shared_session()
+            async with session.get(download_url, headers=headers) as resp:
+                if resp.status == HttpStatusCode.SUCCESS.value:
+                    data = await resp.json()
 
-                            if data.get("record"):
-                                record = self._process_downloaded_record(data)
-                                record_name = record.get("record_name")
-                                self.logger.debug("✅ Successfully retrieved record %s from storage for virtual_record_id: %s", record_name, virtual_record_id)
-                                return record
-                            elif data.get("signedUrl"):
-                                signed_url = data.get("signedUrl")
+                    if data.get("record"):
+                        record = self._process_downloaded_record(data)
+                        record_name = record.get("record_name")
+                        self.logger.debug("✅ Successfully retrieved record %s from storage for virtual_record_id: %s", record_name, virtual_record_id)
+                        return record
+                    elif data.get("signedUrl"):
+                        signed_url = data.get("signedUrl")
 
-                                # Determine download strategy based on stored size
-                                if file_size_bytes is None:
-                                    use_parallel = True
-                                else:
-                                    MIN_SIZE_FOR_PARALLEL = 3 * 1024 * 1024
-                                    use_parallel = file_size_bytes >= MIN_SIZE_FOR_PARALLEL
-
-                                try:
-                                    if use_parallel:
-                                        file_bytes = await self._download_with_range_requests(
-                                            session,
-                                            signed_url,
-                                            chunk_size_mb=2,
-                                            max_connections=6
-                                        )
-                                        data = json.loads(file_bytes.decode('utf-8'))
-                                    else:
-                                        async with session.get(URL(signed_url, encoded=True)) as res:
-                                            if res.status == HttpStatusCode.SUCCESS.value:
-                                                data = await res.json(content_type=None)
-                                            else:
-                                                raise Exception(f"Failed to retrieve record: status {res.status}")
-                                except Exception as e:
-                                    if use_parallel:
-                                        self.logger.warning("⚠️ Parallel download failed: %s. Falling back to single download...", str(e))
-                                        try:
-                                            async with session.get(URL(signed_url, encoded=True)) as res:
-                                                if res.status == HttpStatusCode.SUCCESS.value:
-                                                    data = await res.json(content_type=None)
-                                                else:
-                                                    raise Exception(f"Fallback download failed with status {res.status}")
-                                        except Exception as fallback_error:
-                                            self.logger.error("❌ Fallback download also failed: %s", str(fallback_error))
-                                            raise Exception(f"Both parallel and fallback downloads failed: {str(e)}") from fallback_error
-                                    else:
-                                        self.logger.error("❌ Failed to retrieve record: %s", str(e))
-                                        raise
-
-                                if data.get("record"):
-                                    record = self._process_downloaded_record(data)
-                                    record_name = record.get("record_name")
-                                    self.logger.debug("✅ Successfully retrieved record %s from storage for virtual_record_id: %s", record_name, virtual_record_id)
-                                    return record
-                                else:
-                                    self.logger.error("❌ No record found for virtual_record_id: %s", virtual_record_id)
-                                    raise Exception("No record found for virtual_record_id")
-                            else:
-                                self.logger.error("❌ No record found for virtual_record_id: %s", virtual_record_id)
-                                raise Exception("No record found for virtual_record_id")
+                        # Determine download strategy based on stored size
+                        if file_size_bytes is None:
+                            use_parallel = True
                         else:
-                            self.logger.error("❌ Failed to retrieve record: status %s, virtual_record_id: %s", resp.status, virtual_record_id)
-                            raise Exception("Failed to retrieve record from storage")
-            except Exception as e:
-                self.logger.exception(
-                    "❌ Error retrieving record from storage (virtual_record_id=%s)",
-                    virtual_record_id,
-                )
-                raise e
+                            MIN_SIZE_FOR_PARALLEL = 3 * 1024 * 1024
+                            use_parallel = file_size_bytes >= MIN_SIZE_FOR_PARALLEL
+
+                        try:
+                            if use_parallel:
+                                file_bytes = await self._download_with_range_requests(
+                                    session,
+                                    signed_url,
+                                    chunk_size_mb=2,
+                                    max_connections=6
+                                )
+                                data = json.loads(file_bytes.decode('utf-8'))
+                            else:
+                                async with session.get(URL(signed_url, encoded=True)) as res:
+                                    if res.status == HttpStatusCode.SUCCESS.value:
+                                        data = await res.json(content_type=None)
+                                    else:
+                                        raise Exception(f"Failed to retrieve record: status {res.status}")
+                        except Exception as e:
+                            if use_parallel:
+                                self.logger.warning("⚠️ Parallel download failed: %s. Falling back to single download...", str(e))
+                                try:
+                                    async with session.get(URL(signed_url, encoded=True)) as res:
+                                        if res.status == HttpStatusCode.SUCCESS.value:
+                                            data = await res.json(content_type=None)
+                                        else:
+                                            raise Exception(f"Fallback download failed with status {res.status}")
+                                except Exception as fallback_error:
+                                    self.logger.error("❌ Fallback download also failed: %s", str(fallback_error))
+                                    raise Exception(f"Both parallel and fallback downloads failed: {str(e)}") from fallback_error
+                            else:
+                                self.logger.error("❌ Failed to retrieve record: %s", str(e))
+                                raise
+
+                        if data.get("record"):
+                            record = self._process_downloaded_record(data)
+                            record_name = record.get("record_name")
+                            self.logger.debug("✅ Successfully retrieved record %s from storage for virtual_record_id: %s", record_name, virtual_record_id)
+                            return record
+                        else:
+                            self.logger.error("❌ No record found for virtual_record_id: %s", virtual_record_id)
+                            raise Exception("No record found for virtual_record_id")
+                    else:
+                        self.logger.error("❌ No record found for virtual_record_id: %s", virtual_record_id)
+                        raise Exception("No record found for virtual_record_id")
+                else:
+                    self.logger.error("❌ Failed to retrieve record: status %s, virtual_record_id: %s", resp.status, virtual_record_id)
+                    raise Exception("Failed to retrieve record from storage")
+        except Exception as e:
+            self.logger.exception(
+                "❌ Error retrieving record from storage (virtual_record_id=%s)",
+                virtual_record_id,
+            )
+            raise e
 
     async def store_virtual_record_mapping(self, virtual_record_id: str, document_id: str, file_size_bytes: int | None = None) -> bool:
         """
@@ -1077,14 +1251,7 @@ class BlobStorage(Transformer):
         try:
             headers, nodejs_endpoint, storage_type = await self._get_auth_and_config(org_id)
 
-            # Compress record for upload
-            try:
-                compressed_record = self._compress_record(record)
-                use_compression = True
-            except Exception as e:
-                self.logger.warning("⚠️ Compression failed, uploading uncompressed: %s", str(e))
-                compressed_record = None
-                use_compression = False
+            compressed_record, use_compression = self._maybe_compress_record(record)
 
             upload_data = {
                 "isCompressed": use_compression,
@@ -1231,13 +1398,9 @@ class BlobStorage(Transformer):
         try:
             headers, nodejs_endpoint, storage_type = await self._get_auth_and_config(org_id)
 
-            try:
-                compressed_metadata = self._compress_record(metadata_dict)
-                use_compression = True
-            except Exception as e:
-                self.logger.warning("⚠️ Metadata compression failed, uploading uncompressed: %s", str(e))
-                compressed_metadata = None
-                use_compression = False
+            compressed_metadata, use_compression = self._maybe_compress_record(
+                metadata_dict, label="metadata"
+            )
 
             upload_data = {
                 "isCompressed": use_compression,
@@ -1800,33 +1963,33 @@ class BlobStorage(Transformer):
 
             download_url = f"{nodejs_endpoint}{Routes.STORAGE_DOWNLOAD.value.format(documentId=metadata_document_id)}"
 
-            async with aiohttp.ClientSession() as session:
-                async with session.get(download_url, headers=headers) as resp:
-                    if resp.status == HttpStatusCode.SUCCESS.value:
-                        data = await resp.json()
-                        if data.get("signedUrl"):
-                            signed_url = data.get("signedUrl")
-                            async with session.get(URL(signed_url, encoded=True)) as signed_resp:
-                                if signed_resp.status == HttpStatusCode.SUCCESS.value:
-                                    data = await signed_resp.json(content_type=None)
-                        # Handle both compressed (from upload_next_version) and uncompressed formats
-                        if data.get("isCompressed"):
-                            record = self._process_downloaded_record(data)
-                        elif isinstance(data, dict) and "record" in data:
-                            record = data.get("record", data)
-                        else:
-                            record = data
-                        self.logger.debug(
-                            "✅ Retrieved reconciliation metadata for virtual_record_id: %s",
-                            virtual_record_id
-                        )
-                        return record
+            session = get_shared_session()
+            async with session.get(download_url, headers=headers) as resp:
+                if resp.status == HttpStatusCode.SUCCESS.value:
+                    data = await resp.json()
+                    if data.get("signedUrl"):
+                        signed_url = data.get("signedUrl")
+                        async with session.get(URL(signed_url, encoded=True)) as signed_resp:
+                            if signed_resp.status == HttpStatusCode.SUCCESS.value:
+                                data = await signed_resp.json(content_type=None)
+                    # Handle both compressed (from upload_next_version) and uncompressed formats
+                    if data.get("isCompressed"):
+                        record = self._process_downloaded_record(data)
+                    elif isinstance(data, dict) and "record" in data:
+                        record = data.get("record", data)
                     else:
-                        self.logger.warning(
-                            "⚠️ Failed to retrieve metadata: status %s, virtual_record_id: %s",
-                            resp.status, virtual_record_id
-                        )
-                        return None
+                        record = data
+                    self.logger.debug(
+                        "✅ Retrieved reconciliation metadata for virtual_record_id: %s",
+                        virtual_record_id
+                    )
+                    return record
+                else:
+                    self.logger.warning(
+                        "⚠️ Failed to retrieve metadata: status %s, virtual_record_id: %s",
+                        resp.status, virtual_record_id
+                    )
+                    return None
 
         except Exception as e:
             self.logger.error("❌ Error retrieving reconciliation metadata: %s", str(e))
