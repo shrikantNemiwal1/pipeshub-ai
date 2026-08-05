@@ -147,7 +147,10 @@ MEM_PID=$!
 # it — a truncated SSE stream still reports HTTP 200 (the status line is sent
 # before the body), so the only symptom is curl_exit=28 and a turn that never
 # reaches the server's completion marker.
-TURN_MAX_SECONDS=${PIPESHUB_TURN_MAX_SECONDS:-300}
+# PIPESHUB_MAX_TIME is the older spelling; existing run scripts still pass it,
+# and ignoring it would silently cap turns at 300s and record saturation as
+# errors.
+TURN_MAX_SECONDS=${PIPESHUB_TURN_MAX_SECONDS:-${PIPESHUB_MAX_TIME:-300}}
 
 # Query order per user, drawn from a PRNG seeded on (label, user index): random
 # across users but reproducible, so two arms of an A/B see the SAME sequence
