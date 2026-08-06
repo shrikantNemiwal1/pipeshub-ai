@@ -5074,6 +5074,16 @@ class TestEnrichRecordsWithGraphContext:
             }
 
         gp.get_document = AsyncMock(side_effect=_get_document)
+
+        # The enrichment path resolves base and type-specific docs one query per
+        # collection rather than one per record. Delegate through the attribute
+        # so tests that override `get_document` after construction stay
+        # authoritative for both call shapes.
+        async def _get_nodes_by_field_in(collection, field_name, field_values, *args, **kwargs):
+            docs = [await gp.get_document(rid, collection) for rid in field_values]
+            return [d for d in docs if isinstance(d, dict) and (d.get("id") or d.get("_key"))]
+
+        gp.get_nodes_by_field_in = AsyncMock(side_effect=_get_nodes_by_field_in)
         gp.get_virtual_record_ids_for_record_ids = AsyncMock(return_value=vrid_map or {})
         return gp
 
@@ -5304,7 +5314,12 @@ class TestEnrichRecordsWithGraphContext:
         rel = flattened[0]["parent_node_relation"]
         assert rel["record_id"] == "rec-issue-1"
         assert "This ticket tracks the login bug fix." in rel["context_metadata"]
-        blob_store.get_record_from_storage.assert_awaited_once_with("vr-parent-1", "org-1")
+        # lookup_result is pre-resolved in one batched call by the caller; the
+        # fetch resolves the id itself only when the batch had no entry.
+        blob_store.get_record_from_storage.assert_awaited_once()
+        args, kwargs = blob_store.get_record_from_storage.await_args
+        assert args == ("vr-parent-1", "org-1")
+        assert set(kwargs) <= {"lookup_result"}
 
     @pytest.mark.asyncio
     async def test_falls_back_to_graph_when_not_indexed(self):

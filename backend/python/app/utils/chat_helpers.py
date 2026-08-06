@@ -4,6 +4,7 @@ import hashlib
 import logging
 import re
 from collections import defaultdict
+from collections.abc import Iterable
 from itertools import groupby
 from typing import Any, Dict, List, Optional
 from urllib.parse import quote
@@ -406,6 +407,10 @@ _GRAPH_TO_RECORD_FIELDS: dict[str, str] = {
     "sourceLastModifiedTimestamp": "source_updated_at",
 }
 
+# Matches BlobStorage.VIRTUAL_RECORD_LOOKUP_CHUNK_SIZE: the graph accepts an IN
+# list, but an unbounded one turns one slow query into a timeout.
+_GRAPH_BATCH_CHUNK_SIZE = 500
+
 collection_map = {
                     RecordType.TICKET.value: "tickets",
                     RecordType.PROJECT.value: "projects",
@@ -690,6 +695,57 @@ async def _fetch_type_specific_doc(
     except Exception:
         return None
 
+
+async def _fetch_type_specific_docs_batched(
+    graph_provider: IGraphDBProvider,
+    record_ids: Iterable[str],
+    doc_index: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Resolve type-specific docs for many records, one query per collection.
+
+    Each record otherwise costs its own `get_document`, and a turn enriches every
+    linked record it found. Records whose type has no entry in `collection_map`
+    are skipped rather than queried, matching `_fetch_type_specific_doc`.
+
+    A collection whose query fails is simply absent from the result; the caller
+    falls back to the per-record path for those ids.
+    """
+    by_collection: dict[str, list[str]] = {}
+    for rid in record_ids:
+        collection = collection_map.get((doc_index.get(rid) or {}).get("recordType"))
+        if collection:
+            by_collection.setdefault(collection, []).append(rid)
+    if not by_collection:
+        return {}
+
+    async def _one(collection: str, ids: list[str]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for start in range(0, len(ids), _GRAPH_BATCH_CHUNK_SIZE):
+            out.extend(
+                await graph_provider.get_nodes_by_field_in(
+                    collection, "id", ids[start:start + _GRAPH_BATCH_CHUNK_SIZE]
+                )
+                or []
+            )
+        return out
+
+    collections = list(by_collection)
+    results = await asyncio.gather(
+        *[_one(c, by_collection[c]) for c in collections], return_exceptions=True
+    )
+    resolved: dict[str, dict[str, Any]] = {}
+    for collection, result in zip(collections, results):
+        if isinstance(result, Exception):
+            logger.debug(
+                "Linked record context: type-doc batch failed for %s: %s", collection, result
+            )
+            continue
+        for node in result:
+            key = (node or {}).get("id") or (node or {}).get("_key")
+            if key:
+                resolved[key] = node
+    return resolved
+
 def _base_record_context_metadata_from_graph(
     base_graph_doc: dict[str, Any],
     frontend_url: str | None = None,
@@ -729,11 +785,17 @@ async def _build_linked_record_context_metadata(
     vrid: str | None = None,
     blob_store: Any = None,
     org_id: str = "",
+    lookup_result: dict[str, Any] | None = None,
+    type_doc: dict[str, Any] | None = None,
 ) -> str | None:
     """Build linked-record context (metadata + type fields + summary, no blocks).
 
     The base doc is guaranteed present in doc_index by the caller. When the record
     is indexed (has a vrid), the blob supplies the summary; otherwise metadata only.
+
+    `lookup_result` and `type_doc` are pre-resolved by the caller in one batched
+    query each. Both fall back to the per-record path when absent, so a batch
+    miss costs a query rather than losing the field.
     """
     base_doc = doc_index.get(record_id)
     if not base_doc or not isinstance(base_doc, dict):
@@ -742,7 +804,9 @@ async def _build_linked_record_context_metadata(
         blob_record = None
         if vrid and blob_store and org_id:
             try:
-                blob_record = await blob_store.get_record_from_storage(vrid, org_id)
+                blob_record = await blob_store.get_record_from_storage(
+                    vrid, org_id, lookup_result=lookup_result
+                )
             except Exception as e:
                 logger.debug(
                     "Linked record context: blob fetch failed for %s (vrid=%s): %s",
@@ -754,9 +818,11 @@ async def _build_linked_record_context_metadata(
         else:
             record_dict = _build_record_dict_from_graph_base(base_doc)
 
-        type_graph_doc = await _fetch_type_specific_doc(
-            graph_provider, record_id, record_dict.get("record_type")
-        )
+        type_graph_doc = type_doc
+        if type_graph_doc is None:
+            type_graph_doc = await _fetch_type_specific_doc(
+                graph_provider, record_id, record_dict.get("record_type")
+            )
         record_instance = create_record_instance_from_dict(record_dict, type_graph_doc)
         if record_instance:
             return record_instance.to_llm_linked_context(frontend_url)
@@ -909,13 +975,43 @@ async def _resolve_target_metadata(
     """
     ids_needing_docs = [rid for rid in all_target_ids if rid not in doc_index]
 
-    async def _fetch_docs() -> list:
+    async def _fetch_docs() -> dict[str, dict[str, Any]]:
+        """One query per chunk instead of one per record.
+
+        Ids the batch does not return are absent from the result, which is what
+        the caller already did with a `get_document` that returned None. If the
+        batch itself fails, fall back to the per-id path rather than dropping
+        every linked record's metadata.
+        """
         if not ids_needing_docs:
-            return []
-        return await asyncio.gather(
-            *[graph_provider.get_document(rid, CollectionNames.RECORDS.value) for rid in ids_needing_docs],
-            return_exceptions=True,
-        )
+            return {}
+        collection = CollectionNames.RECORDS.value
+        try:
+            nodes: list[dict[str, Any]] = []
+            for start in range(0, len(ids_needing_docs), _GRAPH_BATCH_CHUNK_SIZE):
+                nodes.extend(
+                    await graph_provider.get_nodes_by_field_in(
+                        collection, "id", ids_needing_docs[start:start + _GRAPH_BATCH_CHUNK_SIZE]
+                    )
+                    or []
+                )
+        except Exception as e:
+            logger.warning("Linked record context: batch doc fetch failed, per-id fallback: %s", e)
+            per_id = await asyncio.gather(
+                *[graph_provider.get_document(rid, collection) for rid in ids_needing_docs],
+                return_exceptions=True,
+            )
+            return {
+                rid: doc
+                for rid, doc in zip(ids_needing_docs, per_id)
+                if not isinstance(doc, Exception) and doc and isinstance(doc, dict)
+            }
+        resolved: dict[str, dict[str, Any]] = {}
+        for node in nodes:
+            key = (node or {}).get("id") or (node or {}).get("_key")
+            if key:
+                resolved[key] = node
+        return resolved
 
     doc_results, vrid_result = await asyncio.gather(
         _fetch_docs(),
@@ -925,8 +1021,8 @@ async def _resolve_target_metadata(
 
     # Populate doc_index from fetched docs
     if ids_needing_docs and not isinstance(doc_results, Exception):
-        for rid, doc in zip(ids_needing_docs, doc_results):
-            if not isinstance(doc, Exception) and doc and isinstance(doc, dict):
+        for rid, doc in doc_results.items():
+            if doc and isinstance(doc, dict):
                 doc_index[rid] = doc
 
     # Build id -> vrid mapping
@@ -943,6 +1039,32 @@ async def _resolve_target_metadata(
 
     context_map: dict[str, str] = {}
     if out_of_context_ids:
+        # Resolve both per-record lookups once for the whole batch. Each linked
+        # record otherwise pays its own virtual-record mapping query inside
+        # get_record_from_storage, plus its own type-specific get_document.
+        blob_lookups: dict[str, dict[str, Any]] = {}
+        vrids_to_resolve = [
+            id_to_vrid[rid] for rid in out_of_context_ids if rid in id_to_vrid
+        ]
+        if blob_store and org_id and vrids_to_resolve:
+            try:
+                resolved_lookups = await blob_store.get_document_ids_by_virtual_record_ids(
+                    vrids_to_resolve
+                )
+                # Anything but a mapping means the pre-resolve did not happen;
+                # passing it through would hand the fetch a bogus lookup instead
+                # of letting it resolve the id itself.
+                if isinstance(resolved_lookups, dict):
+                    blob_lookups = resolved_lookups
+            except Exception as e:
+                logger.warning(
+                    "Linked record context: batch virtual-record lookup failed, "
+                    "resolving per record: %s", e,
+                )
+        type_docs = await _fetch_type_specific_docs_batched(
+            graph_provider, out_of_context_ids, doc_index
+        )
+
         ctx_results = await asyncio.gather(
             *[
                 _build_linked_record_context_metadata(
@@ -950,6 +1072,8 @@ async def _resolve_target_metadata(
                     vrid=id_to_vrid.get(rid),
                     blob_store=blob_store if rid in id_to_vrid else None,
                     org_id=org_id,
+                    lookup_result=blob_lookups.get(id_to_vrid.get(rid) or ""),
+                    type_doc=type_docs.get(rid),
                 )
                 for rid in out_of_context_ids
             ],
