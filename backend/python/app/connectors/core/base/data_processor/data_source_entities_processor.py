@@ -1438,7 +1438,11 @@ class DataSourceEntitiesProcessor:
                         {
                             "eventType": "reindexRecord",
                             "timestamp": get_epoch_timestamp_in_ms(),
-                            "payload": record.to_kafka_record(),
+                            # An explicit reindex must re-run even when the record is
+                            # already COMPLETED; without this the consumer's
+                            # already-indexed guard skips it and reindex silently
+                            # does nothing for a healthy corpus.
+                            "payload": {**record.to_kafka_record(), "forceReindex": True},
                         },
                     )
                     for record in to_publish

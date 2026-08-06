@@ -271,7 +271,12 @@ class RecordEventHandler(BaseEventService):
 
             doc = dict(record)
 
-            if (event_type == EventTypes.NEW_RECORD.value or event_type == EventTypes.REINDEX_RECORD.value) and doc.get("indexingStatus") == ProgressStatus.COMPLETED.value:
+            # The guard stops a replayed newRecord from re-running the pipeline over
+            # an indexed corpus. An explicit reindex is the one case that must run
+            # anyway, so it opts out rather than the guard being relaxed for
+            # everyone: without this, reindex reports success while doing nothing.
+            force_reindex = bool(payload.get("forceReindex"))
+            if (not force_reindex) and (event_type == EventTypes.NEW_RECORD.value or event_type == EventTypes.REINDEX_RECORD.value) and doc.get("indexingStatus") == ProgressStatus.COMPLETED.value:
                 self.logger.info(f"🔍 Indexing already done for record {record_id} with virtual_record_id {virtual_record_id}")
                 yield PipelineEvent(event=IndexingEvent.PARSING_COMPLETE, data=PipelineEventData(record_id=record_id))
                 yield PipelineEvent(event=IndexingEvent.INDEXING_COMPLETE, data=PipelineEventData(record_id=record_id))
