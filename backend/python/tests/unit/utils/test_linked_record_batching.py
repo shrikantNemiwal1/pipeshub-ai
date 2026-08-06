@@ -184,3 +184,37 @@ class TestBlobLookupPassthrough:
         )
 
         assert provider.get_document.await_count == 1
+
+
+class TestMainRecordPathTypeDocs:
+    """The main record path resolved type-specific metadata per record too."""
+
+    @pytest.mark.asyncio
+    async def test_supplied_type_docs_skip_the_per_record_query(self) -> None:
+        provider = _graph_provider()
+        blob_store = MagicMock()
+        blob_store.get_record_from_storage = AsyncMock(
+            return_value={"record_name": "n", "summary": "s"}
+        )
+        vtr = {"v1": {"id": "t1", "recordType": "TICKET", "recordName": "n"}}
+
+        await ch.get_record(
+            "v1", {}, blob_store, "org", vtr, provider, None, None,
+            {"t1": {"id": "t1", "status": "open"}},
+        )
+
+        assert provider.get_document.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_missing_type_doc_falls_back_to_the_query(self) -> None:
+        provider = _graph_provider()
+        provider.get_document = AsyncMock(return_value={"id": "t1", "status": "open"})
+        blob_store = MagicMock()
+        blob_store.get_record_from_storage = AsyncMock(
+            return_value={"record_name": "n", "summary": "s"}
+        )
+        vtr = {"v1": {"id": "t1", "recordType": "TICKET", "recordName": "n"}}
+
+        await ch.get_record("v1", {}, blob_store, "org", vtr, provider, None, None, {})
+
+        assert provider.get_document.await_count == 1

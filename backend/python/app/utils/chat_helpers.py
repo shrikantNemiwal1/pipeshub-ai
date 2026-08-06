@@ -1614,7 +1614,22 @@ async def get_flattened_results(result_set: List[Dict[str, Any]], blob_store: Bl
         except Exception as e:
             logger.warning("Batch virtual-record lookup failed, resolving per record: %s", str(e))
 
-    await asyncio.gather(*[get_record(virtual_record_id,virtual_record_id_to_result,blob_store,org_id,virtual_to_record_map,graph_provider,frontend_url,batched_lookups.get(virtual_record_id)) for virtual_record_id in records_to_fetch])
+    # Type-specific metadata (ticket status, mail sender, ...) is one graph query
+    # per record inside get_record. The record type is already known here, so
+    # resolve the whole batch with one query per collection instead.
+    type_docs: dict[str, dict[str, Any]] = {}
+    if records_to_fetch and graph_provider:
+        by_record_id = {
+            gdb["id"]: gdb
+            for vrid in records_to_fetch
+            if isinstance(gdb := (virtual_to_record_map or {}).get(vrid), dict) and gdb.get("id")
+        }
+        if by_record_id:
+            type_docs = await _fetch_type_specific_docs_batched(
+                graph_provider, list(by_record_id), by_record_id
+            )
+
+    await asyncio.gather(*[get_record(virtual_record_id,virtual_record_id_to_result,blob_store,org_id,virtual_to_record_map,graph_provider,frontend_url,batched_lookups.get(virtual_record_id),type_docs) for virtual_record_id in records_to_fetch])
     # Prefetch reconciliation metadata in parallel (records were fully fetched above).
     vrids_needing_recon: set = set[Any]()
 
@@ -2280,7 +2295,7 @@ def extract_bounding_boxes(citation_metadata) -> list[dict[str, float]]:
         except Exception as e:
             raise e
 
-async def get_record(virtual_record_id: str,virtual_record_id_to_result: dict[str, dict[str, Any]],blob_store: BlobStorage,org_id: str,virtual_to_record_map: dict[str, dict[str, Any]]=None,graph_provider: IGraphDBProvider | None = None,frontend_url: str | None = None,lookup_result: dict[str, Any] | None = None) -> None:
+async def get_record(virtual_record_id: str,virtual_record_id_to_result: dict[str, dict[str, Any]],blob_store: BlobStorage,org_id: str,virtual_to_record_map: dict[str, dict[str, Any]]=None,graph_provider: IGraphDBProvider | None = None,frontend_url: str | None = None,lookup_result: dict[str, Any] | None = None,type_docs: dict[str, dict[str, Any]] | None = None) -> None:
     try:
         record = await blob_store.get_record_from_storage(virtual_record_id=virtual_record_id, org_id=org_id, lookup_result=lookup_result)
         if record:
@@ -2310,8 +2325,8 @@ async def get_record(virtual_record_id: str,virtual_record_id_to_result: dict[st
                     record["external_record_id"] = graph_external_id
 
                 # Fetch type-specific metadata and generate formatted string
-                graph_doc = None
-                if graph_provider and record_key:
+                graph_doc = (type_docs or {}).get(record_key)
+                if graph_doc is None and graph_provider and record_key:
                     try:
                         # Determine collection name based on record type
 
