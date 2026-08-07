@@ -1164,7 +1164,7 @@ class BlobStorage(Transformer):
                             else:
                                 async with session.get(URL(signed_url, encoded=True)) as res:
                                     if res.status == HttpStatusCode.SUCCESS.value:
-                                        data = await res.json(content_type=None)
+                                        data = await res.json(content_type=None, loads=_decode_json)
                                     else:
                                         raise Exception(f"Failed to retrieve record: status {res.status}")
                         except Exception as e:
@@ -1173,7 +1173,7 @@ class BlobStorage(Transformer):
                                 try:
                                     async with session.get(URL(signed_url, encoded=True)) as res:
                                         if res.status == HttpStatusCode.SUCCESS.value:
-                                            data = await res.json(content_type=None)
+                                            data = await res.json(content_type=None, loads=_decode_json)
                                         else:
                                             raise Exception(f"Fallback download failed with status {res.status}")
                                 except Exception as fallback_error:
