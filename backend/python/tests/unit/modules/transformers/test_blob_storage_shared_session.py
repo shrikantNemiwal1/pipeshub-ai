@@ -247,3 +247,32 @@ class TestLookupPassthrough:
         # An empty dict is a resolved "not found", so it must still short-circuit
         # rather than fall back to the per-record query.
         blob.get_document_id_by_virtual_record_id.assert_not_called()
+
+
+class TestEnvelopeDecoding:
+    """Records under the compression threshold are plain JSON, so the envelope
+    parse IS the record decode -- it moved from msgpack (msgspec) to JSON."""
+
+    def test_decodes_bytes_without_a_utf8_round_trip(self) -> None:
+        raw = b'{"isCompressed": false, "record": {"record_name": "n"}, "virtualRecordId": "v"}'
+        assert bs_mod._decode_json(raw) == {
+            "isCompressed": False,
+            "record": {"record_name": "n"},
+            "virtualRecordId": "v",
+        }
+
+    def test_matches_stdlib_json_exactly(self) -> None:
+        import json as _json
+
+        raw = _json.dumps(
+            {"isCompressed": False, "record": {"a": [1, 2.5, None, True], "b": "ünïcode"}}
+        ).encode()
+        assert bs_mod._decode_json(raw) == _json.loads(raw.decode("utf-8"))
+
+    def test_falls_back_to_stdlib_when_msgspec_rejects(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A record msgspec cannot parse is still worth trying to read."""
+        def _boom(_raw) -> None:
+            raise ValueError("nope")
+
+        monkeypatch.setattr(bs_mod.msgspec.json, "decode", _boom)
+        assert bs_mod._decode_json(b'{"record": {"x": 1}}') == {"record": {"x": 1}}

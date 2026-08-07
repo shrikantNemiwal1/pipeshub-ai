@@ -6,6 +6,7 @@ from typing import Any, Dict, TypedDict
 
 import aiohttp
 import jwt
+import msgspec
 from yarl import URL
 
 from app.config.constants.arangodb import CollectionNames
@@ -23,6 +24,27 @@ from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
 COMPRESSION_THRESHOLD_BYTES_DEFAULT = 20 * 1024 * 1024
 DOWNLOAD_CONNECTION_LIMIT_DEFAULT = 100
+
+
+def _decode_json(raw: "bytes | str") -> Any:  # noqa: ANN401 - stored records are free-form
+    """Decode a stored-record envelope.
+
+    Records under the compression threshold are stored as plain JSON, so the
+    envelope now carries the whole record and parsing it *is* the record decode.
+    That moved the cost from msgpack (already msgspec, a C decoder) onto the
+    stdlib json module, which measured 12% of query-service CPU. msgspec is
+    ~1.9x faster on a real 48KB record and is already a dependency.
+
+    Accepts str so it can be passed to ``resp.json(loads=...)``; the UTF-8
+    decode aiohttp does first costs ~2us on that record, well inside the win.
+
+    Falls back to the stdlib rather than failing the fetch: a record msgspec
+    rejects is still worth trying to read.
+    """
+    try:
+        return msgspec.json.decode(raw)
+    except Exception:
+        return json.loads(raw) if isinstance(raw, str) else json.loads(raw.decode("utf-8"))
 _COMPRESSION_THRESHOLD_ENV = "PIPESHUB_RECORD_COMPRESSION_THRESHOLD_BYTES"
 
 
@@ -1113,7 +1135,7 @@ class BlobStorage(Transformer):
             session = get_shared_session()
             async with session.get(download_url, headers=headers) as resp:
                 if resp.status == HttpStatusCode.SUCCESS.value:
-                    data = await resp.json()
+                    data = await resp.json(loads=_decode_json)
 
                     if data.get("record"):
                         record = self._process_downloaded_record(data)
@@ -1138,7 +1160,7 @@ class BlobStorage(Transformer):
                                     chunk_size_mb=2,
                                     max_connections=6
                                 )
-                                data = json.loads(file_bytes.decode('utf-8'))
+                                data = _decode_json(file_bytes)
                             else:
                                 async with session.get(URL(signed_url, encoded=True)) as res:
                                     if res.status == HttpStatusCode.SUCCESS.value:
@@ -1966,7 +1988,7 @@ class BlobStorage(Transformer):
             session = get_shared_session()
             async with session.get(download_url, headers=headers) as resp:
                 if resp.status == HttpStatusCode.SUCCESS.value:
-                    data = await resp.json()
+                    data = await resp.json(loads=_decode_json)
                     if data.get("signedUrl"):
                         signed_url = data.get("signedUrl")
                         async with session.get(URL(signed_url, encoded=True)) as signed_resp:
