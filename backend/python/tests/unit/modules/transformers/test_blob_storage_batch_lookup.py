@@ -191,7 +191,7 @@ class TestBatchKeyField:
 
         await _make_blob_storage(graph).get_document_ids_by_virtual_record_ids(["vr-1"])
 
-        field = graph.get_nodes_by_field_in.await_args.args[1]
+        field = graph.get_nodes_by_field_in.await_args_list[0].args[1]
         assert field == "id", "mapping nodes are keyed by virtual record id"
 
     @pytest.mark.asyncio
@@ -216,3 +216,36 @@ class TestBatchKeyField:
             "record_doc_id": "d1", "fileSizeBytes": 10, "record_metadata_doc_id": "m1",
         }
         assert out["vr-2"]["record_doc_id"] == "d2"
+
+    @pytest.mark.asyncio
+    async def test_rows_carrying_the_field_still_resolve_without_per_id_queries(self) -> None:
+        """The single-id path looks the field up before falling back to the key,
+        so the batch must cover that shape too."""
+        graph = MagicMock()
+
+        async def _batch(collection, field, values):
+            if field == "id":
+                return []
+            return [{"virtualRecordId": "vr-1", "documentId": "d1", "fileSizeBytes": 3}]
+
+        graph.get_nodes_by_field_in = AsyncMock(side_effect=_batch)
+        graph.get_document = AsyncMock()
+
+        out = await _make_blob_storage(graph).get_document_ids_by_virtual_record_ids(["vr-1"])
+
+        assert out["vr-1"]["record_doc_id"] == "d1"
+        graph.get_document.assert_not_called()
+        assert [c.args[1] for c in graph.get_nodes_by_field_in.await_args_list] == [
+            "id", "virtualRecordId",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_neither_shape_matching_still_falls_back_per_id(self) -> None:
+        graph = MagicMock()
+        graph.get_nodes_by_field_in = AsyncMock(return_value=[])
+        graph.get_document = AsyncMock(return_value={"documentId": "d9", "fileSizeBytes": 1})
+
+        out = await _make_blob_storage(graph).get_document_ids_by_virtual_record_ids(["vr-9"])
+
+        assert out["vr-9"]["record_doc_id"] == "d9"
+        graph.get_document.assert_awaited_once_with("vr-9", COLLECTION)

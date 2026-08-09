@@ -1082,7 +1082,29 @@ class BlobStorage(Transformer):
                 if vrid and vrid not in resolved:
                     resolved[vrid] = self._shape_document_lookup(node)
 
+        # get_document_id_by_virtual_record_id looks the field up before falling
+        # back to the key, so cover both shapes here too rather than assuming.
+        # Nothing in this repo writes the field, so on current data this query
+        # never runs -- it exists for rows written by something that does.
         missing = [vrid for vrid in unique_ids if vrid not in resolved]
+        if missing:
+            for start in range(0, len(missing), chunk_size):
+                chunk = missing[start:start + chunk_size]
+                try:
+                    nodes = await self.graph_provider.get_nodes_by_field_in(
+                        collection_name, "virtualRecordId", chunk
+                    )
+                except Exception as e:
+                    self.logger.warning(
+                        "Batch virtual-record lookup by field failed, falling back: %s", str(e)
+                    )
+                    continue
+                for node in nodes or []:
+                    vrid = node.get("virtualRecordId")
+                    if vrid and vrid not in resolved:
+                        resolved[vrid] = self._shape_document_lookup(node)
+            missing = [vrid for vrid in unique_ids if vrid not in resolved]
+
         if missing:
             fallbacks = await asyncio.gather(
                 *[
