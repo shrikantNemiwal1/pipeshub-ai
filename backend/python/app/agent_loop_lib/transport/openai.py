@@ -21,6 +21,8 @@ from app.agent_loop_lib.core.streaming import (
     StreamCompleteEvent,
     StreamEvent,
     TextDeltaEvent,
+    ThinkingDeltaEvent,
+    ToolCallDeltaEvent,
 )
 from app.agent_loop_lib.core.tool_schema import ToolSchema
 from app.agent_loop_lib.transport.base import LLMTransport
@@ -319,6 +321,13 @@ class OpenAITransport(LLMTransport):
                 if chunk.choices[0].finish_reason:
                     finish_reason = chunk.choices[0].finish_reason
                 delta = chunk.choices[0].delta
+                # Reasoning text is not a declared field on ChoiceDelta, but the
+                # SDK models allow extras, so providers that emit it (Azure
+                # gpt-5.x) surface it here. Yielded before content so the agent
+                # loop closes its reasoning block on the first text delta.
+                reasoning_delta = getattr(delta, "reasoning_content", None)
+                if reasoning_delta:
+                    yield ThinkingDeltaEvent(delta=reasoning_delta)
                 if delta.content:
                     text_parts.append(delta.content)
                     yield TextDeltaEvent(delta=delta.content)
@@ -330,8 +339,26 @@ class OpenAITransport(LLMTransport):
                         entry["id"] = tc_delta.id
                     if tc_delta.function and tc_delta.function.name:
                         entry["name"] = tc_delta.function.name
+                    args_delta = ""
                     if tc_delta.function and tc_delta.function.arguments:
-                        entry["arguments"] += tc_delta.function.arguments
+                        args_delta = tc_delta.function.arguments
+                        entry["arguments"] += args_delta
+                    # The agent loop keys its live final_answer extractor off
+                    # `index`, so a tool call that never emits these fragments
+                    # only reaches the user once the whole turn ends.
+                    #
+                    # id/name carry what THIS fragment carried, not the
+                    # accumulated value: providers send them once on the opening
+                    # fragment and omit them after, and the LangChain transport
+                    # passes that through unchanged. Empty argument fragments are
+                    # skipped for the same reason.
+                    if args_delta:
+                        yield ToolCallDeltaEvent(
+                            index=tc_delta.index or 0,
+                            id=tc_delta.id,
+                            name=tc_delta.function.name if tc_delta.function else None,
+                            arguments_delta=args_delta,
+                        )
         except Exception as exc:
             raise self._wrap_error(exc, "stream") from exc
 

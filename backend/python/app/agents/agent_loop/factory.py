@@ -82,6 +82,7 @@ from app.agent_loop_lib.tools.builtin.data.retrieve_artifact import RetrieveArti
 from app.agent_loop_lib.events.base import CompositeEmitter
 from app.agent_loop_lib.hooks.registry import HookRegistry
 from app.agent_loop_lib.runtime.runtime import AgentRuntime
+from app.agent_loop_lib.transport.azure_openai import AzureOpenAITransport
 from app.agent_loop_lib.transport.opik_tracing import resolve_opik_gate, traced_transport_factory
 from app.agent_loop_lib.transport.registry import TransportRegistry
 from app.agents.agent_loop.hooks import (
@@ -241,6 +242,17 @@ class PipesHubAgentFactory:
                 opik_active=opik_active,
                 project_name=opik_project_name,
             ),
+        )
+        # Same Azure deployment as "langchain" above, reached through the raw
+        # SDK instead. LangChain builds an AIMessageChunk per streamed token and
+        # pydantic validates each one, measured at ~9% of query-service CPU.
+        # Registered rather than substituted: selection is per ModelSpec, so
+        # "langchain" stays the default and this is revertible without a deploy.
+        # Credentials come off `llm` so both transports cannot drift apart.
+        # Opik tracing hooks LangChain callbacks and does not cover this path.
+        transport_registry.register(
+            "azure_direct",
+            lambda: AzureOpenAITransport.from_langchain_model(llm, model_name=model_name),
         )
 
         # Gate on the SAME resolution the legacy LangGraph path uses

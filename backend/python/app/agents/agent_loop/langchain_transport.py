@@ -51,6 +51,12 @@ from app.agent_loop_lib.core.streaming import (
 )
 from app.agent_loop_lib.transport.base import LLMTransport
 from app.agent_loop_lib.transport.opik_tracing import build_langchain_opik_callbacks
+from app.agent_loop_lib.transport.provider_conflicts import (
+    API_SHAPE_CONFLICT_MARKERS,
+    REASONING_MANDATORY_CONFLICT_MARKERS,
+    is_api_shape_conflict,
+    is_reasoning_mandatory_conflict,
+)
 from app.agents.agent_loop.converters import (
     convert_assistant_message_from_langchain,
     convert_messages_to_langchain,
@@ -99,27 +105,12 @@ _NETWORK_ERROR_NAME_HINTS = ("connectionerror", "connecttimeout", "readtimeout",
 #   attempt landed on a backend that only supports this on Chat Completions.
 # - "tool_choice.function": Chat-Completions-shaped tool_choice sent to a
 #   Responses-only model/deployment.
-_API_SHAPE_CONFLICT_MARKERS = (
-    "please use /v1/responses instead",
-    "please use /v1/chat/completions instead",
-    "tool_choice.function",
-)
-
-
-def _is_api_shape_conflict(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return any(marker in message for marker in _API_SHAPE_CONFLICT_MARKERS)
-
-
-# Substring a provider/gateway emits when it refuses to let reasoning be
-# turned off at all — observed on some OpenRouter-proxied Gemini models:
-# "Reasoning is mandatory for this endpoint and cannot be disabled."
-_REASONING_MANDATORY_CONFLICT_MARKERS = ("reasoning is mandatory",)
-
-
-def _is_reasoning_mandatory_conflict(exc: Exception) -> bool:
-    message = str(exc).lower()
-    return any(marker in message for marker in _REASONING_MANDATORY_CONFLICT_MARKERS)
+# Markers and predicates live in transport/provider_conflicts.py so the direct
+# SDK transport recovers from exactly the same errors this one does.
+_API_SHAPE_CONFLICT_MARKERS = API_SHAPE_CONFLICT_MARKERS
+_REASONING_MANDATORY_CONFLICT_MARKERS = REASONING_MANDATORY_CONFLICT_MARKERS
+_is_api_shape_conflict = is_api_shape_conflict
+_is_reasoning_mandatory_conflict = is_reasoning_mandatory_conflict
 
 
 def _truncate_raw_for_log(raw: Any, max_len: int = 500) -> str:  # noqa: ANN401
