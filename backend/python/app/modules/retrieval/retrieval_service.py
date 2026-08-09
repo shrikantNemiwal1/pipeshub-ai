@@ -36,6 +36,7 @@ from app.utils.aimodels import (
     get_generator_model,
 )
 from app.utils.chat_helpers import (
+    GRAPH_BATCH_CHUNK_SIZE,
     get_flattened_results,
     get_record,
 )
@@ -509,39 +510,43 @@ class RetrievalService:
             files_map = {}
             mails_map = {}
 
-            async def fetch_files() -> dict:
-                if not file_record_ids_to_fetch:
+            async def _fetch_by_ids(record_ids: list[str], collection: str, label: str) -> dict:
+                """One query per collection instead of one per chunk.
+
+                The id lists are appended per search result, so a record matched
+                by several chunks was previously fetched once per chunk.
+                """
+                if not record_ids:
                     return {}
+                unique_ids = list(dict.fromkeys(record_ids))
                 try:
-                    file_results = await asyncio.gather(*[
-                        self.graph_provider.get_document(record_id, CollectionNames.FILES.value)
-                        for record_id in file_record_ids_to_fetch
-                    ], return_exceptions=True)
-                    return {
-                        record_id: result
-                        for record_id, result in zip(file_record_ids_to_fetch, file_results)
-                        if result and not isinstance(result, Exception)
-                    }
+                    nodes: list[dict] = []
+                    for start in range(0, len(unique_ids), GRAPH_BATCH_CHUNK_SIZE):
+                        nodes.extend(
+                            await self.graph_provider.get_nodes_by_field_in(
+                                collection, "id", unique_ids[start:start + GRAPH_BATCH_CHUNK_SIZE]
+                            )
+                            or []
+                        )
                 except Exception as e:
-                    self.logger.warning(f"Failed to batch fetch files: {str(e)}")
+                    self.logger.warning(f"Failed to batch fetch {label}: {str(e)}")
                     return {}
+                resolved = {}
+                for node in nodes:
+                    key = (node or {}).get("id") or (node or {}).get("_key")
+                    if key:
+                        resolved[key] = node
+                return resolved
+
+            async def fetch_files() -> dict:
+                return await _fetch_by_ids(
+                    file_record_ids_to_fetch, CollectionNames.FILES.value, "files"
+                )
 
             async def fetch_mails() -> dict:
-                if not mail_record_ids_to_fetch:
-                    return {}
-                try:
-                    mail_results = await asyncio.gather(*[
-                        self.graph_provider.get_document(record_id, CollectionNames.MAILS.value)
-                        for record_id in mail_record_ids_to_fetch
-                    ], return_exceptions=True)
-                    return {
-                        record_id: result
-                        for record_id, result in zip(mail_record_ids_to_fetch, mail_results)
-                        if result and not isinstance(result, Exception)
-                    }
-                except Exception as e:
-                    self.logger.warning(f"Failed to batch fetch mails: {str(e)}")
-                    return {}
+                return await _fetch_by_ids(
+                    mail_record_ids_to_fetch, CollectionNames.MAILS.value, "mails"
+                )
 
             async def fetch_locations() -> dict[str, str]:
                 """Resolve permission-aware Location trails for retrieved records.

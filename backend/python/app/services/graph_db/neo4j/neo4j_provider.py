@@ -5346,6 +5346,70 @@ class Neo4jProvider(IGraphDBProvider):
             )
             return []
 
+    async def get_record_relations_batch(
+        self,
+        record_ids: list[str],
+        relation_types: list[str],
+        transaction: Optional[str] = None,
+    ) -> dict[str, dict[str, list[dict[str, Any]]]]:
+        """Both edge directions for every record, in one query.
+
+        The per-record methods cost one query each per relation type per
+        direction; a turn enriching 30 hits over 2 relation types spent 120
+        round trips here.
+        """
+        out: dict[str, dict[str, list[dict[str, Any]]]] = {
+            record_id: {"parents": [], "children": []} for record_id in record_ids
+        }
+        if not record_ids or not relation_types:
+            return out
+        try:
+            query = """
+            MATCH (a:Record)-[r:RECORD_RELATION]-(b:Record)
+            WHERE a.id IN $record_ids AND r.relationshipType IN $relation_types
+            RETURN a.id AS anchor_id,
+                   b.id AS record_id,
+                   startNode(r).id = a.id AS outgoing,
+                   r.relationshipType AS relationType,
+                   COALESCE(r.parentTableName, '') AS parentTable,
+                   COALESCE(r.childTableName, '') AS childTable,
+                   COALESCE(r.sourceColumn, '') AS sourceColumn,
+                   COALESCE(r.targetColumn, '') AS targetColumn
+            """
+            results = await self.client.execute_query(
+                query,
+                parameters={"record_ids": record_ids, "relation_types": relation_types},
+                txn_id=transaction,
+            )
+            for record in results:
+                anchor = record.get("anchor_id")
+                bucket = out.get(anchor)
+                if bucket is None:
+                    continue
+                # Outgoing means the anchor is the edge's start node, matching
+                # get_parent_record_ids_by_relation_type's direction.
+                outgoing = bool(record.get("outgoing"))
+                edge = {
+                    "record_id": record.get("record_id"),
+                    "relationType": record.get("relationType"),
+                    "sourceColumn": record.get("sourceColumn", ""),
+                    "targetColumn": record.get("targetColumn", ""),
+                }
+                if outgoing:
+                    edge["parentTable"] = record.get("parentTable", "")
+                    bucket["parents"].append(edge)
+                else:
+                    edge["childTable"] = record.get("childTable", "")
+                    bucket["children"].append(edge)
+            return out
+        except Exception as e:
+            self.logger.warning(
+                "Failed to batch record relations for %d records: %s", len(record_ids), str(e),
+            )
+            return await super().get_record_relations_batch(
+                record_ids, relation_types, transaction,
+            )
+
     async def batch_upsert_record_groups(
         self,
         record_groups: list[RecordGroup],

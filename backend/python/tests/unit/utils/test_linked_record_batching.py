@@ -218,3 +218,74 @@ class TestMainRecordPathTypeDocs:
         await ch.get_record("v1", {}, blob_store, "org", vtr, provider, None, None, {})
 
         assert provider.get_document.await_count == 1
+
+
+class TestEdgeBatching:
+    """Record-relation edges were four queries per hit (2 relation types x 2
+    directions). These pin the batched form to the same output."""
+
+    @staticmethod
+    def _provider_with_edges(batch_result: dict) -> MagicMock:
+        provider = _graph_provider()
+        provider.get_record_relations_batch = AsyncMock(return_value=batch_result)
+        provider.get_parent_record_ids_by_relation_type = AsyncMock(return_value=[])
+        provider.get_child_record_ids_by_relation_type = AsyncMock(return_value=[])
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_one_query_covers_every_record_and_direction(self) -> None:
+        provider = self._provider_with_edges({
+            "r1": {
+                "parents": [{"record_id": "p1", "relationType": "PARENT_CHILD"}],
+                "children": [{"record_id": "c1", "relationType": "ATTACHMENT"}],
+            },
+            "r2": {"parents": [], "children": []},
+        })
+
+        out = await ch._fetch_edges_for_records(provider, ["r1", "r2"])
+
+        assert provider.get_record_relations_batch.await_count == 1
+        assert provider.get_parent_record_ids_by_relation_type.await_count == 0
+        assert provider.get_child_record_ids_by_relation_type.await_count == 0
+        assert out["r2"] == []
+        # incoming ATTACHMENT reads as PARENT, outgoing PARENT_CHILD as CHILD
+        assert sorted(out["r1"]) == [("c1", "PARENT"), ("p1", "CHILD")]
+
+    @pytest.mark.asyncio
+    async def test_direction_drives_the_label_not_the_relation_name(self) -> None:
+        """PARENT_CHILD outgoing means the hit points at its child; incoming
+        means the hit has a parent. Swapping these mislabels the context."""
+        provider = self._provider_with_edges({
+            "r1": {
+                "parents": [{"record_id": "out", "relationType": "PARENT_CHILD"}],
+                "children": [{"record_id": "in", "relationType": "PARENT_CHILD"}],
+            },
+        })
+
+        out = dict(await ch._fetch_edges_for_records(provider, ["r1"]))["r1"]
+
+        assert dict((rid, label) for rid, label in out) == {"out": "CHILD", "in": "PARENT"}
+
+    @pytest.mark.asyncio
+    async def test_unknown_relation_types_are_dropped(self) -> None:
+        provider = self._provider_with_edges({
+            "r1": {
+                "parents": [{"record_id": "p1", "relationType": "SOMETHING_ELSE"}],
+                "children": [],
+            },
+        })
+
+        assert await ch._fetch_edges_for_records(provider, ["r1"]) == {"r1": []}
+
+    @pytest.mark.asyncio
+    async def test_no_records_issues_no_query(self) -> None:
+        provider = self._provider_with_edges({})
+        assert await ch._fetch_edges_for_records(provider, []) == {}
+        assert provider.get_record_relations_batch.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_batch_failure_degrades_to_no_edges_not_an_exception(self) -> None:
+        provider = self._provider_with_edges({})
+        provider.get_record_relations_batch = AsyncMock(side_effect=RuntimeError("boom"))
+
+        assert await ch._fetch_edges_for_records(provider, ["r1"]) == {}

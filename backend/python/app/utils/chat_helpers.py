@@ -409,7 +409,7 @@ _GRAPH_TO_RECORD_FIELDS: dict[str, str] = {
 
 # Matches BlobStorage.VIRTUAL_RECORD_LOOKUP_CHUNK_SIZE: the graph accepts an IN
 # list, but an unbounded one turns one slow query into a timeout.
-_GRAPH_BATCH_CHUNK_SIZE = 500
+GRAPH_BATCH_CHUNK_SIZE = 500
 
 collection_map = {
                     RecordType.TICKET.value: "tickets",
@@ -720,10 +720,10 @@ async def _fetch_type_specific_docs_batched(
 
     async def _one(collection: str, ids: list[str]) -> list[dict[str, Any]]:
         out: list[dict[str, Any]] = []
-        for start in range(0, len(ids), _GRAPH_BATCH_CHUNK_SIZE):
+        for start in range(0, len(ids), GRAPH_BATCH_CHUNK_SIZE):
             out.extend(
                 await graph_provider.get_nodes_by_field_in(
-                    collection, "id", ids[start:start + _GRAPH_BATCH_CHUNK_SIZE]
+                    collection, "id", ids[start:start + GRAPH_BATCH_CHUNK_SIZE]
                 )
                 or []
             )
@@ -844,43 +844,45 @@ def _relation_display_label(relation: RecordRelations, outgoing: bool) -> str:
     return relation.value
 
 
-async def _fetch_edges_for_record(
+async def _fetch_edges_for_records(
     graph_provider: IGraphDBProvider,
-    record_id: str,
-) -> list[tuple[str, str]]:
-    """Return (related_record_id, display_label) pairs from graph edges.
+    record_ids: list[str],
+) -> dict[str, list[tuple[str, str]]]:
+    """Return {record_id: [(related_record_id, display_label), ...]} from graph edges.
 
     Graph API naming is edge-direction based, not familial role:
-      get_parent_record_ids → records this hit points to (_from == hit)
-      get_child_record_ids  → records pointing to this hit (_to == hit)
-    """
-    query_specs = [
-        (outgoing, relation)
-        for relation in RECORD_RELATION_ENRICHMENT_TYPES
-        for outgoing in (True, False)
-    ]
-    tasks = [
-        graph_provider.get_parent_record_ids_by_relation_type(record_id, rel.value)
-        if outgoing
-        else graph_provider.get_child_record_ids_by_relation_type(record_id, rel.value)
-        for outgoing, rel in query_specs
-    ]
+      parents  → records this hit points to (_from == hit)
+      children → records pointing to this hit (_to == hit)
 
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    edges: list[tuple[str, str]] = []
-    for (outgoing, relation), result in zip(query_specs, results):
-        if isinstance(result, Exception):
-            logger.warning(
-                "Graph context enrichment: edge query failed for %s (%s): %s",
-                record_id, relation.value, result,
-            )
-            continue
-        label = _relation_display_label(relation, outgoing)
-        for edge in result or []:
-            related_id = edge.get("record_id") if isinstance(edge, dict) else None
-            if related_id:
-                edges.append((related_id, label))
-    return edges
+    Batched across records and relation types: the per-record form cost one
+    query per relation type per direction, so a turn enriching every hit spent
+    4x its hit count on round trips.
+    """
+    if not record_ids:
+        return {}
+    by_value = {rel.value: rel for rel in RECORD_RELATION_ENRICHMENT_TYPES}
+    try:
+        relations = await graph_provider.get_record_relations_batch(
+            record_ids, list(by_value),
+        )
+    except Exception as e:
+        logger.warning("Graph context enrichment: batch edge query failed: %s", e)
+        return {}
+
+    out: dict[str, list[tuple[str, str]]] = {}
+    for record_id in record_ids:
+        buckets = relations.get(record_id) or {}
+        edges: list[tuple[str, str]] = []
+        for bucket, outgoing in (("parents", True), ("children", False)):
+            for edge in buckets.get(bucket) or []:
+                if not isinstance(edge, dict):
+                    continue
+                related_id = edge.get("record_id")
+                relation = by_value.get(edge.get("relationType"))
+                if related_id and relation:
+                    edges.append((related_id, _relation_display_label(relation, outgoing)))
+        out[record_id] = edges
+    return out
 
 
 async def _resolve_frontend_url(
@@ -988,10 +990,10 @@ async def _resolve_target_metadata(
         collection = CollectionNames.RECORDS.value
         try:
             nodes: list[dict[str, Any]] = []
-            for start in range(0, len(ids_needing_docs), _GRAPH_BATCH_CHUNK_SIZE):
+            for start in range(0, len(ids_needing_docs), GRAPH_BATCH_CHUNK_SIZE):
                 nodes.extend(
                     await graph_provider.get_nodes_by_field_in(
-                        collection, "id", ids_needing_docs[start:start + _GRAPH_BATCH_CHUNK_SIZE]
+                        collection, "id", ids_needing_docs[start:start + GRAPH_BATCH_CHUNK_SIZE]
                     )
                     or []
                 )
@@ -1196,10 +1198,9 @@ async def enrich_records_with_graph_context(
     # Step 2: Fetch edges for relation-eligible hits
     edge_results: list = []
     if relation_eligible:
-        edge_results = await asyncio.gather(
-            *[_fetch_edges_for_record(graph_provider, rid) for _, rid, _ in relation_eligible],
-            return_exceptions=True,
-        )
+        eligible_ids = [rid for _, rid, _ in relation_eligible]
+        edges_by_record = await _fetch_edges_for_records(graph_provider, eligible_ids)
+        edge_results = [edges_by_record.get(rid, []) for rid in eligible_ids]
 
     # Step 3: Build relation buckets from edges
     relation_buckets, all_related_ids = _build_relation_buckets(

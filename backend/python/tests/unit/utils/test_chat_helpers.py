@@ -5060,6 +5060,23 @@ class TestEnrichRecordsWithGraphContext:
         gp.get_parent_record_ids_by_relation_type = AsyncMock(side_effect=_parent)
         gp.get_child_record_ids_by_relation_type = AsyncMock(side_effect=_child)
 
+        async def _relations_batch(record_ids, relation_types, transaction=None):
+            return {
+                rid: {
+                    "parents": [
+                        {**e, "relationType": rt}
+                        for rt in relation_types for e in outgoing_by_type.get(rt, [])
+                    ],
+                    "children": [
+                        {**e, "relationType": rt}
+                        for rt in relation_types for e in incoming_by_type.get(rt, [])
+                    ],
+                }
+                for rid in record_ids
+            }
+
+        gp.get_record_relations_batch = AsyncMock(side_effect=_relations_batch)
+
         async def _get_document(record_id, collection=None, *args, **kwargs):
             if record_id in docs_by_id:
                 return docs_by_id[record_id]
@@ -5420,15 +5437,19 @@ class TestEnrichRecordsWithGraphContext:
         assert "record_relations" not in rec
 
     @pytest.mark.asyncio
-    async def test_queries_both_relation_types(self):
+    async def test_queries_both_relation_types_in_one_batch(self):
         rec = self._ticket_record()
         vr_map = {"vr-ticket": rec}
         gp = self._make_graph_provider()
         await enrich_records_with_graph_context(
             vr_map, graph_provider=gp, flattened_results=[],
         )
-        assert gp.get_parent_record_ids_by_relation_type.await_count == 2
-        assert gp.get_child_record_ids_by_relation_type.await_count == 2
+        gp.get_record_relations_batch.assert_awaited_once()
+        from app.utils.chat_helpers import RECORD_RELATION_ENRICHMENT_TYPES
+        requested = set(gp.get_record_relations_batch.await_args.args[1])
+        assert requested == {rel.value for rel in RECORD_RELATION_ENRICHMENT_TYPES}
+        assert gp.get_parent_record_ids_by_relation_type.await_count == 0
+        assert gp.get_child_record_ids_by_relation_type.await_count == 0
 
     @pytest.mark.asyncio
     async def test_stores_minimal_related_records(self):
