@@ -1042,11 +1042,17 @@ class BlobStorage(Transformer):
         """Resolve many virtual-record → document mappings with one query per chunk.
 
         Answering a chat turn fetches ~100 records, each of which otherwise costs
-        its own mapping query. Ids the batch query does not return fall back to
-        the per-id path, which also covers legacy rows keyed by virtual record id
-        with no ``virtualRecordId`` field. Ids with no mapping at all are absent
-        from the result rather than present-and-empty, so callers can tell the
-        difference between "not found" and "not looked up".
+        its own mapping query.
+
+        The mapping node's key *is* the virtual record id, which is what the
+        per-id path matches on and what carries the index. Batching on a
+        ``virtualRecordId`` property instead matched nothing and fell through to
+        the per-id path for every id, with an unindexed scan added on top.
+
+        Ids the batch does not return still fall back to the per-id path. Ids
+        with no mapping at all are absent from the result rather than
+        present-and-empty, so callers can tell the difference between "not
+        found" and "not looked up".
         """
         if not self.graph_provider:
             self.logger.error("❌ GraphProvider not initialized, cannot resolve virtual record IDs.")
@@ -1064,7 +1070,7 @@ class BlobStorage(Transformer):
             chunk = unique_ids[start:start + chunk_size]
             try:
                 nodes = await self.graph_provider.get_nodes_by_field_in(
-                    collection_name, "virtualRecordId", chunk
+                    collection_name, "id", chunk
                 )
             except Exception as e:
                 # Degrade to the per-id path for this chunk rather than failing the turn.
@@ -1072,7 +1078,7 @@ class BlobStorage(Transformer):
                 nodes = []
 
             for node in nodes or []:
-                vrid = node.get("virtualRecordId")
+                vrid = node.get("id") or node.get("_key") or node.get("virtualRecordId")
                 if vrid and vrid not in resolved:
                     resolved[vrid] = self._shape_document_lookup(node)
 
