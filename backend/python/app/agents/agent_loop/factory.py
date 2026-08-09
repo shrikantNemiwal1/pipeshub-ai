@@ -175,6 +175,20 @@ _DOMAIN_SHARED_NAV_TOOL_NAMES: frozenset[str] = frozenset({
 # constant here rather than a magic number in `create()`.
 _MAX_TURNS = 15
 
+
+def _transport_provider() -> str:
+    """Which registered transport the agent loop talks through.
+
+    Defaults to the LangChain transport. Set PIPESHUB_AGENT_TRANSPORT to
+    "azure_direct" to use the raw Azure SDK instead, which skips the per-token
+    AIMessageChunk validation LangChain does. Read per call rather than cached
+    so an arm can be switched by restarting the service, without a rebuild.
+
+    An unknown value would fail at TransportRegistry.resolve with a clear
+    RegistryError naming the provider, so it is not validated here.
+    """
+    return os.getenv("PIPESHUB_AGENT_TRANSPORT", "langchain").strip() or "langchain"
+
 # Phase-1 auto-compact (gentle): protects up to 70% of budget in the tail,
 # summarizes only the oldest portion. Phase-2 (aggressive): if still over
 # budget, shrinks tail to 40%, forcing more into the summary.
@@ -493,7 +507,7 @@ class PipesHubAgentFactory:
             # construction is equivalent to having registered it earlier;
             # it just needs `runtime` itself for `run_child()`, which
             # doesn't exist until this line.
-            register_skill_learning(hooks, skill_manager, runtime, provider="langchain", model_name=model_name)
+            register_skill_learning(hooks, skill_manager, runtime, provider=_transport_provider(), model_name=model_name)
 
         # Domain-agent composition, registration half: now that the
         # AgentRuntime exists, actually build each claimed domain's child
@@ -539,7 +553,7 @@ class PipesHubAgentFactory:
             )
             composed_names = register_domain_agents(
                 composition_plan, tool_registry, runtime, context,
-                provider="langchain", model_name=model_name,
+                provider=_transport_provider(), model_name=model_name,
                 lazy_tools=domain_lazy_tools,
                 shared_tool_names=(
                     (DOMAIN_SHARED_SKILL_TOOL_NAMES if skill_manager is not None else frozenset())
@@ -555,7 +569,7 @@ class PipesHubAgentFactory:
             )
             if mode.loop_kind == "orchestrator":
                 runtime.spec_factory = domain_spec_factory(
-                    provider="langchain", model_name=model_name,
+                    provider=_transport_provider(), model_name=model_name,
                     default_tool_names=composed_names, context=context,
                 )
             elif mode.loop_kind == "plan_execute":
@@ -574,7 +588,7 @@ class PipesHubAgentFactory:
             # pool falls back to the flat, uncomposed residual, same as
             # this feature's pre-existing behavior.
             runtime.spec_factory = domain_spec_factory(
-                provider="langchain", model_name=model_name,
+                provider=_transport_provider(), model_name=model_name,
                 default_tool_names=[
                     n for n in tool_registry.names() if n not in COORDINATION_TOOL_NAMES
                 ],
@@ -660,7 +674,7 @@ class PipesHubAgentFactory:
             tool_names=tool_names,
             tool_disclosure=tool_disclosure,
             pinned_toolsets=pinned_toolsets,
-            model=ModelSpec(provider="langchain", model=model_name),
+            model=ModelSpec(provider=_transport_provider(), model=model_name),
             loop=loop,
             max_turns=_MAX_TURNS,
         )
