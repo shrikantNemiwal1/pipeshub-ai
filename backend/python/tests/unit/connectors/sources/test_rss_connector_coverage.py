@@ -92,6 +92,14 @@ def _make_fetch_response(status=200, content=b"<html>body</html>", headers=None,
     )
 
 
+def _patch_fetch_raising(exc: BaseException) -> object:
+    """Patch the connector's fetch_url_with_fallback to raise."""
+    return patch(
+        "app.connectors.sources.rss.connector.fetch_url_with_fallback",
+        new=AsyncMock(side_effect=exc),
+    )
+
+
 def _patch_fetch(**kwargs):
     """Patch the connector's fetch_url_with_fallback to return a FetchResponse."""
     return patch(
@@ -128,9 +136,12 @@ class TestFetchAndParseFeed:
     @pytest.mark.asyncio
     async def test_http_error_returns_none(self):
         conn = _make_connector()
-        resp = _make_mock_response(status=404)
-        conn.session = _make_session(resp)
-        result = await conn._fetch_and_parse_feed("https://feed.com/rss")
+        # Patch `fetch_url_with_fallback`, not `conn.session`. The session is
+        # only that helper's *third* strategy -- curl_cffi and cloudscraper run
+        # first and reach the real network, so a session mock never intercepts
+        # and the test hangs until the suite timeout.
+        with _patch_fetch(status=404):
+            result = await conn._fetch_and_parse_feed("https://feed.com/rss")
         assert result is None
 
     @pytest.mark.asyncio
@@ -154,10 +165,7 @@ class TestFetchAndParseFeed:
     @pytest.mark.asyncio
     async def test_bozo_feed_with_no_entries_returns_none(self):
         conn = _make_connector()
-        # Return content that feedparser can parse but marks as bozo
-        resp = _make_mock_response(status=200, content=b"not-valid-xml-at-all")
-        conn.session = _make_session(resp)
-        with patch("app.connectors.sources.rss.connector.feedparser") as mock_fp:
+        with _patch_fetch(status=200, content=b"not-valid-xml-at-all"),                 patch("app.connectors.sources.rss.connector.feedparser") as mock_fp:
             mock_feed = MagicMock()
             mock_feed.bozo = True
             mock_feed.entries = []
@@ -181,22 +189,15 @@ class TestFetchAndParseFeed:
     @pytest.mark.asyncio
     async def test_timeout_returns_none(self):
         conn = _make_connector()
-        session = MagicMock()
-        cm = MagicMock()
-        cm.__aenter__ = AsyncMock(side_effect=asyncio.TimeoutError())
-        cm.__aexit__ = AsyncMock(return_value=None)
-        session.get = MagicMock(return_value=cm)
-        conn.session = session
-        result = await conn._fetch_and_parse_feed("https://feed.com/rss")
+        with _patch_fetch_raising(asyncio.TimeoutError()):
+            result = await conn._fetch_and_parse_feed("https://feed.com/rss")
         assert result is None
 
     @pytest.mark.asyncio
     async def test_exception_returns_none(self):
         conn = _make_connector()
-        session = MagicMock()
-        session.get = MagicMock(side_effect=Exception("network error"))
-        conn.session = session
-        result = await conn._fetch_and_parse_feed("https://feed.com/rss")
+        with _patch_fetch_raising(Exception("network error")):
+            result = await conn._fetch_and_parse_feed("https://feed.com/rss")
         assert result is None
 
 
