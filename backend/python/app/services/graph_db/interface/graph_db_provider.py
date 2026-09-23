@@ -466,14 +466,14 @@ class IGraphDBProvider(ABC):
     ) -> dict[str, int]:
         """Compute traversal depth for each node relative to a parent.
 
-        For record/folder parents: traverses recordRelations
+        For record/folder parents: traverses nodeRelations
         (PARENT_CHILD / ATTACHMENT) edges.
 
         For recordGroup parents: records belonging to the group are
-        level 1; their children via recordRelations are level 2+.
+        level 1; their children via nodeRelations are level 2+.
 
         For app parents: records directly under the connector's record
-        groups are level 1; their children via recordRelations are level 2+.
+        groups are level 1; their children via nodeRelations are level 2+.
 
         Returns ``{node_id: depth}`` for every reachable node_id.
         Unreachable IDs are omitted.
@@ -1183,7 +1183,7 @@ class IGraphDBProvider(ABC):
         """
         pass
 
-    async def get_record_relations_batch(
+    async def get_node_relations_batch(
         self,
         record_ids: list[str],
         relation_types: list[str],
@@ -3022,7 +3022,7 @@ class IGraphDBProvider(ABC):
         provider that had simply not implemented it. Encoding the fallback once
         is the value; a provider that overrides this opts in, and one that does
         not keeps today's behaviour. Same reasoning as
-        ``get_record_relations_batch``.
+        ``get_node_relations_batch``.
 
         ``apps`` and ``kb`` scope the result: an implementation must narrow
         every set to ``requested_scope_ids(filters)`` and echo that scope in
@@ -3283,7 +3283,7 @@ class IGraphDBProvider(ABC):
         transaction: str | None = None
     ) -> tuple[int, bool]:
         """
-        Delete only sync-created edges for a connector (belongsTo, recordRelations,
+        Delete only sync-created edges for a connector (belongsTo, nodeRelations,
         permission, inheritPermissions, userAppRelation). Does not delete nodes or
         isOfType/indexing data. Used for full sync reset.
 
@@ -3420,51 +3420,6 @@ class IGraphDBProvider(ABC):
 
         Args:
             domains (List[Dict]): List of domain data
-            transaction (Optional[Any]): Optional transaction context
-        """
-        pass
-
-    @abstractmethod
-    async def batch_upsert_anyone(
-        self,
-        anyone: list[dict],
-        transaction: str | None = None
-    ) -> None:
-        """
-        Batch upsert 'anyone' permission entities.
-
-        Args:
-            anyone (List[Dict]): List of anyone entities
-            transaction (Optional[Any]): Optional transaction context
-        """
-        pass
-
-    @abstractmethod
-    async def batch_upsert_anyone_with_link(
-        self,
-        anyone_with_link: list[dict],
-        transaction: str | None = None
-    ) -> None:
-        """
-        Batch upsert 'anyone with link' permission entities.
-
-        Args:
-            anyone_with_link (List[Dict]): List of anyone with link entities
-            transaction (Optional[Any]): Optional transaction context
-        """
-        pass
-
-    @abstractmethod
-    async def batch_upsert_anyone_same_org(
-        self,
-        anyone_same_org: list[dict],
-        transaction: str | None = None
-    ) -> None:
-        """
-        Batch upsert 'anyone same org' permission entities.
-
-        Args:
-            anyone_same_org (List[Dict]): List of anyone same org entities
             transaction (Optional[Any]): Optional transaction context
         """
         pass
@@ -3652,10 +3607,44 @@ class IGraphDBProvider(ABC):
         records linked via PARENT_CHILD survive (e.g. stories under a deleted epic).
         Survivors whose ``externalParentId`` points at a deleted root have that
         field cleared to null only if they already ``BELONGS_TO`` a RecordGroup.
+        Each such survivor is reported under the ``reparented`` key as
+        ``{record_id, record_group_id}``, because the edge sweep below removes the
+        hierarchy and inheritance edges that pointed at the deleted parent and the
+        caller must re-point them at the record group (decision 73).
 
         All edges touching the deleted nodes are swept regardless of
         *cascade_children*, type docs removed, and a deleteRecord event emitted per
         record that carries a virtualRecordId (Qdrant cleanup).
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def migrate_legacy_relation_edge(
+        self,
+        legacy_collection: str,
+        legacy_relationship_type: str,
+    ) -> dict:
+        """Move the hierarchy edge onto its current name (decision 74).
+
+        The legacy names are passed in rather than referenced here, so the only
+        module naming them is the migration that owns the rename; a guard test
+        keeps them from reappearing anywhere else.
+
+        Each backend needs a different operation for the same outcome: Arango
+        renames the collection (the named graph's edge definitions follow it),
+        while Neo4j has no rename for a relationship type and must recreate each
+        edge under the new type.
+
+        Idempotent: a store already on the new name reports
+        ``already_current`` and changes nothing, so a fresh install and a re-run
+        both cost nothing.
+
+        Args:
+            legacy_collection (str): Pre-rename ArangoDB edge collection name.
+            legacy_relationship_type (str): Pre-rename Neo4j relationship type.
+
+        Returns:
+            Dict: {"migrated": int, "already_current": bool}
         """
         raise NotImplementedError
 
@@ -4316,6 +4305,123 @@ class IGraphDBProvider(ABC):
 
         Returns:
             Dict with 'nodes' list and 'total' count
+        """
+        pass
+
+    # ==================== Knowledge Hub v2 ====================
+    #
+    # The permission-model read queries. They differ from the methods above in
+    # three ways that matter to a caller: they take the user's grantees and
+    # gated Apps as inputs (resolved once per request by
+    # `get_knowledge_hub_access_context_v2`) rather than deriving them per
+    # query; they page by keyset rather than by skip; and they **raise** on
+    # failure rather than returning an empty page, because an empty listing is
+    # indistinguishable from "you may see nothing here".
+
+    @abstractmethod
+    async def get_knowledge_hub_root_nodes_v2(
+        self,
+        user_key: str,
+        org_id: str,
+        user_app_ids: list[str],
+        limit: int,
+        sort_field: str = "name",
+        sort_dir: str = "ASC",
+        *,
+        after: dict[str, Any] | None = None,
+        origins: list[str] | None = None,
+        node_types: list[str] | None = None,
+        only_containers: bool = False,
+        search_query: str | None = None,
+        record_types: list[str] | None = None,
+        indexing_status: list[str] | None = None,
+        created_at: dict[str, int | None] | None = None,
+        updated_at: dict[str, int | None] | None = None,
+        size: dict[str, int | None] | None = None,
+        connector_ids: list[str] | None = None,
+        direction: str = "next",
+        include_ids: bool = False,
+        transaction: str | None = None,
+    ) -> dict[str, Any]:
+        """The root listing (Apps), and a global search's Apps partition.
+
+        Returns the partitioned envelope every v2 read returns:
+        ``{"partitions": [{partitionId, partitionKind, appId, rows, hasMore,
+        exhausted, total, countsByType, ids}], "scope": ...}``. Each row carries
+        the comparator's own ``sortKey``/``nullRank``, which is what lets the
+        cursor and the cross-partition merge use one ordering rather than two
+        implementations of it.
+        """
+        pass
+
+    @abstractmethod
+    async def get_knowledge_hub_children_v2(
+        self,
+        user_key: str,
+        org_id: str,
+        parent_id: str,
+        limit: int,
+        grantee_ids: list[str],
+        gated_app_ids: list[str],
+        sort_field: str = "name",
+        sort_dir: str = "ASC",
+        *,
+        after: dict[str, Any] | None = None,
+        only_containers: bool = False,
+        via_parent_id: str | None = None,
+        flatten: bool = False,
+        search_query: str | None = None,
+        node_types: list[str] | None = None,
+        record_types: list[str] | None = None,
+        indexing_status: list[str] | None = None,
+        created_at: dict[str, int | None] | None = None,
+        updated_at: dict[str, int | None] | None = None,
+        size: dict[str, int | None] | None = None,
+        origins: list[str] | None = None,
+        connector_ids: list[str] | None = None,
+        record_group_ids: list[str] | None = None,
+        partition: str | None = None,
+        direction: str = "next",
+        include_ids: bool = False,
+        transaction: str | None = None,
+    ) -> dict[str, Any]:
+        """Browse one level, flatten a subtree, or run one partition of a search.
+
+        One method because all three are the same traversal under different
+        arms: ``flatten`` switches depth, ``partition`` ("group" or
+        "app_direct") switches to the partition rules, and admission, placement
+        and breadcrumbs are identical in each.
+
+        ``scope`` carries ``currentNode``, ``parentNode`` and the breadcrumb
+        trail from the same query (D5, D58). A start node the user may not open
+        returns ``admitted: false`` and no names at all — the caller answers 404
+        with a constant body, so the response never confirms the node exists.
+        """
+        pass
+
+    @abstractmethod
+    async def get_knowledge_hub_partitions_v2(
+        self,
+        org_id: str,
+        gated_app_ids: list[str],
+        *,
+        transaction: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """The partitions a global search runs, as ``{partitionId, partitionKind, appId}``."""
+        pass
+
+    @abstractmethod
+    async def get_knowledge_hub_access_context_v2(
+        self,
+        user_key: str,
+        org_id: str,
+        *,
+        transaction: str | None = None,
+    ) -> dict[str, list[str]]:
+        """``{"grantee_ids": [...], "gated_app_ids": [...]}`` for one request.
+
+        Every other v2 method takes both, so they are resolved once here instead
+        of re-derived inside each query.
         """
         pass
 
@@ -5126,7 +5232,7 @@ class IGraphDBProvider(ABC):
               },
               "parents": {
                 "<child_id>": [
-                  {"parent_id": str, "parent_type": str, "via": "recordRelations"|"belongsTo"},
+                  {"parent_id": str, "parent_type": str, "via": "nodeRelations"|"belongsTo"},
                   ...
                 ],
               },

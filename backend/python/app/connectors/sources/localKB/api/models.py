@@ -9,12 +9,25 @@ from app.config.constants.arangodb import ProgressStatus
 
 
 class PermissionRole(str, Enum):
-    """Valid permission roles for knowledge base access"""
+    """Roles a stored KB grant may carry.
+
+    ORGANIZER, FILEORGANIZER and COMMENTER are retired (decision 41) and can no
+    longer be granted — see GrantablePermissionRole — but they stay here so
+    grants already stored with them still deserialise and read as access
+    (decision 60). A later migration rewrites them to READER.
+    """
     OWNER = "OWNER"
     ORGANIZER = "ORGANIZER"
     FILEORGANIZER = "FILEORGANIZER"
     WRITER = "WRITER"
     COMMENTER = "COMMENTER"
+    READER = "READER"
+
+
+class GrantablePermissionRole(str, Enum):
+    """Roles a new grant may use (decision 41)."""
+    OWNER = "OWNER"
+    WRITER = "WRITER"
     READER = "READER"
 
 
@@ -74,7 +87,7 @@ class CreatePermissionRequest(BaseModel):
     requesterId : str = Field(..., description ="User id granting others access", min_length=1)
     userIds: Optional[List[str]] = Field(None, description="List of user IDs to grant permissions to", min_items=0)
     teamIds: Optional[List[str]] = Field(None, description="List of team IDs to grant permissions to", min_items=0)
-    role: PermissionRole = Field(..., description="Role to grant")
+    role: GrantablePermissionRole = Field(..., description="Role to grant")
 
 
 class UpdatePermissionRequest(BaseModel):
@@ -82,7 +95,7 @@ class UpdatePermissionRequest(BaseModel):
     requesterId : str = Field(..., description ="User id granting others access", min_length=1)
     userIds : Optional[List[str]] = Field(None, description ="User id", min_items=0)
     teamIds : Optional[List[str]] = Field(None, description ="Team id", min_items=0)
-    role: PermissionRole = Field(..., description="New role")
+    role: GrantablePermissionRole = Field(..., description="New role")
 
 class RemovePermissionRequest(BaseModel):
     """Request model for removing a permission"""

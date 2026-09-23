@@ -56,12 +56,26 @@ class ItemPermission(BaseModel):
     canEdit: bool = Field(..., description="Whether user can edit this item")
     canDelete: bool = Field(..., description="Whether user can delete this item")
 
+class ParentRef(BaseModel):
+    """The parent a node is listed under.
+
+    The type is what makes it addressable: browsing to it needs
+    `/nodes/{parentType}/{parentId}`, and a client that only has the id has to
+    guess. Under the v2 permission model the listed parent is the node's
+    *placement* parent, which is not always its storage parent — an
+    inaccessible ancestor is replaced, never named.
+    """
+    id: str = Field(..., description="Parent node ID")
+    nodeType: str = Field(..., description="Parent node type (app, recordGroup, folder, record)")
+    name: Optional[str] = Field(None, description="Parent display name")
+
 class NodeItem(BaseModel):
     """Response model for a single node in the knowledge hub hierarchy"""
     id: str = Field(..., description="Unique identifier for the node")
     name: str = Field(..., description="Display name of the node")
     nodeType: NodeType = Field(..., description="Type of the node")
     parentId: Optional[str] = Field(None, description="ID of the parent node")
+    parent: Optional[ParentRef] = Field(None, description="The parent this node is listed under")
     origin: OriginType = Field(..., description="Origin type (COLLECTION or CONNECTOR)")
     connector: Optional[str] = Field(None, description="Connector name (only for CONNECTOR origin)")
     recordType: Optional[str] = Field(None, description="Record type (only when nodeType is record)")
@@ -106,13 +120,25 @@ class BreadcrumbItem(BaseModel):
         exclude_none = True
 
 class PaginationInfo(BaseModel):
-    """Response model for pagination information"""
-    page: int = Field(..., description="Current page number")
+    """Pagination, carrying both the page shape and the cursor shape.
+
+    The cursor fields are the contract going forward (§3.9): keyset paging has
+    no page number to report, and `prevCursor` is exact where `page - 1` was
+    only approximately the page the user came from. `page` and `totalPages`
+    stay, optional, until the frontend moves (D22) — a client reading them
+    today must not start getting nulls.
+    """
     limit: int = Field(..., description="Items per page")
     totalItems: int = Field(..., description="Total number of items")
-    totalPages: int = Field(..., description="Total number of pages")
     hasNext: bool = Field(..., description="Whether there is a next page")
     hasPrev: bool = Field(..., description="Whether there is a previous page")
+    startIndex: Optional[int] = Field(None, description="1-based index of the first item on this page")
+    endIndex: Optional[int] = Field(None, description="1-based index of the last item on this page")
+    currentPageItems: Optional[int] = Field(None, description="Number of items on this page")
+    nextCursor: Optional[str] = Field(None, description="Opaque cursor for the next page")
+    prevCursor: Optional[str] = Field(None, description="Opaque cursor for the previous page")
+    page: Optional[int] = Field(None, description="Current page number (legacy, being removed)")
+    totalPages: Optional[int] = Field(None, description="Total number of pages (legacy, being removed)")
 
 class FilterOption(BaseModel):
     """Response model for a filter option"""

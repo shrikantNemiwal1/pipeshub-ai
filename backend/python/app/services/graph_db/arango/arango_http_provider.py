@@ -122,7 +122,7 @@ from app.schema.arango.edges import (
     member_of_schema,
     permissions_schema,
     prospect_schema,
-    record_relations_schema,
+    node_relations_schema,
     sold_in_schema,
     toolset_has_tool_schema,
     user_app_relation_schema,
@@ -152,6 +152,8 @@ from app.services.graph_db.vector_membership_queries import (
     build_page_records_for_vector_membership_backfill_aql,
     can_use_membership_cleanup,
 )
+from app.utils.kh_breadcrumbs import browse_scope
+from app.utils.kh_partitions import build_partitions
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
 if TYPE_CHECKING:
@@ -215,7 +217,7 @@ NODE_COLLECTIONS = [
 
 EDGE_COLLECTIONS = [
     (CollectionNames.IS_OF_TYPE.value, is_of_type_schema),
-    (CollectionNames.RECORD_RELATIONS.value, record_relations_schema),
+    (CollectionNames.NODE_RELATIONS.value, node_relations_schema),
     (CollectionNames.ENTITY_RELATIONS.value, entity_relations_schema),
     (CollectionNames.USER_DRIVE_RELATION.value, user_drive_relation_schema),
     (CollectionNames.BELONGS_TO_DEPARTMENT.value, basic_edge_schema),
@@ -279,7 +281,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 "allowed_roles": ["OWNER", "WRITER", "FILEORGANIZER"],
                 "edge_collections": [
                     CollectionNames.IS_OF_TYPE.value,
-                    CollectionNames.RECORD_RELATIONS.value,
+                    CollectionNames.NODE_RELATIONS.value,
                     CollectionNames.PERMISSION.value,
                     CollectionNames.USER_DRIVE_RELATION.value,
                     CollectionNames.BELONGS_TO.value,
@@ -294,7 +296,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 "allowed_roles": ["OWNER", "WRITER"],
                 "edge_collections": [
                     CollectionNames.IS_OF_TYPE.value,
-                    CollectionNames.RECORD_RELATIONS.value,
+                    CollectionNames.NODE_RELATIONS.value,
                     CollectionNames.PERMISSION.value,
                     CollectionNames.BELONGS_TO.value,
                 ],
@@ -308,7 +310,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 "allowed_roles": ["OWNER", "WRITER"],
                 "edge_collections": [
                     CollectionNames.IS_OF_TYPE.value,
-                    CollectionNames.RECORD_RELATIONS.value,
+                    CollectionNames.NODE_RELATIONS.value,
                     CollectionNames.PERMISSION.value,
                     CollectionNames.BELONGS_TO.value,
                 ],
@@ -322,7 +324,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 "allowed_roles": ["OWNER", "WRITER", "FILEORGANIZER"],
                 "edge_collections": [
                     CollectionNames.IS_OF_TYPE.value,
-                    CollectionNames.RECORD_RELATIONS.value,
+                    CollectionNames.NODE_RELATIONS.value,
                     CollectionNames.BELONGS_TO.value,
                     CollectionNames.PERMISSION.value,
                 ],
@@ -624,6 +626,46 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 edge_col = desired["edge_collection"]
                 existing = existing_by_collection.get(edge_col)
                 if not existing:
+                    # A collection the graph does not know about yet — notably
+                    # one that arrived under a new name from the rename
+                    # migration. Until it is registered, traversals over
+                    # GRAPH @graph_name cannot cross it, and delete_nodes_and_edges
+                    # enumerates edge collections from the graph definition, so
+                    # deleting a node would leave every such edge dangling.
+                    url = (
+                        f"{self.http_client.base_url}/_db/{self.http_client.database}"
+                        f"/_api/gharial/{graph_name}/edge"
+                    )
+                    payload = {
+                        "collection": edge_col,
+                        "from": sorted(desired.get("from_vertex_collections", [])),
+                        "to": sorted(desired.get("to_vertex_collections", [])),
+                    }
+                    session = await self.http_client._get_session()
+                    async with session.post(url, json=payload) as resp:
+                        if resp.status in (200, 201, 202):
+                            self.logger.info(
+                                "Added edge definition '%s' to graph '%s'",
+                                edge_col, graph_name,
+                            )
+                        elif resp.status == 409:
+                            # Already registered by a concurrent starter.
+                            self.logger.debug(
+                                "Edge definition '%s' already present", edge_col,
+                            )
+                        else:
+                            body = await resp.text()
+                            # error, not warning: an unregistered edge collection
+                            # is invisible to GRAPH traversals and to
+                            # delete_nodes_and_edges, which enumerates edge
+                            # collections from the graph definition — so deletes
+                            # silently leave its edges dangling.
+                            self.logger.error(
+                                "Could not register edge definition '%s' on graph "
+                                "'%s' (%d): %s — traversals and cascading deletes "
+                                "will not see this collection",
+                                edge_col, graph_name, resp.status, body,
+                            )
                     continue
                 desired_to = set(desired.get("to_vertex_collections", []))
                 existing_to = set(existing.get("to", []))
@@ -1055,7 +1097,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     FOR rg_id IN rg_ids
                         FOR top IN 1..1 INBOUND rg_id {CollectionNames.BELONGS_TO.value}
                             FILTER IS_SAME_COLLECTION("records", top)
-                            FOR v, e, p IN 1..{record_depth} OUTBOUND top {CollectionNames.RECORD_RELATIONS.value}
+                            FOR v, e, p IN 1..{record_depth} OUTBOUND top {CollectionNames.NODE_RELATIONS.value}
                                 OPTIONS {{bfs: true, uniqueVertices: "global"}}
                                 FILTER ALL(edge IN p.edges, edge.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"])
                                 FILTER v._key IN @node_ids
@@ -1083,7 +1125,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 LET deeper = (
                     FOR top IN 1..1 INBOUND rg_doc_id {CollectionNames.BELONGS_TO.value}
                         FILTER IS_SAME_COLLECTION("records", top)
-                        FOR v, e, p IN 1..{record_depth} OUTBOUND top {CollectionNames.RECORD_RELATIONS.value}
+                        FOR v, e, p IN 1..{record_depth} OUTBOUND top {CollectionNames.NODE_RELATIONS.value}
                             OPTIONS {{bfs: true, uniqueVertices: "global"}}
                             FILTER ALL(edge IN p.edges, edge.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"])
                             FILTER v._key IN @node_ids
@@ -1102,7 +1144,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 query = f"""
                 LET parent = DOCUMENT(CONCAT("records/", @parent_id))
                 FILTER parent != null
-                FOR v, e, p IN 1..{safe_depth} OUTBOUND parent {CollectionNames.RECORD_RELATIONS.value}
+                FOR v, e, p IN 1..{safe_depth} OUTBOUND parent {CollectionNames.NODE_RELATIONS.value}
                     OPTIONS {{bfs: true, uniqueVertices: "global"}}
                     FILTER ALL(edge IN p.edges, edge.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"])
                     FILTER v._key IN @node_ids
@@ -2479,7 +2521,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
             self.logger.error(f"❌ Batch entity relation creation failed: {str(e)}")
             raise
 
-    async def batch_upsert_record_relations(
+    async def batch_upsert_node_relations(
         self,
         edges: list[dict],
         transaction: Optional[str] = None
@@ -2517,7 +2559,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
             """
             bind_vars = {
                 "edges": arango_edges,
-                "@collection": CollectionNames.RECORD_RELATIONS.value
+                "@collection": CollectionNames.NODE_RELATIONS.value
             }
 
             results = await self.http_client.execute_aql(
@@ -3358,7 +3400,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         """
         Get full hierarchical path for a record by traversing graph bottom to top.
 
-        Traverses up through RECORD_RELATIONS edges (PARENT_CHILD relationship)
+        Traverses up through NODE_RELATIONS edges (PARENT_CHILD relationship)
         to build a path like: "Folder1/Subfolder/File.txt"
 
         Args:
@@ -3465,7 +3507,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         """
         try:
             query = f"""
-            FOR edge IN {CollectionNames.RECORD_RELATIONS.value}
+            FOR edge IN {CollectionNames.NODE_RELATIONS.value}
                 FILTER edge._to == CONCAT("records/", @record_id)
                 FILTER edge.relationshipType == @relation_type
                 RETURN {{
@@ -3509,7 +3551,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         """
         try:
             query = f"""
-            FOR edge IN {CollectionNames.RECORD_RELATIONS.value}
+            FOR edge IN {CollectionNames.NODE_RELATIONS.value}
                 FILTER edge._from == CONCAT("records/", @record_id)
                 FILTER edge.relationshipType == @relation_type
                 RETURN {{
@@ -3647,7 +3689,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
 
             LET result_1  = depth == 0 ? rec0 :
                 (FOR v, e, p IN 1..100 OUTBOUND rec0
-                    recordRelations
+                    nodeRelations
 
                     FILTER e.relationshipType == "PARENT_CHILD"
 
@@ -4170,7 +4212,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
     ) -> list[Record]:
         """
         Get all child records of a parent record (folder) up to a specified depth.
-        Uses graph traversal on recordRelations edge collection. Parent record is always included.
+        Uses graph traversal on nodeRelations edge collection. Parent record is always included.
 
         Args:
             parent_record_id: Record ID of the parent (folder)
@@ -4265,7 +4307,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
             FILTER startRecord != null
 
             // Single traversal for parent (depth 0) and all children (depth 1+)
-            FOR v, e, p IN 0..@max_depth OUTBOUND startRecord {CollectionNames.RECORD_RELATIONS.value}
+            FOR v, e, p IN 0..@max_depth OUTBOUND startRecord {CollectionNames.NODE_RELATIONS.value}
                 OPTIONS {{bfs: true, uniqueVertices: "global"}}
 
                 FILTER v.connectorId == @connector_id
@@ -5461,7 +5503,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         """
         Create a relation edge between two records.
 
-        Generic implementation that creates RECORD_RELATIONS edge.
+        Generic implementation that creates NODE_RELATIONS edge.
 
         Args:
             from_record_id: Source record ID
@@ -5479,7 +5521,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
 
         await self.batch_create_edges(
             [record_edge],
-            collection=CollectionNames.RECORD_RELATIONS.value,
+            collection=CollectionNames.NODE_RELATIONS.value,
             transaction=transaction
         )
 
@@ -5755,6 +5797,68 @@ class ArangoHTTPProvider(IGraphDBProvider):
         except Exception as e:
             self.logger.error(f"❌ Get legacy KB record groups failed: {str(e)}")
             return []
+
+    async def migrate_legacy_relation_edge(
+        self,
+        legacy_collection: str,
+        legacy_relationship_type: str,
+    ) -> dict:
+        """Rename the hierarchy edge collection (decision 74).
+
+        A rename is enough here, and is graph-safe: ArangoDB updates the named
+        graph's edge definitions to the new name itself, so no gharial repair
+        follows. `legacy_relationship_type` is unused — it is Neo4j's half.
+
+        The both-exist branch is not defensive padding. `ensure_schema()` is not
+        exclusive to this service, so another one reaching it first on an
+        upgraded deployment creates an empty collection under the new name while
+        the edges still sit under the old one. A plain rename would then fail on
+        the taken name and leave the application reading the empty collection.
+        """
+        current = CollectionNames.NODE_RELATIONS.value
+        try:
+            legacy_exists = await self.http_client.collection_exists(legacy_collection)
+            current_exists = await self.http_client.collection_exists(current)
+
+            if not legacy_exists:
+                return {"migrated": 0, "already_current": True}
+
+            if not current_exists:
+                if not await self.http_client.rename_collection(legacy_collection, current):
+                    raise Exception(
+                        f"Could not rename '{legacy_collection}' to '{current}'"
+                    )
+                count = await self.execute_query(
+                    "RETURN LENGTH(@@edges)", bind_vars={"@edges": current}
+                )
+                migrated = (count or [0])[0] or 0
+                self.logger.info(
+                    f"Renamed '{legacy_collection}' to '{current}' ({migrated} edge(s))"
+                )
+                return {"migrated": migrated, "already_current": False}
+
+            # Both exist: fold the legacy edges into the current collection,
+            # keeping _key so a re-run cannot duplicate them, then drop it.
+            moved = await self.execute_query(
+                "LET moved = ("
+                "  FOR e IN @@legacy"
+                "    INSERT UNSET(e, '_id', '_rev') INTO @@current"
+                "    OPTIONS { overwriteMode: 'replace' }"
+                "    RETURN 1"
+                ") RETURN LENGTH(moved)",
+                bind_vars={"@legacy": legacy_collection, "@current": current},
+            )
+            migrated = (moved or [0])[0] or 0
+            if not await self.http_client.delete_collection(legacy_collection):
+                raise Exception(f"Moved {migrated} edge(s) but could not drop '{legacy_collection}'")
+            self.logger.info(
+                f"Merged {migrated} edge(s) from '{legacy_collection}' into '{current}'"
+            )
+            return {"migrated": migrated, "already_current": False}
+
+        except Exception as e:
+            self.logger.error(f"❌ Legacy relation edge migration failed: {str(e)}")
+            raise
 
     async def migrate_legacy_kb_to_app(
         self,
@@ -6542,7 +6646,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
 
             query = f"""
             LET relations = (
-                FOR rel IN {CollectionNames.RECORD_RELATIONS.value}
+                FOR rel IN {CollectionNames.NODE_RELATIONS.value}
                     FILTER rel._to == @record_id
                     RETURN rel._from
             )
@@ -7093,66 +7197,6 @@ class ArangoHTTPProvider(IGraphDBProvider):
             self.logger.error(f"❌ Batch upsert domains failed: {str(e)}")
             raise
 
-    async def batch_upsert_anyone(
-        self,
-        anyone: list[dict],
-        transaction: str | None = None
-    ) -> None:
-        """Batch upsert anyone entities"""
-        try:
-            if not anyone:
-                return
-
-            await self.batch_upsert_nodes(
-                anyone,
-                collection=CollectionNames.ANYONE.value,
-                transaction=transaction
-            )
-
-        except Exception as e:
-            self.logger.error(f"❌ Batch upsert anyone failed: {str(e)}")
-            raise
-
-    async def batch_upsert_anyone_with_link(
-        self,
-        anyone_with_link: list[dict],
-        transaction: str | None = None
-    ) -> None:
-        """Batch upsert anyone with link"""
-        try:
-            if not anyone_with_link:
-                return
-
-            await self.batch_upsert_nodes(
-                anyone_with_link,
-                collection=CollectionNames.ANYONE_WITH_LINK.value,
-                transaction=transaction
-            )
-
-        except Exception as e:
-            self.logger.error(f"❌ Batch upsert anyone with link failed: {str(e)}")
-            raise
-
-    async def batch_upsert_anyone_same_org(
-        self,
-        anyone_same_org: list[dict],
-        transaction: str | None = None
-    ) -> None:
-        """Batch upsert anyone same org"""
-        try:
-            if not anyone_same_org:
-                return
-
-            await self.batch_upsert_nodes(
-                anyone_same_org,
-                collection=CollectionNames.ANYONE_SAME_ORG.value,
-                transaction=transaction
-            )
-
-        except Exception as e:
-            self.logger.error(f"❌ Batch upsert anyone same org failed: {str(e)}")
-            raise
-
     async def batch_create_user_app_edges(
         self,
         edges: list[dict]
@@ -7680,7 +7724,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
 
             # Define all edge collections used in the graph
             EDGE_COLLECTIONS = [
-                CollectionNames.RECORD_RELATIONS.value,
+                CollectionNames.NODE_RELATIONS.value,
                 CollectionNames.BELONGS_TO.value,
                 CollectionNames.BELONGS_TO_DEPARTMENT.value,
                 CollectionNames.BELONGS_TO_CATEGORY.value,
@@ -8440,7 +8484,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
 
             sync_edge_collections = [
                 CollectionNames.BELONGS_TO.value,
-                CollectionNames.RECORD_RELATIONS.value,
+                CollectionNames.NODE_RELATIONS.value,
                 CollectionNames.PERMISSION.value,
                 CollectionNames.INHERIT_PERMISSIONS.value,
                 CollectionNames.USER_APP_RELATION.value,
@@ -10268,7 +10312,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 edge_collections = [
                     CollectionNames.PERMISSION.value,
                     CollectionNames.BELONGS_TO.value,
-                    CollectionNames.RECORD_RELATIONS.value,
+                    CollectionNames.NODE_RELATIONS.value,
                     CollectionNames.INHERIT_PERMISSIONS.value,
                     CollectionNames.IS_OF_TYPE.value,
                     CollectionNames.USER_APP_RELATION.value,
@@ -11099,7 +11143,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     FILTER record != null
                     FILTER record.isDeleted != true
                     LET isChild = LENGTH(
-                        FOR relEdge IN @@record_relations
+                        FOR relEdge IN @@node_relations
                             FILTER relEdge._to == record._id
                             FILTER relEdge.relationshipType == "PARENT_CHILD"
                             RETURN 1
@@ -11119,7 +11163,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     FILTER folder_file != null
                     {folder_filter}
                     LET direct_subfolders = LENGTH(
-                        FOR relEdge IN @@record_relations
+                        FOR relEdge IN @@node_relations
                             FILTER relEdge._from == record._id
                             FILTER relEdge.relationshipType == "PARENT_CHILD"
                             LET child_record = DOCUMENT(relEdge._to)
@@ -11135,7 +11179,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                             RETURN 1
                     )
                     LET direct_records = LENGTH(
-                        FOR relEdge IN @@record_relations
+                        FOR relEdge IN @@node_relations
                             FILTER relEdge._from == record._id
                             FILTER relEdge.relationshipType == "PARENT_CHILD"
                             LET child_record = DOCUMENT(relEdge._to)
@@ -11274,7 +11318,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 "level": level,
                 "kb_connector_type": Connectors.KNOWLEDGE_BASE.value,
                 "@belongs_to": CollectionNames.BELONGS_TO.value,
-                "@record_relations": CollectionNames.RECORD_RELATIONS.value,
+                "@node_relations": CollectionNames.NODE_RELATIONS.value,
                 "@is_of_type": CollectionNames.IS_OF_TYPE.value,
                 **filter_vars,
             }
@@ -11382,7 +11426,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
             )
             FILTER folder_file != null
             LET allSubfolders = (
-                FOR v, e, p IN 1..@level OUTBOUND folder_record._id @@record_relations
+                FOR v, e, p IN 1..@level OUTBOUND folder_record._id @@node_relations
                     FILTER e.relationshipType == "PARENT_CHILD"
                     LET subfolder_record = v
                     LET subfolder_file = FIRST(
@@ -11396,7 +11440,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     LET current_level = LENGTH(p.edges)
                     {folder_filter}
                     LET direct_subfolders = LENGTH(
-                        FOR relEdge IN @@record_relations
+                        FOR relEdge IN @@node_relations
                             FILTER relEdge._from == subfolder_record._id
                             FILTER relEdge.relationshipType == "PARENT_CHILD"
                             LET child_record = DOCUMENT(relEdge._to)
@@ -11412,7 +11456,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                             RETURN 1
                     )
                     LET direct_records = LENGTH(
-                        FOR relEdge IN @@record_relations
+                        FOR relEdge IN @@node_relations
                             FILTER relEdge._from == subfolder_record._id
                             FILTER relEdge.relationshipType == "PARENT_CHILD"
                             LET record = DOCUMENT(relEdge._to)
@@ -11447,7 +11491,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     }}
             )
             LET allRecords = (
-                FOR edge IN @@record_relations
+                FOR edge IN @@node_relations
                     FILTER edge._from == folder_record._id
                     FILTER edge.relationshipType == "PARENT_CHILD"
                     LET record = DOCUMENT(edge._to)
@@ -11554,7 +11598,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 "skip": skip,
                 "limit": limit,
                 "level": level,
-                "@record_relations": CollectionNames.RECORD_RELATIONS.value,
+                "@node_relations": CollectionNames.NODE_RELATIONS.value,
                 "@is_of_type": CollectionNames.IS_OF_TYPE.value,
                 **filter_vars,
             }
@@ -11612,7 +11656,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
             if parent_folder_id:
                 parent_from = f"{CollectionNames.RECORDS.value}/{parent_folder_id}"
                 query = """
-                FOR edge IN @@record_relations
+                FOR edge IN @@node_relations
                     FILTER edge._from == @parent_from
                     FILTER edge.relationshipType == "PARENT_CHILD"
                     FILTER edge._to LIKE "records/%"
@@ -11625,7 +11669,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 """
                 bind_vars: dict[str, Any] = {
                     "parent_from": parent_from,
-                    "@record_relations": CollectionNames.RECORD_RELATIONS.value,
+                    "@node_relations": CollectionNames.NODE_RELATIONS.value,
                     "@files_collection": CollectionNames.FILES.value,
                 }
             else:
@@ -11640,7 +11684,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     LET file_doc = DOCUMENT(@@files_collection, child._key)
                     FILTER file_doc != null AND file_doc.isFile == true
                     LET parent_edge = FIRST(
-                        FOR pc IN @@record_relations
+                        FOR pc IN @@node_relations
                             FILTER pc._to == child._id
                             FILTER pc.relationshipType == "PARENT_CHILD"
                             LIMIT 1
@@ -11652,7 +11696,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 bind_vars = {
                     "parent_from": parent_from,
                     "@belongs_to": CollectionNames.BELONGS_TO.value,
-                    "@record_relations": CollectionNames.RECORD_RELATIONS.value,
+                    "@node_relations": CollectionNames.NODE_RELATIONS.value,
                     "@files_collection": CollectionNames.FILES.value,
                 }
             results = await self.execute_query(query, bind_vars=bind_vars, transaction=transaction)
@@ -11950,7 +11994,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     FILTER folder_record.isDeleted != true
                     FILTER @exclude_folder_id == null OR folder_record._key != @exclude_folder_id
                     LET isChild = LENGTH(
-                        FOR relEdge IN @@record_relations
+                        FOR relEdge IN @@node_relations
                             FILTER relEdge._to == folder_record._id
                             FILTER relEdge.relationshipType == "PARENT_CHILD"
                             RETURN 1
@@ -11980,7 +12024,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                         "kb_id": kb_id,
                         "exclude_folder_id": exclude_folder_id,
                         "@belongs_to": CollectionNames.BELONGS_TO.value,
-                        "@record_relations": CollectionNames.RECORD_RELATIONS.value,
+                        "@node_relations": CollectionNames.NODE_RELATIONS.value,
                         "@is_of_type": CollectionNames.IS_OF_TYPE.value,
                         "entity_type": Connectors.KNOWLEDGE_BASE.value,
                     },
@@ -11988,7 +12032,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 )
             else:
                 query = """
-                FOR edge IN @@record_relations
+                FOR edge IN @@node_relations
                     FILTER edge._from == @parent_from
                     FILTER edge.relationshipType == "PARENT_CHILD"
                     LET folder_record = DOCUMENT(edge._to)
@@ -12017,7 +12061,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                         "parent_from": parent_from,
                         "name_variants": name_variants,
                         "exclude_folder_id": exclude_folder_id,
-                        "@record_relations": CollectionNames.RECORD_RELATIONS.value,
+                        "@node_relations": CollectionNames.NODE_RELATIONS.value,
                         "@is_of_type": CollectionNames.IS_OF_TYPE.value,
                     },
                     transaction=transaction,
@@ -12051,7 +12095,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     FILTER file_record.isDeleted != true
                     FILTER @exclude_record_id == null OR file_record._key != @exclude_record_id
                     LET parent_edge = FIRST(
-                        FOR pc IN @@record_relations
+                        FOR pc IN @@node_relations
                             FILTER pc._to == file_record._id
                             FILTER pc.relationshipType == "PARENT_CHILD"
                             LIMIT 1
@@ -12075,13 +12119,13 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     "mime_type": mime_type_str,
                     "exclude_record_id": exclude_record_id,
                     "@belongs_to": CollectionNames.BELONGS_TO.value,
-                    "@record_relations": CollectionNames.RECORD_RELATIONS.value,
+                    "@node_relations": CollectionNames.NODE_RELATIONS.value,
                     "@files_collection": CollectionNames.FILES.value,
                 }
             else:
                 parent_from = f"records/{parent_folder_id}"
                 query = """
-                FOR edge IN @@record_relations
+                FOR edge IN @@node_relations
                     FILTER edge._from == @parent_from
                     FILTER edge.relationshipType == "PARENT_CHILD"
                     FILTER edge._to LIKE "records/%"
@@ -12105,7 +12149,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     "name_variants": name_variants,
                     "mime_type": mime_type_str,
                     "exclude_record_id": exclude_record_id,
-                    "@record_relations": CollectionNames.RECORD_RELATIONS.value,
+                    "@node_relations": CollectionNames.NODE_RELATIONS.value,
                     "@files_collection": CollectionNames.FILES.value,
                 }
             
@@ -12331,7 +12375,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 )
                 LET all_records = (
                     FOR root IN valid_roots
-                        FOR v, e, p IN 0..20 OUTBOUND root._id @@record_relations
+                        FOR v, e, p IN 0..20 OUTBOUND root._id @@node_relations
                             FILTER LENGTH(p.edges) == 0 OR p.edges[-1].relationshipType IN """ + traversal_types + """
                             RETURN DISTINCT v
                 )
@@ -12356,7 +12400,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     bind_vars={
                         "record_ids": record_ids,
                         "connector_id": connector_id,
-                        "@record_relations": CollectionNames.RECORD_RELATIONS.value,
+                        "@node_relations": CollectionNames.NODE_RELATIONS.value,
                         "@is_of_type": CollectionNames.IS_OF_TYPE.value,
                     },
                     transaction=txn_id,
@@ -12371,6 +12415,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     for rid in record_ids if rid not in valid_root_keys
                 ]
 
+                reparented: list[dict] = []
                 if not cascade_children and valid_root_keys:
                     valid_root_key_set = set(valid_root_keys)
                     parent_external_ids: list[str] = []
@@ -12385,21 +12430,27 @@ class ArangoHTTPProvider(IGraphDBProvider):
                         seen_parent_ids.add(peid)
                         parent_external_ids.append(peid)
                     if parent_external_ids:
+                        # The group is returned, not just tested for, because the
+                        # caller re-points each survivor's hierarchy and inheritance
+                        # at it (decision 73) — the edge sweep below removes the
+                        # ones that pointed at the deleted parent.
                         clear_orphan_parent_query = f"""
                         FOR rec IN @@records
                             FILTER rec.connectorId == @connector_id
                             FILTER rec.externalParentId != null
                             FILTER rec.externalParentId IN @parent_external_ids
                             FILTER rec._key NOT IN @deleted_keys
-                            FILTER LENGTH(
+                            LET rg_key = FIRST(
                                 FOR rg IN 1..1 OUTBOUND rec._id @@belongs_to
                                     FILTER IS_SAME_COLLECTION("{CollectionNames.RECORD_GROUPS.value}", rg)
                                     LIMIT 1
-                                    RETURN 1
-                            ) > 0
+                                    RETURN rg._key
+                            )
+                            FILTER rg_key != null
                             UPDATE rec WITH {{ externalParentId: null }} IN @@records
+                            RETURN {{ record_id: OLD._key, record_group_id: rg_key }}
                         """
-                        await self.execute_query(
+                        rows = await self.execute_query(
                             clear_orphan_parent_query,
                             bind_vars={
                                 "connector_id": connector_id,
@@ -12410,11 +12461,16 @@ class ArangoHTTPProvider(IGraphDBProvider):
                             },
                             transaction=txn_id,
                         )
+                        reparented = [
+                            {"record_id": r["record_id"], "record_group_id": r["record_group_id"]}
+                            for r in (rows or [])
+                            if r and r.get("record_id") and r.get("record_group_id")
+                        ]
 
                 node_ids = [f"records/{k}" for k in record_keys]
                 if node_ids:
                     # Dynamic edge sweep: remove every edge touching the deleted records
-                    # (recordRelations, isOfType, belongsTo, inheritPermissions, permission,
+                    # (nodeRelations, isOfType, belongsTo, inheritPermissions, permission,
                     # entityRelations, link relations, ...).
                     await self._delete_edges_by_node_ids(txn_id, node_ids, edge_collections)
                 if type_targets:
@@ -12458,6 +12514,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     "successfully_deleted": len(valid_root_keys),
                     "failed_count": len(failed_records),
                     "eventData": event_data,
+                    "reparented": reparented,
                 }
             except Exception as db_error:
                 if transaction is None and txn_id:
@@ -13240,8 +13297,8 @@ class ArangoHTTPProvider(IGraphDBProvider):
             if not user_perm:
                 return [], 0, {"recordTypes": [], "origins": [], "connectors": [], "indexingStatus": [], "permissions": [], "folders": []}
             filter_conditions = []
-            filter_bind: dict[str, Any] = {"kb_id": kb_id, "org_id": org_id, "user_permission": user_perm, "skip": skip, "limit": limit, "@belongs_to_kb": CollectionNames.BELONGS_TO.value, "@record_relations": CollectionNames.RECORD_RELATIONS.value, "@is_of_type": CollectionNames.IS_OF_TYPE.value}
-            filter_bind: dict[str, Any] = {"kb_id": kb_id, "org_id": org_id, "user_permission": user_perm, "skip": skip, "limit": limit, "@belongs_to_kb": CollectionNames.BELONGS_TO.value, "@record_relations": CollectionNames.RECORD_RELATIONS.value, "@is_of_type": CollectionNames.IS_OF_TYPE.value}
+            filter_bind: dict[str, Any] = {"kb_id": kb_id, "org_id": org_id, "user_permission": user_perm, "skip": skip, "limit": limit, "@belongs_to_kb": CollectionNames.BELONGS_TO.value, "@node_relations": CollectionNames.NODE_RELATIONS.value, "@is_of_type": CollectionNames.IS_OF_TYPE.value}
+            filter_bind: dict[str, Any] = {"kb_id": kb_id, "org_id": org_id, "user_permission": user_perm, "skip": skip, "limit": limit, "@belongs_to_kb": CollectionNames.BELONGS_TO.value, "@node_relations": CollectionNames.NODE_RELATIONS.value, "@is_of_type": CollectionNames.IS_OF_TYPE.value}
             if search:
                 filter_conditions.append("(LIKE(LOWER(record.recordName), @search) OR LIKE(LOWER(record.externalRecordId), @search))")
                 filter_bind["search"] = f"%{(search or '').lower()}%"
@@ -13281,7 +13338,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
             )
             LET folder_ids = kbFolders[*].folder._id
             LET all_records_data = (
-                FOR relEdge IN @@record_relations
+                FOR relEdge IN @@node_relations
                     FILTER relEdge._from IN folder_ids
                     FILTER relEdge.relationshipType == "PARENT_CHILD"
                     LET record = DOCUMENT(relEdge._to)
@@ -13315,7 +13372,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     {folder_filter}
                     RETURN belongsEdge._from
             )
-            LET record_count = (FOR relEdge IN @@record_relations FILTER relEdge._from IN folder_ids FILTER relEdge.relationshipType == "PARENT_CHILD" LET record = DOCUMENT(relEdge._to) FILTER record != null FILTER record.isDeleted != true FILTER record.orgId == @org_id {record_filter} COLLECT WITH COUNT INTO c RETURN c)
+            LET record_count = (FOR relEdge IN @@node_relations FILTER relEdge._from IN folder_ids FILTER relEdge.relationshipType == "PARENT_CHILD" LET record = DOCUMENT(relEdge._to) FILTER record != null FILTER record.isDeleted != true FILTER record.orgId == @org_id {record_filter} COLLECT WITH COUNT INTO c RETURN c)
             RETURN FIRST(record_count) || 0
             """
             count_results = await self.execute_query(count_query, bind_vars=filter_bind)
@@ -13522,7 +13579,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
     ) -> list[str]:
         """Get attachment IDs for a record."""
         attachments_query = f"""
-        FOR edge IN {CollectionNames.RECORD_RELATIONS.value}
+        FOR edge IN {CollectionNames.NODE_RELATIONS.value}
             FILTER edge._from == @record_from
             AND edge.relationshipType == 'ATTACHMENT'
             RETURN PARSE_IDENTIFIER(edge._to).key
@@ -13545,12 +13602,12 @@ class ArangoHTTPProvider(IGraphDBProvider):
         record_key = record_id
 
         # Delete all edges FROM this record
-        await self.delete_edges_from(record_key, CollectionNames.RECORDS.value, CollectionNames.RECORD_RELATIONS.value, transaction)
+        await self.delete_edges_from(record_key, CollectionNames.RECORDS.value, CollectionNames.NODE_RELATIONS.value, transaction)
         await self.delete_edges_from(record_key, CollectionNames.RECORDS.value, CollectionNames.IS_OF_TYPE.value, transaction)
         await self.delete_edges_from(record_key, CollectionNames.RECORDS.value, CollectionNames.BELONGS_TO.value, transaction)
 
         # Delete all edges TO this record
-        await self.delete_edges_to(record_key, CollectionNames.RECORDS.value, CollectionNames.RECORD_RELATIONS.value, transaction)
+        await self.delete_edges_to(record_key, CollectionNames.RECORDS.value, CollectionNames.NODE_RELATIONS.value, transaction)
         await self.delete_edges_to(record_key, CollectionNames.RECORDS.value, CollectionNames.PERMISSION.value, transaction)
 
         # Delete type-specific documents (files, mails, etc.)
@@ -13571,7 +13628,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         try:
             # Get attachments (child records with ATTACHMENT relation)
             attachments_query = f"""
-            FOR edge IN {CollectionNames.RECORD_RELATIONS.value}
+            FOR edge IN {CollectionNames.NODE_RELATIONS.value}
                 FILTER edge._from == @record_from
                     AND edge.relationshipType == 'ATTACHMENT'
                 RETURN PARSE_IDENTIFIER(edge._to).key
@@ -13626,7 +13683,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 "filter": "edge._from == @record_from",
                 "bind_vars": {"record_from": f"records/{record_id}"},
             },
-            CollectionNames.RECORD_RELATIONS.value: {
+            CollectionNames.NODE_RELATIONS.value: {
                 "filter": "(edge._from == @record_from OR edge._to == @record_to)",
                 "bind_vars": {
                     "record_from": f"records/{record_id}",
@@ -13887,7 +13944,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
 
             # Get attachments (child records with ATTACHMENT relation)
             attachments_query = f"""
-            FOR edge IN {CollectionNames.RECORD_RELATIONS.value}
+            FOR edge IN {CollectionNames.NODE_RELATIONS.value}
                 FILTER edge._from == @record_from
                     AND edge.relationshipType == 'ATTACHMENT'
                 RETURN PARSE_IDENTIFIER(edge._to).key
@@ -14867,7 +14924,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         if only_containers:
             has_children_block = """
                 LET has_children = LENGTH(
-                    FOR edge IN recordRelations
+                    FOR edge IN nodeRelations
                         FILTER edge._from == record._id
                         FILTER edge.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
                         LIMIT 1
@@ -14976,7 +15033,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     )
                     LET is_folder = ref.nodeType == "folder" OR record.mimeType == "application/vnd.folder" OR (file_info != null AND file_info.isFile == false)
                     LET has_children = LENGTH(
-                        FOR edge IN recordRelations
+                        FOR edge IN nodeRelations
                             FILTER edge._from == record._id
                             FILTER edge.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
                             LIMIT 1
@@ -15218,6 +15275,1507 @@ class ArangoHTTPProvider(IGraphDBProvider):
             self.logger.error(f"Error in knowledge hub unified search: {str(e)}")
             raise
 
+    # ==================== Knowledge Hub v2 ====================
+
+    # Interpolated from this map, never bound. The v1 queries bind both the
+    # field and the direction (`SORT node[@sort_field] @sort_dir`), but AQL
+    # takes ASC/DESC as a keyword rather than a value, so a bound direction is
+    # not a valid construct. A field absent from the map is rejected rather
+    # than defaulted, so a bad request fails loudly instead of sorting by
+    # something the caller did not ask for.
+    _KH_V2_SORT_FIELDS = {
+        "name": "name",
+        "createdAt": "createdAt",
+        "updatedAt": "updatedAt",
+        "nodeType": "nodeType",
+        "origin": "origin",
+        "connector": "connector",
+        "sizeInBytes": "sizeInBytes",
+    }
+
+    # How far the browse admissibility walk climbs toward the App.
+    #
+    # Deliberately **not** v1's `_KNOWLEDGE_HUB_INHERIT_MAX_DEPTH = 20`, which
+    # bounds a different traversal. BE-04 needs a 25-deep chain, and inheriting
+    # 20 would fail it the worst way available: the walk simply stops finding a
+    # path, `admitted` comes back false, and a node the user can legitimately
+    # open answers 404. No error, no leak — just a record that appears not to
+    # exist past a certain depth.
+    _KH_V2_MAX_UP_DEPTH = 50
+
+    @staticmethod
+    def _kh_v2_sort_direction(sort_order: str) -> str:
+        """ASC or DESC, validated, for interpolation into the SORT keyword."""
+        direction = (sort_order or "").strip().upper()
+        if direction not in ("ASC", "DESC"):
+            raise ValueError(f"Unsupported sort order: {sort_order!r}. Use 'asc' or 'desc'.")
+        return direction
+
+    def _kh_v2_rule_aql(
+        self, child: str, parent: str, edge: str, allow_strict: str = "@allowStrict",
+    ) -> str:
+        """The per-hop permission rule (§3.2), matching the Cypher branch for branch.
+
+        Three branches keyed on ``accessRule``, deliberately **not** compacted:
+        the compact form is equivalent for every declared value and fails open
+        on an undeclared one (decision 77). An unrecognised value matches no
+        branch and the node is hidden.
+
+        Written against explicit child/parent/edge expressions so one text
+        serves both the last hop and every earlier hop: the rule must be
+        asserted over the **whole path**. Filtering only the last hop is not
+        equivalent — the walk continues past an inaccessible node and emits its
+        descendants, measured as 7 nodes where Cypher returns 4. ``PRUNE``
+        cannot carry the rule at all, because it forbids subqueries.
+
+        Requires ``@types``, ``@grantees`` and ``@skipChecks``, and
+        ``@allowStrict`` unless ``allow_strict`` supplies another expression.
+        """
+        # Namespaced because this text is spliced into callers' queries, and AQL
+        # rejects a variable declared again in a nested scope. The Cypher twin
+        # needs the same treatment for a worse reason: Neo4j does not reject the
+        # collision, it silently binds to the outer variable.
+        inherits = (
+            f"LENGTH(FOR kh_ip IN inheritPermissions "
+            f"FILTER kh_ip._from == {child}._id AND kh_ip._to == {parent}._id "
+            f"LIMIT 1 RETURN 1) > 0"
+        )
+        granted = (
+            f"LENGTH(FOR kh_pm IN permission "
+            f"FILTER kh_pm._to == {child}._id "
+            f"AND PARSE_IDENTIFIER(kh_pm._from).key IN @grantees "
+            f"LIMIT 1 RETURN 1) > 0"
+        )
+        rule = f'NOT_NULL({child}.accessRule, "OPEN")'
+        if allow_strict.strip() == "false":
+            # Both strict arms read `... AND false`, so neither can ever match.
+            # Dropped to stay in step with the Cypher twin, where the dead text
+            # costs measurable planning time; here it is parity that matters,
+            # since the two engines must not diverge in what they emit. This is
+            # boolean reduction, not the compaction decision 77 rejects -- an
+            # unrecognised accessRule still matches no arm and stays hidden.
+            arms = f"""( {rule} == "OPEN"
+                   AND ( {inherits} OR {granted} ) )"""
+        else:
+            arms = f"""( {rule} == "RESTRICTED" AND {allow_strict}
+                   AND {inherits} AND {granted} )
+              OR ( {rule} == "STRICT" AND {allow_strict}
+                   AND ( {inherits} OR {granted} ) )
+              OR ( {rule} == "OPEN"
+                   AND ( {inherits} OR {granted} ) )"""
+        return f"""
+          {edge}.relationshipType IN @types
+          AND {child}.isDeleted != true
+          AND {parent}.hideChildren != true
+          AND ( @skipChecks OR (
+                 {arms} ) )
+        """
+
+    @classmethod
+    def _kh_v2_sort_property(cls, sort_field: str) -> str:
+        """The attribute behind a sort field name, or a caller error."""
+        prop = cls._KH_V2_SORT_FIELDS.get(sort_field)
+        if prop is None:
+            raise ValueError(
+                f"Unsupported sort field: {sort_field!r}. "
+                f"Allowed: {sorted(cls._KH_V2_SORT_FIELDS)}"
+            )
+        return prop
+
+    def _kh_v2_sort_aql(
+        self,
+        sort_field: str,
+        sort_order: str,
+        node_var: str = "node",
+        id_expr: str | None = None,
+        where: str = "",
+        reverse: bool = False,
+    ) -> str:
+        """Project the comparator's own output, then order by it.
+
+        ``reverse`` flips all three terms for a previous page, as in the Cypher
+        twin.
+
+        Matches ``_kh_v2_sort_cypher`` term for term, and matches the ordering
+        in ``app.connectors.sources.localKB.handlers.kh_merge``: ``nullRank``
+        ascending in both directions so nulls keep their place when the sort
+        flips, then the value, then the id ascending as a total tiebreak.
+
+        Both the attribute and the direction are interpolated. The direction has
+        to be: AQL takes ASC/DESC as a keyword rather than a value, so the v1
+        form (``SORT node[@sort_field] @sort_dir``) binds a keyword position
+        that bind parameters do not cover.
+
+        There is deliberately no ``carry`` parameter here, unlike the Cypher
+        builder. Cypher's ``WITH`` is a projection that drops every variable it
+        does not name, so a caller threading a total through the sort has to
+        list it; AQL's ``LET`` bindings stay in scope, so nothing is lost and a
+        matching parameter would be noise that implies a hazard AQL does not
+        have.
+        """
+        prop = self._kh_v2_sort_property(sort_field)
+        direction = self._kh_v2_sort_direction(sort_order)
+        # Names sort case-insensitively (§3.9), matching the Cypher twin. The
+        # lowered value is the stored sortKey, so the ordering and the keyset's
+        # resume point stay in agreement.
+        key_expr = f"{node_var}.{prop}"
+        if sort_field == "name":
+            # LOWER(null) is "" in AQL and null in Cypher's toLower(). Without
+            # this guard a nameless node gets nullRank 0 here and 1 there, so
+            # nulls sort first on one backend and last on the other -- against
+            # the contract, and invisible until the two are compared directly.
+            key_expr = f"({key_expr} == null ? null : LOWER({key_expr}))"
+        # `_key` is right for a raw document and wrong for a projected row: the
+        # row carries the domain `id` and has no `_key`, and sorting has to
+        # happen after projection because several sort fields are computed.
+        # Cypher needs no equivalent — the domain id is `id` on both a node and
+        # a projected map — so the asymmetry is Arango's internal key, not an
+        # oversight. Adding `_key` to the projection instead would pollute the
+        # row shape and break cross-backend field parity.
+        tiebreak = id_expr or f"{node_var}._key"
+        # The keyset FILTER goes here, not before the block. AQL's FILTER is a
+        # standalone statement, so it *looks* like it could precede the sort --
+        # but the predicate reads sortKey and nullRank, which these LETs define,
+        # so it has to sit between them and the SORT. Same placement as the
+        # Cypher builder, reached for a different reason.
+        keyset = f"\n            FILTER {where}" if where else ""
+        flipped = "ASC" if direction == "DESC" else "DESC"
+        null_dir, value_dir, id_dir = (
+            ("DESC", flipped, "DESC") if reverse else ("ASC", direction, "ASC")
+        )
+        return f"""
+            LET sortKey = {key_expr}
+            LET nullRank = sortKey == null ? 1 : 0{keyset}
+            SORT nullRank {null_dir}, sortKey {value_dir}, {tiebreak} {id_dir}
+        """
+
+    def _kh_v2_keyset_aql(
+        self,
+        sort_order: str,
+        direction: str = "next",
+        node_var: str = "node",
+        id_expr: str | None = None,
+    ) -> str:
+        """Resume after (or before) a cursor's boundary row.
+
+        Mirrors ``_kh_v2_keyset_cypher`` term for term, against the boundary the
+        cursor stored (``@ks_null_rank``, ``@ks_sort_key``, ``@ks_id``).
+
+        The null bucket is compared by ``_key`` alone. AQL's ``null == null`` is
+        true, unlike Cypher's, so this arm is not strictly required here — it is
+        kept so both engines evaluate the identical shape. Letting the two
+        diverge "because this dialect tolerates it" is how backends drift into
+        returning different pages for the same cursor.
+        """
+        ascending = self._kh_v2_sort_direction(sort_order) == "ASC"
+        if direction not in ("next", "prev"):
+            raise ValueError(f"Unsupported cursor direction: {direction!r}.")
+        forward = direction == "next"
+        value_cmp = (">" if ascending else "<") if forward else ("<" if ascending else ">")
+        edge_cmp = ">" if forward else "<"
+        # Same reasoning as the sort builder: a projected row has `id`, not
+        # `_key`, and the keyset must break ties on whatever the sort did.
+        tiebreak = id_expr or f"{node_var}._key"
+        return f"""
+            ( nullRank {edge_cmp} @ks_null_rank
+              OR ( nullRank == @ks_null_rank AND @ks_null_rank == 1
+                   AND {tiebreak} {edge_cmp} @ks_id )
+              OR ( nullRank == @ks_null_rank AND @ks_null_rank == 0
+                   AND ( sortKey {value_cmp} @ks_sort_key
+                         OR ( sortKey == @ks_sort_key
+                              AND {tiebreak} {edge_cmp} @ks_id ) ) ) )
+        """
+
+    def _kh_v2_filters_aql(
+        self,
+        search_query: str | None = None,
+        node_types: list[str] | None = None,
+        record_types: list[str] | None = None,
+        indexing_status: list[str] | None = None,
+        created_at: dict[str, int | None] | None = None,
+        updated_at: dict[str, int | None] | None = None,
+        size: dict[str, int | None] | None = None,
+        origins: list[str] | None = None,
+        connector_ids: list[str] | None = None,
+        *,
+        only_containers: bool = False,
+        record_group_ids: list[str] | None = None,
+    ) -> tuple[list[str], dict[str, Any]]:
+        """Filter conditions and their bind parameters, as ``(conditions, params)``.
+
+        Matches ``_kh_v2_filters_cypher`` condition for condition. The one
+        behavioural change from the v1 AQL builder is the search term:
+
+        v1 matches with ``LIKE CONCAT('%', LOWER(@search_query), '%')``, and in
+        AQL ``LIKE`` treats ``%`` and ``_`` in the *needle* as wildcards. A user
+        searching for ``a_b`` therefore matches ``axb``, and ``50% off`` matches
+        almost everything — while the Cypher side, which uses ``CONTAINS``, is
+        literal. Rather than escape the metacharacters, this uses AQL's own
+        ``CONTAINS`` function, which is a plain substring test and the exact
+        analogue of the Cypher form: the two engines then share one meaning
+        instead of two that have to be kept in step.
+        """
+        conditions: list[str] = []
+        params: dict[str, Any] = {}
+
+        conditions.append("(node.isPlaceholder != true)")
+
+        if search_query:
+            params["kh_search"] = search_query.lower()
+            conditions.append("CONTAINS(LOWER(node.name), @kh_search)")
+
+        if node_types:
+            params["kh_node_types"] = node_types
+            conditions.append("node.nodeType IN @kh_node_types")
+
+        if record_types:
+            params["kh_record_types"] = record_types
+            conditions.append(
+                '(node.nodeType == "record" AND node.recordType IN @kh_record_types)'
+            )
+
+        if indexing_status:
+            params["kh_indexing_status"] = indexing_status
+            conditions.append(
+                '(node.nodeType == "record" AND node.indexingStatus IN @kh_indexing_status)'
+            )
+
+        for label, window in (("created", created_at), ("updated", updated_at)):
+            if not window:
+                continue
+            field = "createdAt" if label == "created" else "updatedAt"
+            if window.get("gte") is not None:
+                params[f"kh_{label}_gte"] = window["gte"]
+                conditions.append(f"node.{field} >= @kh_{label}_gte")
+            if window.get("lte") is not None:
+                params[f"kh_{label}_lte"] = window["lte"]
+                conditions.append(f"node.{field} <= @kh_{label}_lte")
+
+        if size:
+            # "Unknown size" is not "zero bytes", so a record without one is
+            # outside every size window rather than at the bottom of it.
+            if size.get("gte") is not None:
+                params["kh_size_gte"] = size["gte"]
+                conditions.append(
+                    '(node.nodeType == "record" AND node.sizeInBytes != null '
+                    "AND node.sizeInBytes >= @kh_size_gte)"
+                )
+            if size.get("lte") is not None:
+                params["kh_size_lte"] = size["lte"]
+                conditions.append(
+                    '(node.nodeType == "record" AND node.sizeInBytes != null '
+                    "AND node.sizeInBytes <= @kh_size_lte)"
+                )
+
+        if origins:
+            params["kh_origins"] = origins
+            conditions.append("node.origin IN @kh_origins")
+
+        if connector_ids:
+            params["kh_connector_ids"] = connector_ids
+            conditions.append(
+                '((node.nodeType == "app" AND node.id IN @kh_connector_ids) '
+                "OR (node.connectorId IN @kh_connector_ids))"
+            )
+
+        if record_group_ids:
+            params["kh_record_group_ids"] = record_group_ids
+            conditions.append(
+                '(node.nodeType != "recordGroup" OR node.origin != "COLLECTION" '
+                "OR node.id IN @kh_record_group_ids)"
+            )
+
+        if only_containers:
+            conditions.append(
+                "(node.hasChildren == true "
+                'OR node.nodeType IN ["app", "recordGroup", "folder"])'
+            )
+
+        return conditions, params
+
+    def _kh_v2_projection_aql(
+        self,
+        node_var: str = "node",
+        parent_var: str = "parent",
+        overrides: dict[str, str] | None = None,
+        include_comparator: bool = True,
+    ) -> str:
+        """The row a v2 listing returns, as an AQL object expression.
+
+        Field for field identical to ``_kh_v2_projection_cypher``, so both
+        backends answer with the same shape — the parity the harness asserts.
+
+        **Ids are bare `_key` values**, never `_id`. The collection/key form is
+        Arango's internal addressing; v1 leaks it into responses that the Neo4j
+        backend also serves, so a client cannot round-trip a parentId it was
+        given. A caller wanting to traverse from a returned id re-qualifies it
+        with the collection it already knows.
+
+        **`overrides` replaces a field's expression, it never adds one.** The
+        defaults read stored attributes, but several fields are computed and
+        differ per branch — an App has no `origin` attribute, and its `connector`,
+        `webUrl` and `sharingStatus` follow their own rules. An unknown key
+        raises: a typo would otherwise add a field to one backend and not the
+        other, the row-shape divergence the parity test exists to catch, and it
+        would slip past that test because each side stays internally consistent.
+
+        `include_comparator=False` omits `sortKey`/`nullRank`, which the listing
+        queries need: the row is projected before it can be sorted, since the
+        sort reads computed fields off the projected object, and the
+        comparator's output does not exist until then.
+        """
+        fields = {
+            "id": f"{node_var}._key",
+            # Only an App stores `name`; records store `recordName` and record
+            # groups `groupName`. Reading `name` alone leaves every browse row
+            # nameless, which the root listing could not reveal because it lists
+            # Apps exclusively.
+            "name": (
+                f"NOT_NULL({node_var}.name, {node_var}.recordName, "
+                f"{node_var}.groupName)"
+            ),
+            "nodeType": '"record"',
+            "parentId": f"{parent_var}._key",
+            "parentType": "null",
+            # The same fallback as `name`: only an App stores `name` (D69).
+            "parentName": (
+                f"NOT_NULL({parent_var}.name, {parent_var}.recordName, "
+                f"{parent_var}.groupName)"
+            ),
+            # The partition merge keeps a real hierarchy parent over an internal
+            # one when two partitions return the same node (decision 67).
+            "parentIsInternal": f"{parent_var}.isInternal == true",
+            "origin": f"{node_var}.origin",
+            "connector": f"{node_var}.connector",
+            "connectorId": f"{node_var}.connectorId",
+            "recordType": f"{node_var}.recordType",
+            "recordGroupType": f"{node_var}.groupType",
+            "indexingStatus": f"{node_var}.indexingStatus",
+            "createdAt": f"NOT_NULL({node_var}.createdAtTimestamp, 0)",
+            "updatedAt": f"NOT_NULL({node_var}.updatedAtTimestamp, 0)",
+            "sizeInBytes": f"{node_var}.sizeInBytes",
+            "mimeType": f"{node_var}.mimeType",
+            "extension": f"{node_var}.extension",
+            "webUrl": f"{node_var}.webUrl",
+            "sharingStatus": f"{node_var}.sharingStatus",
+            "isInternal": f"NOT_NULL({node_var}.isInternal, false)",
+            "hasChildren": "false",
+            "userRole": "permission_role",
+        }
+        unknown = sorted(set(overrides or {}) - set(fields))
+        if unknown:
+            raise ValueError(
+                f"Unknown projection field(s): {unknown}. Known: {sorted(fields)}"
+            )
+        fields.update(overrides or {})
+        if include_comparator:
+            fields["sortKey"] = "sortKey"
+            fields["nullRank"] = "nullRank"
+        body = ",\n".join(f"            {key}: {expr}" for key, expr in fields.items())
+        return "{\n" + body + "\n        }"
+
+    async def get_knowledge_hub_root_nodes_v2(
+        self,
+        user_key: str,
+        org_id: str,
+        user_app_ids: list[str],
+        limit: int,
+        sort_field: str = "name",
+        sort_dir: str = "ASC",
+        *,
+        after: dict[str, Any] | None = None,
+        origins: list[str] | None = None,
+        node_types: list[str] | None = None,
+        only_containers: bool = False,
+        search_query: str | None = None,
+        record_types: list[str] | None = None,
+        indexing_status: list[str] | None = None,
+        created_at: dict[str, int | None] | None = None,
+        updated_at: dict[str, int | None] | None = None,
+        size: dict[str, int | None] | None = None,
+        connector_ids: list[str] | None = None,
+        direction: str = "next",
+        include_ids: bool = False,
+        transaction: str | None = None,
+    ) -> dict[str, Any]:
+        """The root listing (Apps) in the v2 partitioned shape, matching Neo4j.
+
+        It also serves global search's Apps partition, so it takes the same
+        filters, ``direction`` and ``include_ids`` as the browse method.
+
+        Same envelope, same row shape, same paging semantics as
+        ``Neo4jProvider.get_knowledge_hub_root_nodes_v2`` — one partition,
+        ``total`` counted only on the first page, ``limit + 1`` fetched so
+        ``hasMore`` needs no second query, and a raise rather than an empty page
+        on failure.
+
+        Bind parameters are declared only when used: Arango **rejects a query
+        that declares a parameter it never references**, so the filter, keyset
+        and org bindings are added conditionally rather than always.
+        """
+        permission_role = self._get_permission_role_aql("app", "app", "u")
+        conditions, bind_vars = self._kh_v2_filters_aql(
+            search_query, node_types, record_types, indexing_status,
+            created_at, updated_at, size, origins, connector_ids,
+            only_containers=only_containers,
+        )
+        row = self._kh_v2_projection_aql(
+            node_var="app",
+            parent_var="parent",
+            overrides={
+                "nodeType": '"app"',
+                "origin": 'app.type == "KB" ? "COLLECTION" : "CONNECTOR"',
+                "connector": "app.type",
+                "connectorId": "app._key",
+                "webUrl": 'CONCAT("/app/", app._key)',
+                # `app.createdBy != null` is load-bearing here, unlike in the
+                # Cypher twin. AQL's `null == null` is **true**, so a collection
+                # with no recorded creator matched a user with no `userId` and
+                # every such KB app reported itself as the caller's *personal*
+                # collection. v1 has this bug today: on Arango a KB app without
+                # createdBy shows as "personal" to every user, and as "shared"
+                # on Neo4j. The cross-backend row comparison is what caught it.
+                "sharingStatus": (
+                    'app.type == "KB" '
+                    '? ((app.createdBy != null '
+                    'AND (app.createdBy == u.userId OR app.createdBy == u._key)) '
+                    '? "personal" : "shared") '
+                    ': (app.scope != null ? app.scope : "personal")'
+                ),
+                "hasChildren": "has_children",
+                "userRole": "normalized_role",
+            },
+            include_comparator=False,
+        )
+        if direction not in ("next", "prev"):
+            raise ValueError(f"Unsupported page direction: {direction!r}.")
+        # The type travels with the id because a global search counts types over
+        # the *union* of its partitions (PG-33): summing each partition's own
+        # counts would count a two-parent node twice.
+        ids_expr = (
+            "all_nodes[* RETURN {id: CURRENT.id, nodeType: CURRENT.nodeType}]"
+            if include_ids else "[]"
+        )
+        keyset = ""
+        if after is not None:
+            keyset = self._kh_v2_keyset_aql(
+                sort_dir, direction, node_var="node", id_expr="node.id",
+            )
+            bind_vars.update({
+                "ks_null_rank": after["nullRank"],
+                "ks_sort_key": after.get("sortKey"),
+                "ks_id": after["id"],
+            })
+        # The projected row carries `id`, not `_key`.
+        sort = self._kh_v2_sort_aql(
+            sort_field, sort_dir, node_var="node", id_expr="node.id", where=keyset,
+            reverse=direction == "prev",
+        )
+        filter_clause = ""
+        if conditions:
+            filter_clause = "FILTER " + "\n                AND ".join(conditions)
+
+        query = f"""
+        LET u = DOCUMENT("users", @user_key)
+        LET all_nodes = (
+            FOR app IN apps
+                FILTER app._key IN @kh_app_ids
+                FILTER app.type == "KB" OR NOT (app.hideConnector == true)
+                LET has_children = app.type == "KB" ? (LENGTH(
+                    FOR edge IN belongsTo
+                        FILTER edge._to == app._id
+                        AND STARTS_WITH(edge._from, "records/")
+                        LIMIT 1 RETURN 1
+                ) > 0) : (LENGTH(
+                    FOR rg IN recordGroups
+                        FILTER rg.connectorId == app._key
+                        LIMIT 1 RETURN 1
+                ) > 0)
+                {permission_role}
+                LET normalized_role = IS_ARRAY(permission_role)
+                    ? (LENGTH(permission_role) > 0 ? permission_role[0] : null)
+                    : permission_role
+                LET parent = null
+                LET node = {row}
+                {filter_clause}
+                RETURN node
+        )
+        LET total = LENGTH(all_nodes)
+        LET page = (
+            FOR node IN all_nodes
+                {sort}
+                LIMIT @kh_limit
+                RETURN MERGE(node, {{ sortKey: sortKey, nullRank: nullRank }})
+        )
+        RETURN {{ rows: page, total: total, ids: {ids_expr} }}
+        """
+        bind_vars.update({
+            "user_key": user_key,
+            "kh_app_ids": user_app_ids,
+            "kh_limit": limit + 1,
+        })
+        if "@org_id" in query:
+            bind_vars["org_id"] = org_id
+
+        try:
+            result = await self.http_client.execute_aql(
+                query, bind_vars=bind_vars, txn_id=transaction
+            )
+        except Exception as e:
+            # v1 returns an empty page on failure here. An empty listing reads
+            # as "you may see nothing", so a failed permission query would look
+            # like a correct answer.
+            self.logger.error(f"Error in get_knowledge_hub_root_nodes_v2: {str(e)}")
+            raise
+
+        payload = result[0] if result else {}
+        rows = payload.get("rows") or []
+        total = int(payload.get("total") or 0)
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        if direction == "prev":
+            page_rows.reverse()
+        return {
+            "partitions": [{
+                "partitionId": "__root__",
+                "partitionKind": "ROOT",
+                "appId": None,
+                "rows": page_rows,
+                "ids": payload.get("ids") or [],
+                "hasMore": has_more,
+                "exhausted": not has_more,
+                "total": None if after is not None else total,
+                "countsByType": None,
+            }],
+            "scope": None,
+        }
+
+    async def get_knowledge_hub_partitions_v2(
+        self,
+        org_id: str,
+        gated_app_ids: list[str],
+        *,
+        transaction: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """The partitions a global search runs, matching ``Neo4jProvider.get_knowledge_hub_partitions_v2``."""
+        query = """
+        FOR a IN apps
+            FILTER a._key IN @gated_app_ids AND a.orgId == @org_id
+            LET children = (
+                FOR child, e IN 1..1 OUTBOUND a._id nodeRelations
+                    FILTER e.relationshipType IN @types
+                    RETURN child
+            )
+            RETURN {
+                appId: a._key,
+                isCollection: a.type == "KB",
+                groups: UNIQUE(children[* FILTER IS_SAME_COLLECTION("recordGroups", CURRENT)
+                                           AND CURRENT.isDeleted != true RETURN CURRENT._key]),
+                hasDirect: LENGTH(children[* FILTER NOT IS_SAME_COLLECTION("recordGroups", CURRENT)]) > 0
+            }
+        """
+        try:
+            result = await self.http_client.execute_aql(
+                query,
+                bind_vars={"org_id": org_id, "gated_app_ids": gated_app_ids,
+                           "types": ["PARENT_CHILD", "ATTACHMENT"]},
+                txn_id=transaction,
+            )
+        except Exception as e:
+            self.logger.error(f"Error in get_knowledge_hub_partitions_v2: {str(e)}")
+            raise
+        return build_partitions(result or [])
+
+    async def get_knowledge_hub_access_context_v2(
+        self,
+        user_key: str,
+        org_id: str,
+        *,
+        transaction: str | None = None,
+    ) -> dict[str, list[str]]:
+        """Grantees and gated Apps, matching ``Neo4jProvider.get_knowledge_hub_access_context_v2``.
+
+        Memberships are USER permissions into ``groups``, ``roles`` and ``teams``,
+        and ``belongsTo`` into ``groups`` or ``organizations`` (D42). App grants
+        are matched by ``_from`` handle so the edge index serves them (D43).
+        """
+        query = """
+        LET u = DOCUMENT("users", @user_key)
+        LET viaPermission = u == null ? [] : (
+            FOR p IN permission
+                FILTER p._from == u._id AND p.type == "USER"
+                   AND (STARTS_WITH(p._to, "groups/") OR STARTS_WITH(p._to, "roles/")
+                        OR STARTS_WITH(p._to, "teams/"))
+                RETURN DISTINCT p._to
+        )
+        LET viaBelongs = u == null ? [] : (
+            FOR b IN belongsTo
+                FILTER b._from == u._id
+                   AND (STARTS_WITH(b._to, "groups/") OR STARTS_WITH(b._to, "organizations/"))
+                RETURN DISTINCT b._to
+        )
+        LET handles = u == null ? [] : UNION_DISTINCT([u._id], viaPermission, viaBelongs)
+        LET relApps = u == null ? [] : (
+            FOR r IN userAppRelation
+                FILTER r._from == u._id AND STARTS_WITH(r._to, "apps/")
+                LET a = DOCUMENT(r._to)
+                FILTER a != null AND a.orgId == @org_id
+                RETURN DISTINCT a._key
+        )
+        LET grantApps = (
+            FOR p IN permission
+                FILTER p._from IN handles AND STARTS_WITH(p._to, "apps/")
+                LET a = DOCUMENT(p._to)
+                FILTER a != null AND a.orgId == @org_id
+                RETURN DISTINCT a._key
+        )
+        RETURN {
+            grantees: handles[* RETURN PARSE_IDENTIFIER(CURRENT).key],
+            gatedApps: UNION_DISTINCT(relApps, grantApps)
+        }
+        """
+        try:
+            result = await self.http_client.execute_aql(
+                query, bind_vars={"user_key": user_key, "org_id": org_id},
+                txn_id=transaction,
+            )
+        except Exception as e:
+            self.logger.error(f"Error in get_knowledge_hub_access_context_v2: {str(e)}")
+            raise
+        payload = result[0] if result else {}
+        return {
+            "grantee_ids": list(dict.fromkeys(payload.get("grantees") or [])),
+            "gated_app_ids": list(dict.fromkeys(payload.get("gatedApps") or [])),
+        }
+
+    def _kh_v2_rule_admission_aql(self, node: str, prefix: str = "") -> str:
+        """``LET {prefix}fromApp`` and ``LET {prefix}viaSeed``, matching the Cypher twin.
+
+        The walks run INBOUND, so for edge i the child is ``path.vertices[i]``
+        and the parent is ``path.vertices[i+1]``.
+        """
+        rule_up = self._kh_v2_rule_aql(
+            "path.vertices[i]", "path.vertices[i+1]", "path.edges[i]",
+        )
+        # Below a seed nothing strict is admissible (§3.6 arm 2).
+        seed_up = self._kh_v2_rule_aql(
+            "path.vertices[i]", "path.vertices[i+1]", "path.edges[i]",
+            allow_strict="false",
+        )
+        return f"""
+        LET {prefix}fromApp = {node} == null ? false : (
+            IS_SAME_COLLECTION("apps", {node})
+                ? ({node}._key IN @kh_gated_apps)
+                : LENGTH(
+                    FOR v, e, path IN 1..@kh_max_depth INBOUND {node}._id nodeRelations
+                        OPTIONS {{ bfs: true, uniqueVertices: "path" }}
+                        FILTER IS_SAME_COLLECTION("apps", v)
+                           AND v._key IN @kh_gated_apps
+                        FILTER LENGTH(
+                            FOR i IN 0..LENGTH(path.edges) - 1
+                                FILTER NOT ( {rule_up} )
+                                LIMIT 1 RETURN 1
+                        ) == 0
+                        LIMIT 1
+                        RETURN 1
+                  ) > 0
+        )
+        // Depth 0 is the seed itself, where the hop check must be skipped:
+        // AQL's 0..-1 is [0, -1], not an empty range.
+        LET {prefix}viaSeed = ({node} == null OR IS_SAME_COLLECTION("apps", {node})) ? false : LENGTH(
+            FOR v, e, path IN 0..@kh_max_depth INBOUND {node}._id nodeRelations
+                OPTIONS {{ bfs: true, uniqueVertices: "path" }}
+                FILTER IS_SAME_COLLECTION("records", v) OR IS_SAME_COLLECTION("recordGroups", v)
+                FILTER NOT_NULL(v.accessRule, "OPEN") == "OPEN" AND v.isDeleted != true
+                FILTER LENGTH(
+                    FOR sp IN permission
+                        FILTER sp._to == v._id
+                           AND PARSE_IDENTIFIER(sp._from).key IN @grantees
+                        LIMIT 1 RETURN 1
+                ) > 0
+                FILTER LENGTH(path.edges) == 0 OR LENGTH(
+                    FOR i IN 0..LENGTH(path.edges) - 1
+                        FILTER NOT ( {seed_up} )
+                        LIMIT 1 RETURN 1
+                ) == 0
+                FILTER LENGTH(
+                    FOR h IN 1..20 INBOUND v._id nodeRelations
+                        OPTIONS {{ bfs: true, uniqueVertices: "path" }}
+                        FILTER IS_SAME_COLLECTION("recordGroups", h)
+                           AND h.hideChildren == true
+                        LIMIT 1 RETURN 1
+                ) == 0
+                FILTER LENGTH(
+                    FOR ga IN 1..20 INBOUND v._id nodeRelations
+                        FILTER IS_SAME_COLLECTION("apps", ga)
+                           AND ga._key IN @kh_gated_apps
+                        LIMIT 1 RETURN 1
+                ) > 0
+                LIMIT 1
+                RETURN 1
+        ) > 0
+        """
+
+    def _kh_v2_opener_aql(self, node: str, prefix: str = "") -> str:
+        """Whether ``node`` opens everything below it, matching the Cypher twin."""
+        return (
+            f'( ( IS_SAME_COLLECTION("apps", {node}) AND {node}._key IN @kh_gated_apps '
+            f'AND ({node}.type == "KB" OR {node}.permissionModel == "APP_LEVEL") ) '
+            f'OR ( IS_SAME_COLLECTION("recordGroups", {node}) '
+            f'AND {node}.permissionModel == "RECORD_GROUP_LEVEL" '
+            f'AND ({prefix}fromApp OR {prefix}viaSeed) ) )'
+        )
+
+    def _kh_v2_admission_aql(self, node: str, prefix: str = "") -> str:
+        """``LET {prefix}fromApp``, ``{prefix}viaSeed`` and ``{prefix}inScope``, matching the Cypher twin.
+
+        Each use needs its own ``prefix``: AQL rejects a variable declared twice
+        in one scope. The inScope walk is INBOUND, so for edge i the child is
+        ``kh_op.vertices[i]`` and the parent is ``kh_op.vertices[i+1]``.
+        """
+        opener_rule = self._kh_v2_rule_admission_aql("kh_o", prefix="kh_o_")
+        opener = self._kh_v2_opener_aql("kh_o", prefix="kh_o_")
+        return self._kh_v2_rule_admission_aql(node, prefix) + f"""
+        LET {prefix}kh_hier = {node} == null ? false : LENGTH(
+            FOR kh_o, kh_oe, kh_op IN 1..@kh_max_depth INBOUND {node}._id nodeRelations
+                OPTIONS {{ bfs: true, uniqueVertices: "path" }}
+                FILTER IS_SAME_COLLECTION("apps", kh_o)
+                    OR kh_o.permissionModel == "RECORD_GROUP_LEVEL"
+                FILTER LENGTH(
+                    FOR kh_i IN 0..LENGTH(kh_op.edges) - 1
+                        FILTER kh_op.edges[kh_i].relationshipType NOT IN @types
+                            OR kh_op.vertices[kh_i].isDeleted == true
+                            OR kh_op.vertices[kh_i + 1].hideChildren == true
+                        LIMIT 1 RETURN 1
+                ) == 0
+                {opener_rule}
+                FILTER {opener}
+                LIMIT 1
+                RETURN 1
+        ) > 0
+        // A collection's items hang off the App by BELONGS_TO, never by
+        // hierarchy: `kb_service` writes "records+files+isOfType,
+        // belongsTo->apps/<kbId>" and no nodeRelations edge from the App, which
+        // is what the design doc declares (KB record -> KB App, entityType KB)
+        // and how v1 read them back. Membership is one hop, not a path -- every
+        // item carries the edge, nested ones included -- so this decides
+        // visibility only, and placement stays hierarchical.
+        LET {prefix}kh_collection = {node} == null || {node}.isDeleted == true ? false : LENGTH(
+            FOR kh_bt IN belongsTo
+                FILTER kh_bt._from == {node}._id AND kh_bt.entityType == "KB"
+                LET kh_kb = DOCUMENT(kh_bt._to)
+                FILTER kh_kb != null AND kh_kb.type == "KB"
+                   AND kh_kb._key IN @kh_gated_apps
+                LIMIT 1
+                RETURN 1
+        ) > 0
+        LET {prefix}inScope = {prefix}kh_hier OR {prefix}kh_collection
+        """
+
+    def _kh_v2_open_region_aql(self, openers: str, out: str) -> str:
+        """``LET {out}``: (node, parent) pairs for everything structurally below ``openers``.
+
+        Matches ``Neo4jProvider._kh_v2_open_region_cypher``. OUTBOUND, so for
+        edge j the parent is ``vertices[j]`` and the child ``vertices[j + 1]``.
+        """
+        return f"""
+        LET {out}_hier = (
+            FOR kh_open IN {openers}
+                FOR kh_d, kh_de, kh_dp IN 1..@kh_max_depth OUTBOUND kh_open._id nodeRelations
+                    OPTIONS {{ bfs: true, uniqueVertices: "path" }}
+                    FILTER LENGTH(
+                        FOR kh_j IN 0..LENGTH(kh_dp.edges) - 1
+                            FILTER kh_dp.edges[kh_j].relationshipType NOT IN @types
+                                OR kh_dp.vertices[kh_j + 1].isDeleted == true
+                                OR kh_dp.vertices[kh_j].hideChildren == true
+                            LIMIT 1 RETURN 1
+                    ) == 0
+                    RETURN {{ n: kh_d, parent: kh_dp.vertices[LENGTH(kh_dp.vertices) - 2] }}
+        )
+        // A collection reaches its items by BELONGS_TO, so the hierarchy walk
+        // above finds none of them. Placement stays hierarchical: every item
+        // carries the edge, nested ones too, so the parent is the record above
+        // it when there is one and the App otherwise -- otherwise a nested item
+        // would surface under both its folder and the collection (NV-36, NV-39).
+        LET {out}_kb = (
+            FOR kh_kbopen IN {openers}
+                FILTER IS_SAME_COLLECTION("apps", kh_kbopen) AND kh_kbopen.type == "KB"
+                FOR kh_bt IN belongsTo
+                    FILTER kh_bt._to == kh_kbopen._id AND kh_bt.entityType == "KB"
+                    LET kh_item = DOCUMENT(kh_bt._from)
+                    FILTER kh_item != null AND kh_item.isDeleted != true
+                    LET kh_ip = FIRST(
+                        FOR kh_p, kh_pe IN 1..1 INBOUND kh_item._id nodeRelations
+                            FILTER kh_pe.relationshipType IN @types
+                               AND kh_p.isDeleted != true
+                            LIMIT 1
+                            RETURN kh_p
+                    )
+                    RETURN {{ n: kh_item, parent: kh_ip == null ? kh_kbopen : kh_ip }}
+        )
+        LET {out} = APPEND({out}_hier, {out}_kb)"""
+
+    def _kh_v2_open_parent_aql(self, node: str) -> str:
+        """Whether ``node`` already lists under a parent the user may open, as an expression.
+
+        Matches ``Neo4jProvider._kh_v2_open_parent_cypher``: an admitted
+        hierarchy parent that does not hide its children (§3.3, NV-37).
+        """
+        parent_admission = self._kh_v2_admission_aql("kh_par", prefix="kh_par_")
+        return f"""LENGTH(
+            FOR kh_par, kh_pe IN 1..1 INBOUND {node}._id nodeRelations
+                FILTER kh_pe.relationshipType IN @types
+                   AND kh_par.hideChildren != true
+                {parent_admission}
+                FILTER kh_par_fromApp OR kh_par_viaSeed OR kh_par_inScope
+                LIMIT 1
+                RETURN 1
+        ) > 0"""
+
+    async def get_knowledge_hub_children_v2(
+        self,
+        user_key: str,
+        org_id: str,
+        parent_id: str,
+        limit: int,
+        grantee_ids: list[str],
+        gated_app_ids: list[str],
+        sort_field: str = "name",
+        sort_dir: str = "ASC",
+        *,
+        after: dict[str, Any] | None = None,
+        only_containers: bool = False,
+        via_parent_id: str | None = None,
+        flatten: bool = False,
+        search_query: str | None = None,
+        node_types: list[str] | None = None,
+        record_types: list[str] | None = None,
+        indexing_status: list[str] | None = None,
+        created_at: dict[str, int | None] | None = None,
+        updated_at: dict[str, int | None] | None = None,
+        size: dict[str, int | None] | None = None,
+        origins: list[str] | None = None,
+        connector_ids: list[str] | None = None,
+        record_group_ids: list[str] | None = None,
+        partition: str | None = None,
+        direction: str = "next",
+        include_ids: bool = False,
+        transaction: str | None = None,
+    ) -> dict[str, Any]:
+        """Browse one level or flatten a subtree, matching ``Neo4jProvider.get_knowledge_hub_children_v2``.
+
+        Flatten builds the same (node, parent) pairs region by region and keeps
+        one parent per node, non-internal first (decisions 28 and 67).
+
+        Same envelope, same row shape, same two arms: direct children admitted
+        by the per-hop rule, plus granted OPEN nodes whose placement resolves
+        here by their **own** record group (§3.3, decision 13).
+
+        **The empty-listing defect has no analogue here.** In Cypher
+        ``admitted`` was destroyed by an aggregation over zero rows, so a node
+        with no children reported as a 404. AQL binds it with ``LET`` before any
+        rows exist, so it cannot be swallowed — the same contract, a different
+        failure surface. Worth stating because the Cypher fix looks like
+        needless nesting until you know what it defends against.
+
+        The upward walk runs **INBOUND**, so for edge ``i`` the *child* is
+        ``path.vertices[i]`` and the *parent* is ``path.vertices[i+1]`` — the
+        reverse of the downward traversals, and easy to write backwards.
+
+        A collection's items carry the collection's role and connector items
+        carry none; browsing an App adds the App-fallback arm (NV-07, decision
+        78: the own group cannot be opened). Arms 2 and 3 list only chain-tops
+        (NV-37), and declarations and collections open everything below them
+        (§3.8, decision 52). Breadcrumbs work as in the Neo4j twin: the query
+        returns flags and ``kh_breadcrumbs`` picks the trail.
+        """
+        if partition not in (None, "group", "app_direct"):
+            raise ValueError(f"unknown partition kind {partition!r}")
+        flatten = flatten or partition is not None
+        rule_down = self._kh_v2_rule_aql("c", "start", "e", allow_strict="fromApp")
+        # The same listing condition for any breadcrumb edge, keyed on whether
+        # that edge's parent has a full path from the App.
+        crumb_rule = self._kh_v2_rule_aql(
+            "ch", "par", "pr", allow_strict="par._key IN kh_from_app_ids",
+        )
+        admission = self._kh_v2_admission_aql("start")
+        start_opener = self._kh_v2_opener_aql("start")
+        crumb_admission = self._kh_v2_admission_aql("a", prefix="a_")
+        crumb_opener = self._kh_v2_opener_aql("a", prefix="a_")
+        seed_has_open_parent = self._kh_v2_open_parent_aql("s")
+        group_admission = self._kh_v2_admission_aql("grp", prefix="grp_")
+        # The collection's own role, resolved once per request. Only the app
+        # variant applies: the record and recordGroup variants dispatch on a
+        # single node type, and a browse listing is mixed.
+        app_role = self._get_permission_role_aql("app", "ownerApp", "u")
+        conditions, bind_vars = self._kh_v2_filters_aql(
+            search_query, node_types, record_types, indexing_status,
+            created_at, updated_at, size, origins, connector_ids,
+            only_containers=only_containers, record_group_ids=record_group_ids,
+        )
+        row = self._kh_v2_projection_aql(
+            node_var="n",
+            parent_var="parent",
+            overrides={
+                "nodeType": (
+                    'IS_SAME_COLLECTION("recordGroups", n) ? "recordGroup" '
+                    ': (IS_SAME_COLLECTION("apps", n) ? "app" : "record")'
+                ),
+                "parentType": (
+                    'IS_SAME_COLLECTION("recordGroups", parent) ? "recordGroup" '
+                    ': (IS_SAME_COLLECTION("apps", parent) ? "app" : "record")'
+                ),
+                "origin": 'NOT_NULL(n.origin, "CONNECTOR")',
+                "connector": "NOT_NULL(n.connectorName, n.type)",
+                "hasChildren": (
+                    "LENGTH(FOR x, xe IN 1..1 OUTBOUND n._id nodeRelations "
+                    "FILTER xe.relationshipType IN @types LIMIT 1 RETURN 1) > 0"
+                ),
+                # Null for connector items (decision 34); a collection's items
+                # carry the role held on the collection itself (decision 52).
+                "userRole": "collection_role",
+            },
+            include_comparator=False,
+        )
+        if direction not in ("next", "prev"):
+            raise ValueError(f"Unsupported page direction: {direction!r}.")
+        # The type travels with the id because a global search counts types over
+        # the *union* of its partitions (PG-33): summing each partition's own
+        # counts would count a two-parent node twice.
+        ids_expr = (
+            "all_nodes[* RETURN {id: CURRENT.id, nodeType: CURRENT.nodeType}]"
+            if include_ids else "[]"
+        )
+        keyset = ""
+        if after is not None:
+            keyset = self._kh_v2_keyset_aql(
+                sort_dir, direction, node_var="node", id_expr="node.id",
+            )
+            bind_vars.update({
+                "ks_null_rank": after["nullRank"],
+                "ks_sort_key": after.get("sortKey"),
+                "ks_id": after["id"],
+            })
+        sort = self._kh_v2_sort_aql(
+            sort_field, sort_dir, node_var="node", id_expr="node.id", where=keyset,
+            reverse=direction == "prev",
+        )
+        filter_clause = ""
+        if conditions:
+            filter_clause = "FILTER " + "\n                AND ".join(conditions)
+
+        browse_arms = f"""
+        // Arm 1: direct children, by the rule or because this node opens
+        // everything below it (a declaration or a collection).
+        LET arm1 = (
+            FOR c, e IN 1..1 OUTBOUND start._id nodeRelations
+                FILTER ( {rule_down} )
+                    OR ( opensBelow
+                         AND e.relationshipType IN @types
+                         AND c.isDeleted != true
+                         AND start.hideChildren != true )
+                RETURN c
+        )
+
+        // Arm 1b: a collection's root items. They hang off the App by
+        // BELONGS_TO (entityType KB) and carry no hierarchy edge from it, so
+        // arm 1 finds none of them -- which is why a collection browsed as
+        // empty on a real instance while the fixture, which invented that edge,
+        // listed it correctly. Only items with no hierarchy parent belong here;
+        // nested ones list under their folder through arm 1, and returning them
+        // here as well would place the same row twice (NV-37).
+        // No `opensBelow` term: admission refuses an ungated collection before
+        // this arm runs, so it could never be the deciding condition. Measured
+        // -- removing it changed nothing, and kb-2 still lists nothing because
+        // `inScope` already said no.
+        LET arm1kb = (start != null AND IS_SAME_COLLECTION("apps", start)
+                      AND start.type == "KB") ? (
+            FOR kh_cbt IN belongsTo
+                FILTER kh_cbt._to == start._id AND kh_cbt.entityType == "KB"
+                LET c = DOCUMENT(kh_cbt._from)
+                FILTER c != null AND c.isDeleted != true
+                   AND LENGTH(
+                       FOR kh_cp, kh_cpe IN 1..1 INBOUND c._id nodeRelations
+                           FILTER kh_cpe.relationshipType IN @types
+                           LIMIT 1 RETURN 1
+                   ) == 0
+                RETURN c
+        ) : []
+
+        // Arm 2: chain-tops placed here by their own record group, meaning
+        // granted OPEN nodes with no parent the user may open (§3.3, NV-37).
+        LET arm2 = (
+            FOR pm IN permission
+                FILTER PARSE_IDENTIFIER(pm._from).key IN @grantees
+                LET s = DOCUMENT(pm._to)
+                FILTER s != null
+                   AND NOT_NULL(s.accessRule, "OPEN") == "OPEN"
+                   AND s.isDeleted != true
+                   AND LENGTH(
+                       FOR bt IN belongsTo
+                           FILTER bt._from == s._id AND bt._to == start._id
+                           LIMIT 1 RETURN 1
+                   ) > 0
+                   AND LENGTH(
+                       FOR h IN 1..20 INBOUND s._id nodeRelations
+                           OPTIONS {{ bfs: true, uniqueVertices: "path" }}
+                           FILTER IS_SAME_COLLECTION("recordGroups", h)
+                              AND h.hideChildren == true
+                           LIMIT 1 RETURN 1
+                   ) == 0
+                FILTER NOT ( {seed_has_open_parent} )
+                RETURN s
+        )
+
+        // Arm 3: the App fallback (§3.3, decisions 13 and 78). A chain-top whose
+        // own record group is structurally under this App but cannot be opened
+        // lists directly under the App. Anything beneath a hideChildren group
+        // is dropped first, so hideChildren keeps its contents hidden rather
+        // than surfacing them one level up.
+        LET arm3 = start != null AND IS_SAME_COLLECTION("apps", start) ? (
+            FOR pm IN permission
+                FILTER PARSE_IDENTIFIER(pm._from).key IN @grantees
+                LET s = DOCUMENT(pm._to)
+                FILTER s != null
+                   AND NOT_NULL(s.accessRule, "OPEN") == "OPEN"
+                   AND s.isDeleted != true
+                   AND LENGTH(
+                       FOR h IN 1..20 INBOUND s._id nodeRelations
+                           OPTIONS {{ bfs: true, uniqueVertices: "path" }}
+                           FILTER IS_SAME_COLLECTION("recordGroups", h)
+                              AND h.hideChildren == true
+                           LIMIT 1 RETURN 1
+                   ) == 0
+                FOR bt IN belongsTo
+                    FILTER bt._from == s._id
+                       AND STARTS_WITH(bt._to, "recordGroups/")
+                    LET grp = DOCUMENT(bt._to)
+                    FILTER grp != null AND grp.isDeleted != true
+                    FILTER LENGTH(
+                        FOR v IN 1..20 OUTBOUND start._id nodeRelations
+                            FILTER v._id == grp._id
+                            LIMIT 1 RETURN 1
+                    ) > 0
+                    {group_admission}
+                    FILTER NOT (grp_fromApp OR grp_viaSeed OR grp_inScope)
+                    FILTER NOT ( {seed_has_open_parent} )
+                    RETURN DISTINCT s
+        ) : []"""
+        browse_source = """FOR n IN UNION_DISTINCT(arm1, arm1kb, arm2, arm3)
+                LET parent = start"""
+
+        # Partition mode, matching the Cypher twin: no scope-chain check for
+        # seeds, an App fallback parent, the root's own row when it can be
+        # opened, and App-direct keeping only what no top-level group holds.
+        seed_any_scope = "true" if partition else 'IS_SAME_COLLECTION("apps", start)'
+        # In partition mode the guard is the literal `true`, so the FILTER it
+        # heads can never exclude a row -- but the engine still evaluates the
+        # 20-hop belongsTo walk behind it, with a permission subquery per hop.
+        # Emitting nothing is boolean reduction; the non-partition form below is
+        # byte-identical to what shipped. Kept in step with the Cypher twin.
+        seed_scope_filter = "" if seed_any_scope == "true" else f"""FILTER {seed_any_scope} OR LENGTH(
+                    FOR kg, kge, kgp IN 1..20 OUTBOUND s._id belongsTo
+                        OPTIONS {{ bfs: true, uniqueVertices: "path" }}
+                        FILTER IS_SAME_COLLECTION("recordGroups", kg)
+                           AND kg._id IN innerIds
+                        FILTER LENGTH(kgp.vertices) <= 2 OR LENGTH(
+                            FOR kh_k IN 1..LENGTH(kgp.vertices) - 2
+                                LET kh_ga = kgp.vertices[kh_k]
+                                FILTER NOT (
+                                    IS_SAME_COLLECTION("recordGroups", kh_ga)
+                                    AND NOT_NULL(kh_ga.accessRule, "OPEN") == "OPEN"
+                                    AND kh_ga.isDeleted != true
+                                    AND LENGTH(
+                                        FOR kh_gp IN permission
+                                            FILTER kh_gp._to == kh_ga._id
+                                               AND PARSE_IDENTIFIER(kh_gp._from).key IN @grantees
+                                            LIMIT 1 RETURN 1
+                                    ) > 0
+                                )
+                                LIMIT 1 RETURN 1
+                        ) == 0
+                        LIMIT 1 RETURN 1
+                ) > 0"""
+        seed_fallback = "kh_app" if partition == "group" else "start"
+        include_root = "true" if partition == "group" else "false"
+        app_direct = "true" if partition == "app_direct" else "false"
+        # Flatten (decision 28). OUTBOUND walks, so for edge i the parent is
+        # path.vertices[i] and the child path.vertices[i+1].
+        flat_rule_a = self._kh_v2_rule_aql(
+            "path.vertices[i+1]", "path.vertices[i]", "path.edges[i]",
+            allow_strict="fromApp",
+        )
+        flat_seed_rule = self._kh_v2_rule_aql(
+            "path.vertices[i+1]", "path.vertices[i]", "path.edges[i]",
+            allow_strict="false",
+        )
+        open_region_a = self._kh_v2_open_region_aql("openersA", "pairsOA")
+        open_region_b = self._kh_v2_open_region_aql("openersB", "pairsOB")
+        flatten_arms = f"""
+        // Region A: what the rule reaches from here (§3.6 arm 1). The rule
+        // assumes an open parent, so a closed partition root has none.
+        LET pairsA = (start == null OR NOT admitted) ? [] : (
+            FOR v, e, path IN 1..@kh_max_depth OUTBOUND start._id nodeRelations
+                OPTIONS {{ bfs: true, uniqueVertices: "path" }}
+                FILTER LENGTH(
+                    FOR i IN 0..LENGTH(path.edges) - 1
+                        FILTER NOT ( {flat_rule_a} )
+                        LIMIT 1 RETURN 1
+                ) == 0
+                RETURN {{ n: v, parent: path.vertices[LENGTH(path.vertices) - 2] }}
+        )
+        // Openers: this node when it opens its subtree, and every
+        // RECORD_GROUP_LEVEL group the rule reached (§3.8).
+        LET openersA = APPEND(
+            pairsA[* FILTER IS_SAME_COLLECTION("recordGroups", CURRENT.n)
+                     AND CURRENT.n.permissionModel == "RECORD_GROUP_LEVEL" RETURN CURRENT.n],
+            opensBelow ? [start] : []
+        )
+        {open_region_a}
+        // Region B: chain-tops below a gap whose placement stays inside this
+        // scope, and what the rule reaches below them with nothing strict
+        // (§3.6 arm 2, NV-32). Placement above the scope is out of reach here
+        // (AC-59, NV-45).
+        LET innerIds = start == null ? [] : APPEND(
+            admitted ? [start._id] : [], APPEND(pairsA[*].n._id, pairsOA[*].n._id)
+        )
+        // The scope-chain test used to run per candidate seed, walking INBOUND
+        // from the candidate until it found `start`. Cypher's twin of that shape
+        // bound both ends, which 5.26 plans as VarLengthExpand(Into) -- contract:
+        // find *all* connecting paths, not probe for one -- and it measured 11.6M
+        // db hits returning 0 rows. Materialising the descendant set once and
+        // testing membership took the whole query from 12,566,085 to 828,201 hits
+        // and warm execution from ~3,590ms to ~140ms. Same reduction applies here,
+        // inverted: walk OUTBOUND from `start` once instead of INBOUND per seed.
+        LET khDescIds = start == null ? [] : (
+            FOR kh_d, kh_de, kh_dp IN 1..@kh_max_depth OUTBOUND start._id nodeRelations
+                OPTIONS {{ bfs: true, uniqueVertices: "global" }}
+                FILTER kh_dp.edges[* FILTER CURRENT.relationshipType NOT IN @types] == []
+                RETURN DISTINCT kh_d._id
+        )
+        LET seeds = start == null ? [] : (
+            FOR pm IN permission
+                FILTER PARSE_IDENTIFIER(pm._from).key IN @grantees
+                LET s = DOCUMENT(pm._to)
+                FILTER s != null
+                   AND (IS_SAME_COLLECTION("records", s) OR IS_SAME_COLLECTION("recordGroups", s))
+                   AND NOT_NULL(s.accessRule, "OPEN") == "OPEN"
+                   AND s.isDeleted != true
+                   AND s._id NOT IN innerIds
+                   AND s._id IN khDescIds
+                FILTER LENGTH(
+                    FOR h IN 1..20 INBOUND s._id nodeRelations
+                        OPTIONS {{ bfs: true, uniqueVertices: "path" }}
+                        FILTER IS_SAME_COLLECTION("recordGroups", h)
+                           AND h.hideChildren == true
+                        LIMIT 1 RETURN 1
+                ) == 0
+                // Outside the App, the chain of own groups must land inside the
+                // scope through granted OPEN groups only. With no intermediate
+                // group the range 1..LENGTH-2 would run backwards, so it is
+                // guarded rather than iterated.
+                {seed_scope_filter}
+                RETURN DISTINCT s
+        )
+        // The App this node hangs from. A partition places a seed whose own
+        // group cannot be opened under it (PG-04).
+        LET kh_app = start == null ? null : NOT_NULL(FIRST(
+            FOR kh_a0 IN 1..1 INBOUND start._id nodeRelations
+                FILTER IS_SAME_COLLECTION("apps", kh_a0)
+                LIMIT 1
+                RETURN kh_a0
+        ), start)
+        LET seedIds = seeds[*]._id
+        LET seedPairs = (
+            FOR sd IN seeds
+                // Filter to in-scope groups before picking one -- see the
+                // Cypher twin. Ranked as kh_breadcrumbs ranks parents:
+                // non-internal before internal, then by id (D67).
+                // The edge scan stays on its own so it keeps using the edge
+                // index and reads no documents it will discard. Filtering and
+                // ranking then run over that short list: doing them inside the
+                // edge loop reads a document per edge and, with
+                // move-calculations-down disabled here, does not finish.
+                LET ownCandidates = (
+                    FOR bt IN belongsTo
+                        FILTER bt._from == sd._id AND STARTS_WITH(bt._to, "recordGroups/")
+                        RETURN DOCUMENT(bt._to)
+                )
+                LET ownG = FIRST(
+                    FOR g IN ownCandidates
+                        FILTER g != null AND (g._id IN innerIds OR g._id IN seedIds)
+                        SORT g.isInternal == true, g._key
+                        LIMIT 1
+                        RETURN g
+                )
+                RETURN {{
+                    n: sd,
+                    parent: ownG != null
+                        ? ownG : {seed_fallback}
+                }}
+        )
+        LET belowPairs = (
+            FOR sd IN seeds
+                FOR v, e, path IN 1..@kh_max_depth OUTBOUND sd._id nodeRelations
+                    OPTIONS {{ bfs: true, uniqueVertices: "path" }}
+                    FILTER LENGTH(
+                        FOR i IN 0..LENGTH(path.edges) - 1
+                            FILTER NOT ( {flat_seed_rule} )
+                            LIMIT 1 RETURN 1
+                    ) == 0
+                    RETURN {{ n: v, parent: path.vertices[LENGTH(path.vertices) - 2] }}
+        )
+        LET pairsB = APPEND(seedPairs, belowPairs)
+        LET openersB = pairsB[* FILTER IS_SAME_COLLECTION("recordGroups", CURRENT.n)
+                                 AND CURRENT.n.permissionModel == "RECORD_GROUP_LEVEL" RETURN CURRENT.n]
+        {open_region_b}
+        // One parent per node: non-internal first, so the drive location beats
+        // Shared with Me (decision 67), then the id for a stable choice.
+        // A group partition lists its own root under the App, but only when
+        // the root can be opened (PG-41).
+        LET rootPairs = ({include_root} AND admitted) ? [{{ n: start, parent: kh_app }}] : []
+        LET flatPairs = start == null ? [] : (
+            FOR pair IN APPEND(APPEND(pairsA, pairsOA), APPEND(APPEND(pairsB, pairsOB), rootPairs))
+                FILTER pair.n._id != start._id
+                    OR ({include_root} AND pair.parent._id == kh_app._id)
+                COLLECT nid = pair.n._id INTO candidates = pair
+                RETURN FIRST(
+                    FOR cand IN candidates
+                        SORT (cand.parent.isInternal == true) ASC, cand.parent._key ASC
+                        LIMIT 1
+                        RETURN cand
+                )
+        )
+        // App-direct keeps only what no top-level group holds (§3.9).
+        LET scopedPairs = {app_direct} ? (
+            FOR pair IN flatPairs
+                FILTER LENGTH(
+                    FOR kh_tg IN 1..1 OUTBOUND start._id nodeRelations
+                        FILTER IS_SAME_COLLECTION("recordGroups", kh_tg)
+                        FOR kh_x IN 0..@kh_max_depth OUTBOUND kh_tg._id nodeRelations
+                            FILTER kh_x._id == pair.n._id
+                            LIMIT 1
+                            RETURN 1
+                ) == 0
+                RETURN pair
+        ) : flatPairs"""
+        flatten_source = """FOR pair IN scopedPairs
+                LET n = pair.n
+                LET parent = pair.parent"""
+        arms, source = (flatten_arms, flatten_source) if flatten else (browse_arms, browse_source)
+
+        query = f"""
+        // The start node may be an App, a record group or a record; NOT_NULL
+        // takes the first collection that holds this key.
+        LET start = NOT_NULL(
+            DOCUMENT("apps", @kh_parent_id),
+            NOT_NULL(
+                DOCUMENT("recordGroups", @kh_parent_id),
+                DOCUMENT("records", @kh_parent_id)
+            )
+        )
+
+        LET u = DOCUMENT("users", @user_key)
+
+        // A collection behaves differently from a connector subtree (decision
+        // 52). Its items carry no inheritance edges at all, so the ordinary
+        // rule would hide every one of them; they are visible because the user
+        // holds a grant on the *collection*, and they carry that grant's role.
+        LET ownerApp = start == null ? null : (
+            IS_SAME_COLLECTION("apps", start) AND start.type == "KB"
+                ? start
+                // A primary-key lookup and an indexed edge walk, not a scan of
+                // every App. The old form ran `FOR a IN apps` once per browse
+                // or flatten call, with a nested edge lookup per App examined.
+                // A null connectorId yields a null document the filter drops.
+                : FIRST(
+                    FOR a IN APPEND(
+                        [DOCUMENT("apps", start.connectorId)],
+                        (FOR bt IN belongsTo
+                             FILTER bt._from == start._id
+                                AND STARTS_WITH(bt._to, "apps/")
+                             RETURN DOCUMENT(bt._to))
+                    )
+                        FILTER a != null AND a.type == "KB"
+                        LIMIT 1
+                        RETURN a
+                  )
+        )
+        {app_role}
+        LET isCollection = ownerApp != null
+        LET collection_role = ownerApp == null ? null : (
+            IS_ARRAY(permission_role)
+                ? (LENGTH(permission_role) > 0 ? permission_role[0] : null)
+                : permission_role
+        )
+
+        // Admissibility: fromApp, viaSeed, inScope (§3.6, §3.8, decision 52).
+        {admission}
+        LET admitted = fromApp OR viaSeed OR inScope
+        LET opensBelow = start != null AND ( {start_opener} OR inScope )
+
+        // Breadcrumbs (§3.3, decision 5): the start node and every hierarchy
+        // ancestor, each with the same admissibility flags and its own record
+        // group, plus for each hierarchy edge between them whether the child
+        // lists under that parent. kh_breadcrumbs walks these flags to pick the
+        // trail, so no permission decision is re-derived in Python.
+        // A collection's items have no hierarchy ancestor, so the walk below
+        // finds nothing and the trail would stop at the item itself. The owning
+        // App reaches them by BELONGS_TO (entityType KB), so add it as a member;
+        // the edge further down then gives kh_breadcrumbs a parent to step to,
+        // and no Python-side rule changes.
+        LET kh_crumb_kb = start == null ? [] : (
+            FOR kh_cbt IN belongsTo
+                FILTER kh_cbt._from == start._id AND kh_cbt.entityType == "KB"
+                LET kh_ckb = DOCUMENT(kh_cbt._to)
+                FILTER kh_ckb != null AND kh_ckb.type == "KB"
+                RETURN kh_ckb
+        )
+        LET members = start == null ? [] : UNION_DISTINCT([start], (
+            FOR anc, ae, apath IN 1..@kh_max_depth INBOUND start._id nodeRelations
+                OPTIONS {{ bfs: true, uniqueVertices: "path" }}
+                FILTER apath.edges[* FILTER CURRENT.relationshipType NOT IN @types] == []
+                RETURN anc
+        ), kh_crumb_kb)
+        LET crumbNodes = (
+            FOR a IN members
+                {crumb_admission}
+                // Every own group, not the lowest id -- see the Cypher twin for
+                // why collapsing here loses a group the user can open.
+                LET ownGroups = UNIQUE(
+                    FOR bt IN belongsTo
+                        FILTER bt._from == a._id AND STARTS_WITH(bt._to, "recordGroups/")
+                        RETURN PARSE_IDENTIFIER(bt._to).key
+                )
+                RETURN {{
+                    id: a._key,
+                    name: NOT_NULL(a.name, a.recordName, a.groupName),
+                    nodeType: IS_SAME_COLLECTION("recordGroups", a) ? "recordGroup"
+                        : (IS_SAME_COLLECTION("apps", a) ? "app" : "record"),
+                    subType: IS_SAME_COLLECTION("apps", a) ? a.type
+                        : (IS_SAME_COLLECTION("recordGroups", a)
+                            ? (a.connectorName == "KB" ? "COLLECTION"
+                               : NOT_NULL(a.groupType, a.connectorName))
+                            : a.recordType),
+                    isInternal: a.isInternal == true,
+                    admitted: a_fromApp OR a_viaSeed OR a_inScope,
+                    fromApp: a_fromApp,
+                    opensBelow: {crumb_opener} OR a_inScope,
+                    ownGroups: ownGroups
+                }}
+        )
+        LET kh_from_app_ids = crumbNodes[* FILTER CURRENT.fromApp RETURN CURRENT.id]
+        LET kh_opens_below_ids = crumbNodes[* FILTER CURRENT.opensBelow RETURN CURRENT.id]
+        LET crumbHierEdges = (
+            FOR ch IN members
+                FOR par, pr IN 1..1 INBOUND ch._id nodeRelations
+                    FILTER par._id IN members[*]._id
+                    RETURN {{
+                        parentId: par._key,
+                        childId: ch._key,
+                        lists: ( {crumb_rule} )
+                            OR ( par._key IN kh_opens_below_ids
+                                 AND pr.relationshipType IN @types
+                                 AND ch.isDeleted != true
+                                 AND par.hideChildren != true )
+                    }}
+        )
+        // No collection edge is emitted. Adding the App to `members` above is
+        // what makes the trail reach it: `kh_breadcrumbs` falls back to an
+        // admitted App when a node has no listing parent, so the edge was
+        // redundant. Measured -- forcing its `lists` false changed no trail on
+        // either engine, while removing the App from `members` collapses kb-f1
+        // to ['kb-f1'] and kb-f2 to ['kb-f1','kb-f2'].
+        LET crumbEdges = crumbHierEdges
+
+        // Browse: arms 1 to 3 list this level. Flatten: region pairs for the
+        // whole subtree, each row with its own parent.
+        {arms}
+
+        LET all_nodes = (
+            {source}
+                LET node = {row}
+                {filter_clause}
+                RETURN node
+        )
+        LET total = LENGTH(all_nodes)
+        LET page = (
+            FOR node IN all_nodes
+                {sort}
+                LIMIT @kh_limit
+                RETURN MERGE(node, {{ sortKey: sortKey, nullRank: nullRank }})
+        )
+
+        RETURN {{
+            rows: page, total: total, ids: {ids_expr}, admitted: admitted,
+            crumbNodes: crumbNodes, crumbEdges: crumbEdges
+        }}
+        """
+        bind_vars.update({
+            "kh_parent_id": parent_id,
+            "kh_gated_apps": gated_app_ids,
+            "grantees": grantee_ids,
+            "types": ["PARENT_CHILD", "ATTACHMENT"],
+            "allowStrict": True,
+            "skipChecks": False,
+            "kh_limit": limit + 1,
+            "kh_max_depth": self._KH_V2_MAX_UP_DEPTH,
+        })
+        bind_vars["user_key"] = user_key
+        # `org_id` only when the role block actually references it: Arango
+        # rejects a query that declares a bind parameter it never uses.
+        if "@org_id" in query:
+            bind_vars["org_id"] = org_id
+
+        try:
+            # Nearly all of this query's time is Arango *planning* it, not running
+            # it: the admission subqueries are spliced in at every use, and
+            # move-calculations-down scales badly on a plan that size. Measured on
+            # the harness: browse 3.5s -> 0.43s, flatten 0.66s -> 0.17s, identical
+            # rows and breadcrumbs, execution unchanged. Recheck at PERF-06/07,
+            # where the rule could start paying for itself on real data.
+            result = await self.http_client.execute_aql(
+                query, bind_vars=bind_vars, txn_id=transaction,
+                options={"optimizer": {"rules": ["-move-calculations-down"]}},
+            )
+        except Exception as e:
+            self.logger.error(f"Error in get_knowledge_hub_children_v2: {str(e)}")
+            raise
+
+        payload = result[0] if result else {}
+        rows = payload.get("rows") or []
+        total = int(payload.get("total") or 0)
+        admitted = bool(payload.get("admitted"))
+        has_more = len(rows) > limit
+        # A previous page was fetched nearest the boundary first; hand it back
+        # in page order.
+        page_rows = rows[:limit]
+        if direction == "prev":
+            page_rows.reverse()
+        # A partition's rows stand on their own admission; only browse and a
+        # scoped flatten hide everything behind the start node's (SEC-02).
+        visible = admitted or partition is not None
+        return {
+            "partitions": [{
+                "partitionId": parent_id,
+                "partitionKind": {"group": "GROUP", "app_direct": "APP_DIRECT"}.get(
+                    partition, "SUBTREE" if flatten else "BROWSE"
+                ),
+                "appId": None,
+                "rows": page_rows if visible else [],
+                "hasMore": has_more if visible else False,
+                "exhausted": (not has_more) if visible else True,
+                "total": (None if after is not None else total) if visible else 0,
+                "ids": (payload.get("ids") or []) if visible else [],
+                "countsByType": None,
+            }],
+            "scope": browse_scope(
+                parent_id, admitted,
+                payload.get("crumbNodes") or [], payload.get("crumbEdges") or [],
+                via_parent_id=via_parent_id,
+            ),
+        }
+
     async def get_knowledge_hub_breadcrumbs(
         self,
         node_id: str,
@@ -15228,11 +16786,11 @@ class ArangoHTTPProvider(IGraphDBProvider):
 
         NOTE(N+1 Queries): Uses iterative parent lookup (one query per level) because a single
         AQL graph traversal isn't feasible here. Parent relationships are stored via multiple
-        edge types: recordRelations (record->record) and belongsTo (record->recordGroup,
+        edge types: nodeRelations (record->record) and belongsTo (record->recordGroup,
         recordGroup->recordGroup, recordGroup->app).
 
         Traversal logic:
-        - Records: Check recordRelations edge from another record first, then belongsTo to recordGroup
+        - Records: Check nodeRelations edge from another record first, then belongsTo to recordGroup
         - RecordGroups: Check belongsTo edge to another recordGroup, then to app (excluding KB apps)
         - Apps: No parent (root level)
         """
@@ -15276,18 +16834,18 @@ class ArangoHTTPProvider(IGraphDBProvider):
 
             // Find parent ID - REFACTORED LOGIC:
             // For Records:
-            //   1. Check recordRelations edge from another RECORD only (at one hop)
+            //   1. Check nodeRelations edge from another RECORD only (at one hop)
             //   2. If no record parent, check belongsTo edge to recordGroup
             // For RecordGroups:
             //   1. Check belongsTo edge to another recordGroup
             //   2. If no parent recordGroup, check belongsTo edge to app (exclude KB apps)
             // For Apps: No parent
             LET parent_id = record != null ? (
-                // For records: Step 1 - Check for recordRelations edge from another record only
+                // For records: Step 1 - Check for nodeRelations edge from another record only
                 // Edge direction: parent -> child (edge._from = parent, edge._to = current record)
                 (
                     LET record_parent = FIRST(
-                        FOR edge IN recordRelations
+                        FOR edge IN nodeRelations
                             FILTER edge._to == record._id
                             AND edge.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
                             LET parent_doc = DOCUMENT(edge._from)
@@ -15667,7 +17225,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     LET start = DOCUMENT(CONCAT(@records_col, "/", seed))
                     FILTER start != null AND start.orgId == @org_id
                     FOR v, e IN 0..@max_depth OUTBOUND start
-                        belongsTo, INBOUND recordRelations
+                        belongsTo, INBOUND nodeRelations
                         // Traversal FILTERs are post-filters only — PRUNE stops
                         // expansion through non-parent edges, past cross-org
                         // nodes, and beyond apps (roots).
@@ -15709,7 +17267,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                         : NOT_NULL(app.name, app.appName, app._key))
 
                 LET rr_parents = rec != null ? (
-                    FOR e IN recordRelations
+                    FOR e IN nodeRelations
                         FILTER e._to == rec._id
                             AND e.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
                         LET p = DOCUMENT(e._from)
@@ -15719,7 +17277,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                         RETURN {
                             parent_id: p._key,
                             parent_type: "record",
-                            via: "recordRelations"
+                            via: "nodeRelations"
                         }
                 ) : []
 
@@ -16174,7 +17732,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         FILTER source != null AND source.orgId == @org_id
 
         LET linked = (
-            FOR v, e IN 1..1 ANY @record_doc_id {CollectionNames.RECORD_RELATIONS.value}
+            FOR v, e IN 1..1 ANY @record_doc_id {CollectionNames.NODE_RELATIONS.value}
                 FILTER e.relationshipType IN @relation_types
                 LET record = v
                 FILTER record != null AND record.orgId == @org_id
@@ -16188,7 +17746,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 FILTER r_norm != null AND r_norm != ""
 
                 LET has_children = LENGTH(
-                    FOR ce IN {CollectionNames.RECORD_RELATIONS.value}
+                    FOR ce IN {CollectionNames.NODE_RELATIONS.value}
                         FILTER ce._from == record._id
                         AND ce.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
                         LIMIT 1
@@ -16262,14 +17820,14 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     rg.parentId != null ? rg.parentId : rg.connectorId
                 )
             ) : (
-                // Records: For KB records, check recordRelations first (to find parent folder/record for nested items),
+                // Records: For KB records, check nodeRelations first (to find parent folder/record for nested items),
                 // then fallback to belongsTo (to find parent KB record group for immediate children)
-                // For connector records, check recordRelations edge first
+                // For connector records, check nodeRelations edge first
                 record != null ? (
                     is_kb_record ? (
-                        // First check recordRelations for nested folders/records
+                        // First check nodeRelations for nested folders/records
                         FIRST(
-                            FOR edge IN recordRelations
+                            FOR edge IN nodeRelations
                                 FILTER edge._to == record._id AND edge.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
                                 RETURN PARSE_IDENTIFIER(edge._from).key
                         ) ||
@@ -16282,11 +17840,11 @@ class ArangoHTTPProvider(IGraphDBProvider):
                                 RETURN PARSE_IDENTIFIER(edge._to).key
                         )
                     ) : (
-                        // For connector records, check recordRelations first (for nested folders/records),
+                        // For connector records, check nodeRelations first (for nested folders/records),
                         // then belongsTo (for immediate children of record groups),
                         // then inheritPermissions (alternative way records can be connected to record groups)
                         LET parent_from_rel = FIRST(
-                            FOR edge IN recordRelations
+                            FOR edge IN nodeRelations
                                 FILTER edge._to == record._id AND edge.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
                                 LET parent_record = DOCUMENT(edge._from)
                                 // Ensure the parent is actually a record (folder), not a record group
@@ -16560,7 +18118,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     FILTER permEdge.type == "USER"
                     LIMIT 1
                     LET parentFolder = FIRST(
-                        FOR parent, relEdge IN 1..1 INBOUND recordDoc._id @@record_relations
+                        FOR parent, relEdge IN 1..1 INBOUND recordDoc._id @@node_relations
                             FILTER relEdge.relationshipType == 'PARENT_CHILD'
                             FILTER PARSE_IDENTIFIER(parent._id).collection == @files
                             RETURN parent
@@ -16603,7 +18161,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 ) : null
                 FILTER highest_role != null
                 LET parentFolder = FIRST(
-                    FOR parent, relEdge IN 1..1 INBOUND recordDoc._id @@record_relations
+                    FOR parent, relEdge IN 1..1 INBOUND recordDoc._id @@node_relations
                         FILTER relEdge.relationshipType == 'PARENT_CHILD'
                         FILTER PARSE_IDENTIFIER(parent._id).collection == @files
                         RETURN parent
@@ -16651,7 +18209,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 "@anyone": CollectionNames.ANYONE.value,
                 "@belongs_to": CollectionNames.BELONGS_TO.value,
                 "@permission": CollectionNames.PERMISSION.value,
-                "@record_relations": CollectionNames.RECORD_RELATIONS.value,
+                "@node_relations": CollectionNames.NODE_RELATIONS.value,
             }
 
             results = await self.http_client.execute_aql(
@@ -17037,7 +18595,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 FILTER record != null AND record.isDeleted != true
                 // Root-level: no parent record within this KB
                 LET has_parent = LENGTH(
-                    FOR rel IN recordRelations
+                    FOR rel IN nodeRelations
                         FILTER rel._to == record._id
                         AND rel.relationshipType == "PARENT_CHILD"
                         LIMIT 1
@@ -17050,7 +18608,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 )
                 LET is_folder = record.mimeType == "application/vnd.folder"
                 LET has_children = is_folder ? (LENGTH(
-                    FOR rel IN recordRelations
+                    FOR rel IN nodeRelations
                         FILTER rel._from == record._id
                         AND rel.relationshipType == "PARENT_CHILD"
                         LIMIT 1
@@ -17181,7 +18739,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 LET file_info = FIRST(FOR fe IN isOfType FILTER fe._from == record._id LET f = DOCUMENT(fe._to) RETURN f)
                 LET is_folder = file_info != null AND file_info.isFile == false
                 LET has_children = (LENGTH(
-                    FOR ce IN recordRelations
+                    FOR ce IN nodeRelations
                         FILTER ce._from == record._id
                         AND ce.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
                         AND ce.isDeleted != true
@@ -17342,7 +18900,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 LET file_info = FIRST(FOR fe IN isOfType FILTER fe._from == record._id LET f = DOCUMENT(fe._to) RETURN f)
                 LET is_folder = file_info != null AND file_info.isFile == false
                 LET has_children = (LENGTH(
-                    FOR ce IN recordRelations
+                    FOR ce IN nodeRelations
                         FILTER ce._from == record._id
                         AND ce.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
                         AND ce.isDeleted != true
@@ -17447,7 +19005,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 LET file_info = FIRST(FOR fe IN isOfType FILTER fe._from == record._id LET f = DOCUMENT(fe._to) RETURN f)
                 LET is_folder = file_info != null AND file_info.isFile == false
                 LET has_children = (LENGTH(
-                    FOR ce IN recordRelations
+                    FOR ce IN nodeRelations
                         FILTER ce._from == record._id
                         AND ce.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
                         AND ce.isDeleted != true
@@ -17584,11 +19142,11 @@ class ArangoHTTPProvider(IGraphDBProvider):
 
                 FILTER normalized_role != null AND normalized_role != ""
 
-                // Calculate hasChildren via recordRelations
+                // Calculate hasChildren via nodeRelations
                 LET file_info = FIRST(FOR fe IN isOfType FILTER fe._from == record._id LET f = DOCUMENT(fe._to) RETURN f)
                 LET is_folder = file_info != null AND file_info.isFile == false
                 LET has_children = (LENGTH(
-                    FOR ce IN recordRelations
+                    FOR ce IN nodeRelations
                         FILTER ce._from == record._id
                         AND ce.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
                         AND ce.isDeleted != true
@@ -17632,7 +19190,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         """Generate AQL sub-query to fetch children of a Folder/Record.
 
         Simplified unified approach:
-        - Uses recordRelations edge with relationshipType filter (PARENT_CHILD, ATTACHMENT)
+        - Uses nodeRelations edge with relationshipType filter (PARENT_CHILD, ATTACHMENT)
         - Uses _get_permission_role_aql for comprehensive permission checking (all 10 paths)
         - Applies permission checks to both KB and Connector records
         - Returns only children where user has permission
@@ -17652,7 +19210,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         FILTER u != null
 
         LET raw_children = (
-            FOR edge IN recordRelations
+            FOR edge IN nodeRelations
                 FILTER edge._from == @record_doc_id
                 AND edge.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
                 LET record = DOCUMENT(edge._to)
@@ -17681,7 +19239,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
 
                 // Simple hasChildren check (no permission filtering on grandchildren)
                 LET has_children = (LENGTH(
-                    FOR ce IN recordRelations
+                    FOR ce IN nodeRelations
                         FILTER ce._from == record._id
                         AND ce.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
                         LET c = DOCUMENT(ce._to)
@@ -18441,7 +19999,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         Build AQL to traverse children from parent and intersect with accessible nodes.
 
         This ensures scoped search only returns nodes that are:
-        1. Within the parent's hierarchy (via belongsTo or recordRelations)
+        1. Within the parent's hierarchy (via belongsTo or nodeRelations)
         2. Accessible to the user (from permission traversal)
 
         Returns:
@@ -18485,11 +20043,11 @@ class ArangoHTTPProvider(IGraphDBProvider):
         elif parent_type in ("record", "folder"):
             max_depth = min(max(1, depth), 100) if depth is not None else 100
             return f"""
-        // Traverse children of record/folder parent via recordRelations edge
+        // Traverse children of record/folder parent via nodeRelations edge
         LET parent_record = DOCUMENT(@parent_doc_id)
 
         LET parent_descendant_record_ids = parent_record != null ? (
-            FOR v, e, p IN 1..{max_depth} OUTBOUND parent_record._id recordRelations
+            FOR v, e, p IN 1..{max_depth} OUTBOUND parent_record._id nodeRelations
                 FILTER e.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
                 FILTER IS_SAME_COLLECTION("records", v)
                 FILTER v != null AND v.isDeleted != true
@@ -18520,7 +20078,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                     child_traversal = f"""
         LET child_record_ids = (
             FOR rec_id IN direct_record_ids
-                FOR v, e IN 1..{remaining} OUTBOUND rec_id recordRelations
+                FOR v, e IN 1..{remaining} OUTBOUND rec_id nodeRelations
                     FILTER e.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
                     FILTER IS_SAME_COLLECTION("records", v)
                     FILTER v != null AND v.isDeleted != true
@@ -18590,7 +20148,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
         LET ancestor_doc_id = CONCAT("records/", @ancestor_id)
 
         // Traverse down from ancestor to find if descendant is reachable
-        FOR v IN 1..100 OUTBOUND ancestor_doc_id @@record_relations
+        FOR v IN 1..100 OUTBOUND ancestor_doc_id @@node_relations
             OPTIONS { bfs: true, uniqueVertices: "global" }
             FILTER v._key == @descendant_id
             LIMIT 1
@@ -18602,7 +20160,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 bind_vars={
                     "ancestor_id": ancestor_id,
                     "descendant_id": record_id,
-                    "@record_relations": CollectionNames.RECORD_RELATIONS.value,
+                    "@node_relations": CollectionNames.NODE_RELATIONS.value,
                 },
                 txn_id=transaction
             )
@@ -18636,7 +20194,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
 
         // Find the incoming PARENT_CHILD or ATTACHMENT edge
         LET parent_edge = FIRST(
-            FOR edge IN @@record_relations
+            FOR edge IN @@node_relations
                 FILTER edge._to == record_doc_id
                 FILTER edge.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
                 RETURN edge
@@ -18658,7 +20216,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 query,
                 bind_vars={
                     "record_id": record_id,
-                    "@record_relations": CollectionNames.RECORD_RELATIONS.value,
+                    "@node_relations": CollectionNames.NODE_RELATIONS.value,
                 },
                 txn_id=transaction
             )
@@ -18673,7 +20231,12 @@ class ArangoHTTPProvider(IGraphDBProvider):
         transaction: str | None = None
     ) -> int:
         """
-        Delete all PARENT_CHILD edges pointing to a record.
+        Delete the PARENT_CHILD edge from a record's parent *record*.
+
+        Scoped to record sources on purpose. A record group hangs its top-level
+        records off itself with the same relationship type, and Shared with Me
+        adds a second such edge (D55); an unscoped delete would take those too,
+        leaving the record with no hierarchy parent at all.
 
         Args:
             record_id: The record key (target of the edge)
@@ -18685,10 +20248,11 @@ class ArangoHTTPProvider(IGraphDBProvider):
         query = """
         LET record_doc_id = CONCAT("records/", @record_id)
 
-        FOR edge IN @@record_relations
+        FOR edge IN @@node_relations
             FILTER edge._to == record_doc_id
-            FILTER edge.relationshipType == "PARENT_CHILD"
-            REMOVE edge IN @@record_relations
+            FILTER STARTS_WITH(edge._from, "records/")
+            FILTER edge.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
+            REMOVE edge IN @@node_relations
             RETURN OLD
         """
         try:
@@ -18696,7 +20260,7 @@ class ArangoHTTPProvider(IGraphDBProvider):
                 query,
                 bind_vars={
                     "record_id": record_id,
-                    "@record_relations": CollectionNames.RECORD_RELATIONS.value,
+                    "@node_relations": CollectionNames.NODE_RELATIONS.value,
                 },
                 txn_id=transaction
             )

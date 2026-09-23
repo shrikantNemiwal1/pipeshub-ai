@@ -45,6 +45,7 @@ from app.config.constants.neo4j import (
     COLLECTION_TO_LABEL,
     EDGE_COLLECTION_TO_RELATIONSHIP,
     Neo4jLabel,
+    Neo4jRelationshipType,
     build_node_id,
     collection_to_label,
     edge_collection_to_relationship,
@@ -111,6 +112,8 @@ from app.services.graph_db.vector_membership_queries import (
 )
 from app.utils.env_config import env_int
 from app.utils.env_utils import env_bool
+from app.utils.kh_breadcrumbs import browse_scope
+from app.utils.kh_partitions import build_partitions
 from app.utils.time_conversion import get_epoch_timestamp_in_ms
 
 # Constants
@@ -2327,7 +2330,7 @@ class Neo4jProvider(IGraphDBProvider):
                 curr_node = f"n{i}"
                 rel_var = f"r{i}"
                 step_blocks.append(
-                        f"""MATCH ({prev_node})-[{rel_var}:RECORD_RELATION {{relationshipType: "PARENT_CHILD"}}]->({curr_node}:Record)
+                        f"""MATCH ({prev_node})-[{rel_var}:NODE_RELATION {{relationshipType: "PARENT_CHILD"}}]->({curr_node}:Record)
                 WHERE {curr_node}.recordName = parts[{i}]"""
                     )
 
@@ -2787,7 +2790,7 @@ class Neo4jProvider(IGraphDBProvider):
                 UNWIND candidateRecords AS record
 
                 // 3) Root = no parent in group linked by PARENT_CHILD/ATTACHMENT
-                OPTIONAL MATCH (parent:Record)-[r:RECORD_RELATION]->(record)
+                OPTIONAL MATCH (parent:Record)-[r:NODE_RELATION]->(record)
                 WHERE r.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT']
                 AND parent IN candidateRecords
 
@@ -2796,7 +2799,7 @@ class Neo4jProvider(IGraphDBProvider):
                 UNWIND roots AS root
 
                 // 4) Roots + descendants via PARENT_CHILD/ATTACHMENT only (*0.. = include root)
-                MATCH treePath = (root)-[:RECORD_RELATION*0..{reindex_tree_depth}]->(record:Record)
+                MATCH treePath = (root)-[:NODE_RELATION*0..{reindex_tree_depth}]->(record:Record)
                 WHERE all(rel IN relationships(treePath) WHERE rel.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT'])
                 AND record IN candidateRecords
                 AND record.connectorId = $connector_id
@@ -2893,7 +2896,7 @@ class Neo4jProvider(IGraphDBProvider):
     ) -> list[Record]:
         """
         Get all child records of a parent record (folder) up to a specified depth.
-        Uses graph traversal on RECORD_RELATIONS relationship. Parent record is always included.
+        Uses graph traversal on NODE_RELATIONS relationship. Parent record is always included.
 
         Args:
             parent_record_id: Record ID of the parent (folder)
@@ -2961,7 +2964,7 @@ class Neo4jProvider(IGraphDBProvider):
                 {user_match}
 
                 // Single traversal for parent (depth 0) and all children (depth 1+)
-                OPTIONAL MATCH path = (startRecord)-[:RECORD_RELATION*0..{max_depth}]->(record:Record)
+                OPTIONAL MATCH path = (startRecord)-[:NODE_RELATION*0..{max_depth}]->(record:Record)
                 WHERE (length(path) = 0 OR all(rel IN relationships(path) WHERE rel.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT']))
                 AND record.connectorId = $connector_id
                 AND (record.orgId = $org_id OR record.orgId IS NULL)
@@ -3167,7 +3170,7 @@ class Neo4jProvider(IGraphDBProvider):
         try:
             query ="""
             // PROFILE
-            MATCH path = (start_record:Record {id: $record_id})<-[:RECORD_RELATION*0..100]-(ancestor)
+            MATCH path = (start_record:Record {id: $record_id})<-[:NODE_RELATION*0..100]-(ancestor)
 
             // 1. Edge Filter: Ensure the edge acts as a parent-child link
             WHERE all(r IN relationships(path) WHERE r.relationshipType = 'PARENT_CHILD')
@@ -3684,6 +3687,99 @@ class Neo4jProvider(IGraphDBProvider):
         except Exception as e:
             self.logger.error(f"❌ Get legacy KB record groups failed: {str(e)}")
             return []
+
+    async def migrate_legacy_relation_edge(
+        self,
+        legacy_collection: str,
+        legacy_relationship_type: str,
+    ) -> dict:
+        """Move every hierarchy edge onto the current relationship type
+        (decision 74).
+
+        Unlike Arango, Neo4j cannot rename a relationship type — a type is part
+        of the relationship's identity — so each edge is recreated under the new
+        type and the old one deleted. APOC does that in one call and ships in
+        every deployment image, but a self-managed Neo4j may not have it, so a
+        batched fallback follows. `legacy_collection` is unused: it is Arango's
+        half.
+
+        Both paths preserve edge properties; without that, `relationshipType`
+        would be lost and every edge would stop counting as hierarchy.
+        """
+        current = Neo4jRelationshipType.NODE_RELATIONS.value
+        # Interpolated, never parameterised: a relationship type is syntax in
+        # Cypher, not a value. Both names are module constants, never input.
+        if not legacy_relationship_type.replace("_", "").isalnum():
+            raise ValueError(f"Unsafe relationship type: {legacy_relationship_type!r}")
+
+        try:
+            remaining = await self.client.execute_query(
+                f"MATCH ()-[r:{legacy_relationship_type}]->() RETURN count(r) AS n"
+            )
+            total = (remaining or [{}])[0].get("n", 0) if remaining else 0
+            if not total:
+                return {"migrated": 0, "already_current": True}
+
+            migrated = 0
+            apoc_ran = False
+            try:
+                rows = await self.client.execute_query(
+                    "CALL apoc.refactor.rename.type($old, $new) "
+                    "YIELD committedOperations RETURN committedOperations AS n",
+                    parameters={"old": legacy_relationship_type, "new": current},
+                )
+                migrated = (rows or [{}])[0].get("n", 0) if rows else 0
+                apoc_ran = True
+            except Exception as apoc_error:
+                message = str(apoc_error).lower()
+                if "apoc" not in message and "unknown procedure" not in message:
+                    raise
+                self.logger.warning(
+                    f"APOC unavailable ({apoc_error}); recreating {total} edge(s) in batches"
+                )
+
+            if apoc_ran:
+                # APOC batches internally and returns normally on partial
+                # failure, so committedOperations alone cannot distinguish a
+                # complete rename from one that left edges behind. Verifying is
+                # what stops the caller writing the completion flag over a
+                # half-migrated graph: those edges would match no query and
+                # nothing would ever re-check them.
+                left = await self.client.execute_query(
+                    f"MATCH ()-[r:{legacy_relationship_type}]->() RETURN count(r) AS n"
+                )
+                still_legacy = (left or [{}])[0].get("n", 0) if left else 0
+                if still_legacy:
+                    raise Exception(
+                        f"APOC reported {migrated} of {total} edge(s) renamed but "
+                        f"{still_legacy} still carry '{legacy_relationship_type}'"
+                    )
+                self.logger.info(f"Renamed {migrated} edge(s) to '{current}' via APOC")
+                return {"migrated": migrated, "already_current": False}
+
+            migrated = 0
+            while True:
+                rows = await self.client.execute_query(
+                    f"""
+                    MATCH (a)-[r:{legacy_relationship_type}]->(b)
+                    WITH a, b, r LIMIT $batch
+                    CREATE (a)-[r2:{current}]->(b)
+                    SET r2 = properties(r)
+                    DELETE r
+                    RETURN count(r2) AS n
+                    """,
+                    parameters={"batch": 10000},
+                )
+                done = (rows or [{}])[0].get("n", 0) if rows else 0
+                migrated += done
+                if not done:
+                    break
+            self.logger.info(f"Recreated {migrated} edge(s) as '{current}'")
+            return {"migrated": migrated, "already_current": False}
+
+        except Exception as e:
+            self.logger.error(f"❌ Legacy relation edge migration failed: {str(e)}")
+            raise
 
     async def migrate_legacy_kb_to_app(
         self,
@@ -5654,11 +5750,11 @@ class Neo4jProvider(IGraphDBProvider):
 
         await self.batch_create_edges(
             [edge],
-            collection=CollectionNames.RECORD_RELATIONS.value,
+            collection=CollectionNames.NODE_RELATIONS.value,
             transaction=transaction
         )
 
-    async def batch_upsert_record_relations(
+    async def batch_upsert_node_relations(
         self,
         edges: list[dict],
         transaction: Optional[str] = None
@@ -5705,7 +5801,7 @@ class Neo4jProvider(IGraphDBProvider):
             UNWIND $edges AS edge
             MATCH (from:Record {id: edge.from_key})
             MATCH (to:Record {id: edge.to_key})
-            MERGE (from)-[r:RECORD_RELATION {relationshipType: edge.relationshipType, constraintName: edge.constraintName}]->(to)
+            MERGE (from)-[r:NODE_RELATION {relationshipType: edge.relationshipType, constraintName: edge.constraintName}]->(to)
             SET r += edge.props
             RETURN count(r) AS upserted
             """
@@ -5743,7 +5839,7 @@ class Neo4jProvider(IGraphDBProvider):
         """
         try:
             query = """
-            MATCH (child:Record)-[r:RECORD_RELATION]->(parent:Record {id: $record_id})
+            MATCH (child:Record)-[r:NODE_RELATION]->(parent:Record {id: $record_id})
             WHERE r.relationshipType = $relation_type
             RETURN child.id AS record_id,
                    COALESCE(r.childTableName, '') AS childTable,
@@ -5829,7 +5925,7 @@ class Neo4jProvider(IGraphDBProvider):
         """
         try:
             query = """
-            MATCH (child:Record {id: $record_id})-[r:RECORD_RELATION]->(parent:Record)
+            MATCH (child:Record {id: $record_id})-[r:NODE_RELATION]->(parent:Record)
             WHERE r.relationshipType = $relation_type
             RETURN parent.id AS record_id,
                    COALESCE(r.parentTableName, '') AS parentTable,
@@ -5860,7 +5956,7 @@ class Neo4jProvider(IGraphDBProvider):
             )
             return []
 
-    async def get_record_relations_batch(
+    async def get_node_relations_batch(
         self,
         record_ids: list[str],
         relation_types: list[str],
@@ -5879,7 +5975,7 @@ class Neo4jProvider(IGraphDBProvider):
             return out
         try:
             query = """
-            MATCH (a:Record)-[r:RECORD_RELATION]-(b:Record)
+            MATCH (a:Record)-[r:NODE_RELATION]-(b:Record)
             WHERE a.id IN $record_ids AND r.relationshipType IN $relation_types
             RETURN a.id AS anchor_id,
                    b.id AS record_id,
@@ -5920,7 +6016,7 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.warning(
                 "Failed to batch record relations for %d records: %s", len(record_ids), str(e),
             )
-            return await super().get_record_relations_batch(
+            return await super().get_node_relations_batch(
                 record_ids, relation_types, transaction,
             )
 
@@ -6178,7 +6274,7 @@ class Neo4jProvider(IGraphDBProvider):
         """Get parent file external IDs"""
         try:
             query = """
-            MATCH (parent:Record)-[:RECORD_RELATION]->(child:Record {id: $file_key})
+            MATCH (parent:Record)-[:NODE_RELATION]->(child:Record {id: $file_key})
             RETURN parent.externalRecordId AS externalRecordId
             """
 
@@ -6690,66 +6786,6 @@ class Neo4jProvider(IGraphDBProvider):
 
         except Exception as e:
             self.logger.error(f"❌ Batch upsert domains failed: {str(e)}")
-            raise
-
-    async def batch_upsert_anyone(
-        self,
-        anyone: list[dict],
-        transaction: str | None = None
-    ) -> None:
-        """Batch upsert anyone entities"""
-        try:
-            if not anyone:
-                return
-
-            await self.batch_upsert_nodes(
-                anyone,
-                collection=CollectionNames.ANYONE.value,
-                transaction=transaction
-            )
-
-        except Exception as e:
-            self.logger.error(f"❌ Batch upsert anyone failed: {str(e)}")
-            raise
-
-    async def batch_upsert_anyone_with_link(
-        self,
-        anyone_with_link: list[dict],
-        transaction: str | None = None
-    ) -> None:
-        """Batch upsert anyone with link"""
-        try:
-            if not anyone_with_link:
-                return
-
-            await self.batch_upsert_nodes(
-                anyone_with_link,
-                collection=CollectionNames.ANYONE_WITH_LINK.value,
-                transaction=transaction
-            )
-
-        except Exception as e:
-            self.logger.error(f"❌ Batch upsert anyone with link failed: {str(e)}")
-            raise
-
-    async def batch_upsert_anyone_same_org(
-        self,
-        anyone_same_org: list[dict],
-        transaction: str | None = None
-    ) -> None:
-        """Batch upsert anyone same org"""
-        try:
-            if not anyone_same_org:
-                return
-
-            await self.batch_upsert_nodes(
-                anyone_same_org,
-                collection=CollectionNames.ANYONE_SAME_ORG.value,
-                transaction=transaction
-            )
-
-        except Exception as e:
-            self.logger.error(f"❌ Batch upsert anyone same org failed: {str(e)}")
             raise
 
     async def batch_create_user_app_edges(
@@ -7565,7 +7601,7 @@ class Neo4jProvider(IGraphDBProvider):
 
             sync_edge_collections = [
                 CollectionNames.BELONGS_TO.value,
-                CollectionNames.RECORD_RELATIONS.value,
+                CollectionNames.NODE_RELATIONS.value,
                 CollectionNames.PERMISSION.value,
                 CollectionNames.INHERIT_PERMISSIONS.value,
                 CollectionNames.USER_APP_RELATION.value,
@@ -8438,7 +8474,7 @@ class Neo4jProvider(IGraphDBProvider):
                     MATCH (rg2:RecordGroup {{connectorId: $parent_id}})
                     WHERE rg2.isDeleted <> true
                     MATCH (top:Record)-[:BELONGS_TO]->(rg2)
-                    MATCH path = (top)-[:RECORD_RELATION*1..{record_depth}]->(desc:Record)
+                    MATCH path = (top)-[:NODE_RELATION*1..{record_depth}]->(desc:Record)
                     WHERE ALL(rel IN relationships(path)
                               WHERE rel.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT'])
                     AND desc.id IN $node_ids
@@ -8455,7 +8491,7 @@ class Neo4jProvider(IGraphDBProvider):
                     RETURN direct.id AS id, 1 AS level
                     UNION ALL
                     MATCH (top:Record)-[:BELONGS_TO]->(rg2:RecordGroup {{id: $parent_id}})
-                    MATCH path = (top)-[:RECORD_RELATION*1..{record_depth}]->(desc:Record)
+                    MATCH path = (top)-[:NODE_RELATION*1..{record_depth}]->(desc:Record)
                     WHERE ALL(rel IN relationships(path)
                               WHERE rel.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT'])
                     AND desc.id IN $node_ids
@@ -8466,7 +8502,7 @@ class Neo4jProvider(IGraphDBProvider):
             else:
                 query = f"""
                 MATCH (parent:Record {{id: $parent_id}})
-                MATCH path = (parent)-[:RECORD_RELATION*1..{safe_depth}]->(descendant:Record)
+                MATCH path = (parent)-[:NODE_RELATION*1..{safe_depth}]->(descendant:Record)
                 WHERE ALL(rel IN relationships(path)
                           WHERE rel.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT'])
                 AND descendant.id IN $node_ids
@@ -10515,7 +10551,7 @@ class Neo4jProvider(IGraphDBProvider):
             MATCH (folder:Record {id: $folder_id})
             WHERE folder.mimeType = "application/vnd.folder"
             MATCH (folder)-[:BELONGS_TO]->(kb:App {id: $kb_id, type: "KB"})
-            OPTIONAL MATCH (folder)<-[:RECORD_RELATION {relationshipType: "PARENT_CHILD"}]-(child:Record)
+            OPTIONAL MATCH (folder)<-[:NODE_RELATION {relationshipType: "PARENT_CHILD"}]-(child:Record)
             RETURN folder, collect(DISTINCT {record: child}) AS children
             LIMIT 1
             """
@@ -10584,7 +10620,7 @@ class Neo4jProvider(IGraphDBProvider):
                 txn_id = await self.begin_transaction(
                     read=[],
                     write=node_collections + [
-                        CollectionNames.RECORD_RELATIONS.value,
+                        CollectionNames.NODE_RELATIONS.value,
                         CollectionNames.IS_OF_TYPE.value,
                         CollectionNames.BELONGS_TO.value,
                         CollectionNames.PERMISSION.value,
@@ -10604,7 +10640,7 @@ class Neo4jProvider(IGraphDBProvider):
                 WITH valid_roots, [r IN valid_roots | r.id] AS valid_root_keys
                 // 2. Containment subtree, depth-0 inclusive
                 UNWIND (CASE WHEN size(valid_roots) = 0 THEN [null] ELSE valid_roots END) AS root
-                OPTIONAL MATCH path = (root)-[:RECORD_RELATION*0..20]->(v:Record)
+                OPTIONAL MATCH path = (root)-[:NODE_RELATION*0..20]->(v:Record)
                 WHERE root IS NOT NULL AND all(rel IN relationships(path) WHERE rel.relationshipType IN """ + traversal_types + """)
                 WITH valid_root_keys, collect(DISTINCT v) AS all_vertices
                 // 3. Attach each record's isOfType type doc (any label)
@@ -10631,6 +10667,7 @@ class Neo4jProvider(IGraphDBProvider):
                     for rid in record_ids if rid not in valid_root_keys
                 ]
 
+                reparented: list[dict] = []
                 if not cascade_children and valid_root_keys:
                     valid_root_key_set = set(valid_root_keys)
                     parent_external_ids: list[str] = []
@@ -10645,14 +10682,19 @@ class Neo4jProvider(IGraphDBProvider):
                         seen_parent_ids.add(peid)
                         parent_external_ids.append(peid)
                     if parent_external_ids:
-                        await self.client.execute_query(
+                        # The group is returned, not just matched, because the caller
+                        # re-points each survivor's hierarchy and inheritance at it
+                        # (decision 73) — DETACH DELETE below removes the ones that
+                        # pointed at the deleted parent.
+                        rows = await self.client.execute_query(
                             """
                             UNWIND $parent_external_ids AS peid
-                            MATCH (survivor:Record)-[:BELONGS_TO]->(:RecordGroup)
+                            MATCH (survivor:Record)-[:BELONGS_TO]->(rg:RecordGroup)
                             WHERE survivor.connectorId = $connector_id
                               AND survivor.externalParentId = peid
                               AND NOT survivor.id IN $deleted_ids
                             SET survivor.externalParentId = null
+                            RETURN DISTINCT survivor.id AS record_id, rg.id AS record_group_id
                             """,
                             parameters={
                                 "parent_external_ids": parent_external_ids,
@@ -10661,6 +10703,11 @@ class Neo4jProvider(IGraphDBProvider):
                             },
                             txn_id=txn_id,
                         )
+                        reparented = [
+                            {"record_id": r["record_id"], "record_group_id": r["record_group_id"]}
+                            for r in (rows or [])
+                            if r and r.get("record_id") and r.get("record_group_id")
+                        ]
 
                 if record_keys:
                     # Delete the isOfType type docs (any label) via the record, then the
@@ -10709,6 +10756,7 @@ class Neo4jProvider(IGraphDBProvider):
                     "successfully_deleted": len(valid_root_keys),
                     "failed_count": len(failed_records),
                     "eventData": event_data,
+                    "reparented": reparented,
                 }
             except Exception as db_error:
                 if transaction is None and txn_id:
@@ -10737,7 +10785,7 @@ class Neo4jProvider(IGraphDBProvider):
                 txn_id = await self.begin_transaction(
                     read=[],
                     write=node_collections + [
-                        CollectionNames.RECORD_RELATIONS.value,
+                        CollectionNames.NODE_RELATIONS.value,
                         CollectionNames.IS_OF_TYPE.value,
                         CollectionNames.BELONGS_TO.value,
                         CollectionNames.PERMISSION.value,
@@ -10837,12 +10885,12 @@ class Neo4jProvider(IGraphDBProvider):
         Find a folder by name within a specific parent (KB root or folder).
 
         New logic:
-        - For KB root: Find folders with BELONGS_TO edge to KB that have NO incoming RECORD_RELATION edges
-        - For nested folders: Find folders with RECORD_RELATION edge from parent
+        - For KB root: Find folders with BELONGS_TO edge to KB that have NO incoming NODE_RELATION edges
+        - For nested folders: Find folders with NODE_RELATION edge from parent
         """
         try:
             if parent_folder_id is None:
-                # KB root: Find immediate children (no incoming RECORD_RELATION edges)
+                # KB root: Find immediate children (no incoming NODE_RELATION edges)
                 query = """
                 MATCH (folder:Record)-[:BELONGS_TO]->(kb:App {id: $kb_id, type: "KB"})
                 WHERE folder.mimeType = "application/vnd.folder"
@@ -10850,16 +10898,16 @@ class Neo4jProvider(IGraphDBProvider):
                   AND folder.isDeleted <> true
                   AND ($exclude_folder_id IS NULL OR folder.id <> $exclude_folder_id)
                   AND NOT EXISTS {
-                      MATCH (folder)<-[:RECORD_RELATION {relationshipType: "PARENT_CHILD"}]-(:Record)
+                      MATCH (folder)<-[:NODE_RELATION {relationshipType: "PARENT_CHILD"}]-(:Record)
                   }
                 RETURN folder
                 LIMIT 1
                 """
                 params = {"kb_id": kb_id, "folder_name": folder_name, "exclude_folder_id": exclude_folder_id}
             else:
-                # Nested folder: Find children via RECORD_RELATION edge
+                # Nested folder: Find children via NODE_RELATION edge
                 query = """
-                MATCH (parent:Record {id: $parent_folder_id})-[:RECORD_RELATION {relationshipType: "PARENT_CHILD"}]->(folder:Record)
+                MATCH (parent:Record {id: $parent_folder_id})-[:NODE_RELATION {relationshipType: "PARENT_CHILD"}]->(folder:Record)
                 WHERE folder.mimeType = "application/vnd.folder"
                   AND toLower(folder.recordName) = toLower($folder_name)
                   AND ($exclude_folder_id IS NULL OR folder.id <> $exclude_folder_id)
@@ -10902,7 +10950,7 @@ class Neo4jProvider(IGraphDBProvider):
                   AND file.mimeType = $mime_type
                   AND ($exclude_record_id IS NULL OR file_record.id <> $exclude_record_id)
                   AND NOT EXISTS {
-                      MATCH (file_record)<-[:RECORD_RELATION {relationshipType: "PARENT_CHILD"}]-(:Record)
+                      MATCH (file_record)<-[:NODE_RELATION {relationshipType: "PARENT_CHILD"}]-(:Record)
                   }
                 RETURN file_record, file
                 LIMIT 1
@@ -10915,7 +10963,7 @@ class Neo4jProvider(IGraphDBProvider):
                 }
             else:
                 query = """
-                MATCH (parent:Record {id: $parent_folder_id})-[:RECORD_RELATION {relationshipType: "PARENT_CHILD"}]->(file_record:Record)
+                MATCH (parent:Record {id: $parent_folder_id})-[:NODE_RELATION {relationshipType: "PARENT_CHILD"}]->(file_record:Record)
                 MATCH (file_record)-[:IS_OF_TYPE]->(file:File {isFile: true})
                 WHERE file_record.isDeleted <> true
                   AND toLower(file_record.recordName) = toLower($file_name)
@@ -10965,14 +11013,14 @@ class Neo4jProvider(IGraphDBProvider):
                 MATCH (rec:Record)-[:BELONGS_TO]->(kb:App {id: $kb_id, type: "KB"})
                 WHERE rec.isDeleted <> true
                   AND NOT rec.mimeType = "application/vnd.folder"
-                  AND NOT (rec)<-[:RECORD_RELATION {relationshipType: "PARENT_CHILD"}]-(:Record)
+                  AND NOT (rec)<-[:NODE_RELATION {relationshipType: "PARENT_CHILD"}]-(:Record)
                 RETURN toLower(rec.recordName) AS name_lower, rec.mimeType AS mime_type
                 """
                 params: dict = {"kb_id": kb_id}
             else:
                 query = """
                 MATCH (parent:Record {id: $parent_folder_id})
-                      -[:RECORD_RELATION {relationshipType: "PARENT_CHILD"}]->
+                      -[:NODE_RELATION {relationshipType: "PARENT_CHILD"}]->
                       (rec:Record)
                 MATCH (rec)-[:IS_OF_TYPE]->(file:File {isFile: true})
                 WHERE rec.isDeleted <> true
@@ -12327,7 +12375,7 @@ class Neo4jProvider(IGraphDBProvider):
             MATCH (kb:App {{id: $kb_id, type: "KB"}})
             MATCH (folder:Record)-[:BELONGS_TO]->(kb)
             WHERE folder.mimeType = "application/vnd.folder"{folder_match}
-            MATCH (folder)-[rel:RECORD_RELATION {{relationshipType: "PARENT_CHILD"}}]->(record:Record)
+            MATCH (folder)-[rel:NODE_RELATION {{relationshipType: "PARENT_CHILD"}}]->(record:Record)
             WHERE record.isDeleted <> true
             AND record.orgId = $org_id
             AND NOT record.mimeType = "application/vnd.folder"
@@ -12378,7 +12426,7 @@ class Neo4jProvider(IGraphDBProvider):
             AND record.orgId = $org_id
             AND NOT record.mimeType = "application/vnd.folder"
             AND NOT EXISTS {{
-                MATCH (parentFolder:Record)-[:RECORD_RELATION {{relationshipType: "PARENT_CHILD"}}]->(record)
+                MATCH (parentFolder:Record)-[:NODE_RELATION {{relationshipType: "PARENT_CHILD"}}]->(record)
             }}
             {record_filter}
             OPTIONAL MATCH (record)-[:IS_OF_TYPE]->(file:File)
@@ -12433,7 +12481,7 @@ class Neo4jProvider(IGraphDBProvider):
             MATCH (kb:App {{id: $kb_id, type: "KB"}})
             OPTIONAL MATCH (folder:Record)-[:BELONGS_TO]->(kb)
             WHERE folder.mimeType = "application/vnd.folder"{folder_match}
-            OPTIONAL MATCH (folder)-[:RECORD_RELATION {{relationshipType: "PARENT_CHILD"}}]->(folderRecord:Record)
+            OPTIONAL MATCH (folder)-[:NODE_RELATION {{relationshipType: "PARENT_CHILD"}}]->(folderRecord:Record)
             WHERE folderRecord.isDeleted <> true
             AND folderRecord.orgId = $org_id
             AND NOT folderRecord.mimeType = "application/vnd.folder"
@@ -12445,7 +12493,7 @@ class Neo4jProvider(IGraphDBProvider):
             AND rootRecord.orgId = $org_id
             AND NOT rootRecord.mimeType = "application/vnd.folder"
             AND NOT EXISTS {{
-                MATCH (parentFolder:Record)-[:RECORD_RELATION {{relationshipType: "PARENT_CHILD"}}]->(rootRecord)
+                MATCH (parentFolder:Record)-[:NODE_RELATION {{relationshipType: "PARENT_CHILD"}}]->(rootRecord)
             }}
             {record_filter.replace('record.', 'rootRecord.')}
 
@@ -12470,7 +12518,7 @@ class Neo4jProvider(IGraphDBProvider):
             // Get records from folders
             OPTIONAL MATCH (folder:Record)-[:BELONGS_TO]->(kb)
             WHERE folder.mimeType = "application/vnd.folder"
-            OPTIONAL MATCH (folder)-[:RECORD_RELATION {relationshipType: "PARENT_CHILD"}]->(folderRecord:Record)
+            OPTIONAL MATCH (folder)-[:NODE_RELATION {relationshipType: "PARENT_CHILD"}]->(folderRecord:Record)
             WHERE folderRecord.isDeleted <> true
             AND folderRecord.orgId = $org_id
             AND NOT folderRecord.mimeType = "application/vnd.folder"
@@ -12481,7 +12529,7 @@ class Neo4jProvider(IGraphDBProvider):
             AND rootRecord.orgId = $org_id
             AND NOT rootRecord.mimeType = "application/vnd.folder"
             AND NOT EXISTS {
-                MATCH (pf:Record)-[:RECORD_RELATION {relationshipType: "PARENT_CHILD"}]->(rootRecord)
+                MATCH (pf:Record)-[:NODE_RELATION {relationshipType: "PARENT_CHILD"}]->(rootRecord)
             }
 
             WITH collect(DISTINCT folderRecord) + collect(DISTINCT rootRecord) AS allRecords,
@@ -12606,20 +12654,20 @@ class Neo4jProvider(IGraphDBProvider):
             # Query to get all folders (with level traversal)
             # NEW LOGIC: Immediate children are identified by:
             # 1. BELONGS_TO edge to KB
-            # 2. NO incoming RECORD_RELATION edges (not a child of another folder)
+            # 2. NO incoming NODE_RELATION edges (not a child of another folder)
             folders_query = f"""
             MATCH (kb:App {{id: $kb_id, type: "KB"}})
-            // Get immediate children (folders with BELONGS_TO but no incoming RECORD_RELATION)
+            // Get immediate children (folders with BELONGS_TO but no incoming NODE_RELATION)
             MATCH (folder_record:Record)-[:BELONGS_TO]->(kb)
             WHERE folder_record.isDeleted <> true
               AND folder_record.mimeType = "application/vnd.folder"
               AND NOT EXISTS {{
-                  MATCH (folder_record)<-[:RECORD_RELATION {{relationshipType: "PARENT_CHILD"}}]-(:Record)
+                  MATCH (folder_record)<-[:NODE_RELATION {{relationshipType: "PARENT_CHILD"}}]-(:Record)
               }}
             {folder_filter}
             WITH folder_record, 1 AS current_level
             // Get counts for this folder (direct children only)
-            OPTIONAL MATCH (folder_record)-[:RECORD_RELATION {{relationshipType: "PARENT_CHILD"}}]->(child_record:Record)
+            OPTIONAL MATCH (folder_record)-[:NODE_RELATION {{relationshipType: "PARENT_CHILD"}}]->(child_record:Record)
             WITH folder_record, current_level,
                  sum(CASE WHEN child_record.mimeType = "application/vnd.folder" THEN 1 ELSE 0 END) AS direct_subfolders,
                  sum(CASE WHEN child_record IS NOT NULL AND child_record.isDeleted <> true AND NOT child_record.mimeType = "application/vnd.folder" THEN 1 ELSE 0 END) AS direct_records
@@ -12644,14 +12692,14 @@ class Neo4jProvider(IGraphDBProvider):
             """
 
             # Query to get all records directly in KB root (excluding folders)
-            # Immediate children with BELONGS_TO but no incoming RECORD_RELATION
+            # Immediate children with BELONGS_TO but no incoming NODE_RELATION
             records_query = f"""
             MATCH (kb:App {{id: $kb_id, type: "KB"}})
             MATCH (record:Record)-[:BELONGS_TO]->(kb)
             WHERE record.isDeleted <> true
               AND NOT record.mimeType = "application/vnd.folder"
               AND NOT EXISTS {{
-                  MATCH (record)<-[:RECORD_RELATION {{relationshipType: "PARENT_CHILD"}}]-(:Record)
+                  MATCH (record)<-[:NODE_RELATION {{relationshipType: "PARENT_CHILD"}}]-(:Record)
               }}
             {record_filter}
             OPTIONAL MATCH (record)-[:IS_OF_TYPE]->(file:File)
@@ -12776,7 +12824,7 @@ class Neo4jProvider(IGraphDBProvider):
         """
         Get folder contents with folders_first pagination and level order traversal.
 
-        NEW LOGIC: Children are identified via RECORD_RELATION edges with relationshipType="PARENT_CHILD"
+        NEW LOGIC: Children are identified via NODE_RELATION edges with relationshipType="PARENT_CHILD"
         """
         try:
             self.logger.debug(f"🔍 Getting folder {folder_id} children with folders_first pagination (skip={skip}, limit={limit}, level={level})")
@@ -12822,19 +12870,19 @@ class Neo4jProvider(IGraphDBProvider):
             record_sort_field = record_sort_map.get(sort_by, "record.recordName")
             sort_direction = sort_order.upper() if sort_order.upper() in ["ASC", "DESC"] else "ASC"
 
-            # Query to get all subfolders (direct children via RECORD_RELATION)
+            # Query to get all subfolders (direct children via NODE_RELATION)
             folders_query = f"""
             MATCH (folder_record:Record {{id: $folder_id}})
             MATCH (folder_record)-[:IS_OF_TYPE]->(folder_file:File)
             WHERE folder_file.isFile = false
-            // Get direct subfolders via RECORD_RELATION edges
-            MATCH (folder_record)-[:RECORD_RELATION {{relationshipType: "PARENT_CHILD"}}]->(subfolder_record:Record)
+            // Get direct subfolders via NODE_RELATION edges
+            MATCH (folder_record)-[:NODE_RELATION {{relationshipType: "PARENT_CHILD"}}]->(subfolder_record:Record)
             MATCH (subfolder_record)-[:IS_OF_TYPE]->(subfolder_file:File)
             WHERE subfolder_file.isFile = false
             {folder_filter}
             WITH subfolder_record, subfolder_file, 1 AS current_level
             // Get counts for this subfolder
-            OPTIONAL MATCH (subfolder_record)-[:RECORD_RELATION {{relationshipType: "PARENT_CHILD"}}]->(child_record:Record)
+            OPTIONAL MATCH (subfolder_record)-[:NODE_RELATION {{relationshipType: "PARENT_CHILD"}}]->(child_record:Record)
             OPTIONAL MATCH (child_record)-[:IS_OF_TYPE]->(child_file:File)
             WITH subfolder_record, subfolder_file, current_level,
                  sum(CASE WHEN child_file IS NOT NULL AND child_file.isFile = false THEN 1 ELSE 0 END) AS direct_subfolders,
@@ -12862,7 +12910,7 @@ class Neo4jProvider(IGraphDBProvider):
 
             # Query to get all records directly in folder (excluding folders)
             records_query = f"""
-            MATCH (folder_record:Record {{id: $folder_id}})-[:RECORD_RELATION {{relationshipType: "PARENT_CHILD"}}]->(record:Record)
+            MATCH (folder_record:Record {{id: $folder_id}})-[:NODE_RELATION {{relationshipType: "PARENT_CHILD"}}]->(record:Record)
             WHERE record.isDeleted <> true
             // Exclude folders by checking if there's a File with isFile = false
             OPTIONAL MATCH (record)-[:IS_OF_TYPE]->(check_file:File)
@@ -13289,11 +13337,18 @@ class Neo4jProvider(IGraphDBProvider):
         record_id: str,
         transaction: str | None = None
     ) -> bool:
-        """Delete parent-child edge to a record."""
+        """Delete the PARENT_CHILD edge from a record's parent *record*.
+
+        Scoped to record sources on purpose. A record group hangs its top-level
+        records off itself with the same relationship type, and Shared with Me
+        adds a second such edge (D55); an unscoped delete would take those too,
+        leaving the record with no hierarchy parent at all.
+        """
         try:
-            rel_type = edge_collection_to_relationship(CollectionNames.RECORD_RELATIONS.value)
+            rel_type = edge_collection_to_relationship(CollectionNames.NODE_RELATIONS.value)
             query = f"""
-            MATCH ()-[r:{rel_type} {{relationshipType: "PARENT_CHILD"}}]->(child:Record {{id: $record_id}})
+            MATCH (:Record)-[r:{rel_type}]->(child:Record {{id: $record_id}})
+            WHERE r.relationshipType IN ["PARENT_CHILD", "ATTACHMENT"]
             DELETE r
             RETURN count(r) > 0 as deleted
             """
@@ -13608,7 +13663,7 @@ class Neo4jProvider(IGraphDBProvider):
         """Get parent information for a record."""
         try:
             query = """
-            MATCH (parent:Record)-[:RECORD_RELATION {relationshipType: "PARENT_CHILD"}]->(r:Record {id: $record_id})
+            MATCH (parent:Record)-[:NODE_RELATION {relationshipType: "PARENT_CHILD"}]->(r:Record {id: $record_id})
             RETURN {
                 id: parent.id,
                 type: parent.recordType
@@ -13701,7 +13756,7 @@ class Neo4jProvider(IGraphDBProvider):
         """Check if record is descendant of ancestor."""
         try:
             query = """
-            MATCH path = (ancestor:Record {id: $ancestor_id})-[:RECORD_RELATION*1..20 {relationshipType: "PARENT_CHILD"}]->(r:Record {id: $record_id})
+            MATCH path = (ancestor:Record {id: $ancestor_id})-[:NODE_RELATION*1..20 {relationshipType: "PARENT_CHILD"}]->(r:Record {id: $record_id})
             RETURN count(path) > 0 as is_descendant
             """
             results = await self.client.execute_query(
@@ -14198,6 +14253,3008 @@ class Neo4jProvider(IGraphDBProvider):
             self.logger.error(traceback.format_exc())
             return {"nodes": [], "total": 0}
 
+    # ==================== Knowledge Hub v2 ====================
+
+    # Sort is interpolated from this map, never bound: Neo4j has no dynamic
+    # property access, and an unvalidated field name reaching the query text is
+    # an injection point. A field absent from the map is rejected rather than
+    # silently replaced with a default, so a bad request fails loudly.
+    _KH_V2_SORT_FIELDS = {
+        "name": "name",
+        "createdAt": "createdAt",
+        "updatedAt": "updatedAt",
+        "nodeType": "nodeType",
+        "origin": "origin",
+        "connector": "connector",
+        "sizeInBytes": "sizeInBytes",
+    }
+
+    @staticmethod
+    def _kh_v2_sort_direction(sort_order: str) -> str:
+        """ASC or DESC, validated. Anything else is a caller error."""
+        direction = (sort_order or "").strip().upper()
+        if direction not in ("ASC", "DESC"):
+            raise ValueError(f"Unsupported sort order: {sort_order!r}. Use 'asc' or 'desc'.")
+        return direction
+
+    def _kh_v2_rule_cypher(
+        self, child: str = "c", parent: str = "p", edge: str = "r",
+        allow_strict: str = "$allowStrict",
+        member_of: str | None = None,
+    ) -> str:
+        """The per-hop permission rule (§3.2), as boolean algebra.
+
+        Three branches keyed on ``accessRule``, deliberately **not** compacted
+        to three conjuncts. The compact form is equivalent for every declared
+        value and fails open on an undeclared one — it satisfies
+        ``accessRule <> 'RESTRICTED'`` and returns a node this form hides
+        (decision 77). An unrecognised value matches no branch here, so
+        corruption or a foreign writer hides the node instead of exposing it.
+
+        Never rewrite this as a nested ``CASE``: 5.26 crashes its planner on an
+        ``EXISTS {}`` referencing two QPP-internal variables inside a ``CASE``
+        (``FunctionInvocation cannot be cast to LogicalVariable``), and the
+        crash poisons the session rather than failing the one query.
+
+        Requires ``$types``, ``$grantees`` and ``$skipChecks``, and
+        ``$allowStrict`` unless ``allow_strict`` supplies another expression —
+        one query can need strictness allowed on paths from the App and refused
+        below a seed, which a single bound value cannot say.
+        """
+        # Both ends are bound here, so 5.26 plans Expand(Into). Profiled on real
+        # data that is 1,725,316 db hits across 13 sites returning **zero rows at
+        # every one** -- 43% of a partition query that returns a single row. The
+        # probe itself is cheap; the cost is that ~200k candidate (child, parent)
+        # pairs reach the rule, so it runs about 1.7M times. A comprehension
+        # expands from the child alone, whose INHERIT_PERMISSIONS out-degree is
+        # ~1, instead of intersecting two bound endpoints.
+        inherits = f"{parent} IN [({child})-[:INHERIT_PERMISSIONS]->(kh_ip) | kh_ip]"
+        # Namespaced because this text is spliced into callers' queries. An
+        # EXISTS subquery that names a variable already bound outside it binds
+        # to that variable instead of introducing a new one -- so a caller with
+        # its own `g` in scope silently turned "granted to any of the user's
+        # grantees" into "granted to this one grantee". No error is raised; the
+        # permission decision just changes.
+        granted = (
+            f"EXISTS {{ (kh_grantee)-[:PERMISSION]->({child}) "
+            f"WHERE kh_grantee.id IN $grantees }}"
+        )
+        rule = f"coalesce({child}.accessRule, 'OPEN')"
+        if member_of is not None:
+            # The caller already decided visibility for every node, in one pass,
+            # so the arms collapse to a membership test. Only the arms: the hop
+            # conditions above stay, because `hideChildren` is a property of the
+            # parent *on this path* and cannot be precomputed per node, and
+            # `$skipChecks` still has to short-circuit the whole thing.
+            #
+            # Measured on real data: the arms ran ~400k times per partition to
+            # return one row, 4.0M db hits. One pre-pass computes the same
+            # answer for a whole connector in 6-133ms.
+            arms = f"{child}.id IN {member_of}"
+        elif allow_strict.strip() == "false":
+            # Both strict arms read `... AND false`, so neither can ever match,
+            # and 5.26 still plans an unreachable branch: 296ms against 18ms for
+            # the same probe without them. This rule is spliced in ten times per
+            # partition query, so the dead text is paid ten times over.
+            # Reducing it is boolean algebra, not the compaction decision 77
+            # rejects -- an unrecognised accessRule still matches no arm here and
+            # stays hidden, which is the property that decision protects.
+            arms = f"""( {rule} = 'OPEN'
+                         AND ( {inherits} OR {granted} ) )"""
+        else:
+            arms = f"""( {rule} = 'RESTRICTED' AND {allow_strict}
+                         AND {inherits} AND {granted} )
+                    OR ( {rule} = 'STRICT' AND {allow_strict}
+                         AND ( {inherits} OR {granted} ) )
+                    OR ( {rule} = 'OPEN'
+                         AND ( {inherits} OR {granted} ) )"""
+        return f"""
+            {edge}.relationshipType IN $types
+            AND NOT coalesce({child}.isDeleted, false)
+            AND NOT coalesce({parent}.hideChildren, false)
+            AND ( $skipChecks
+                  OR (
+                       {arms}
+                     ) )
+        """
+
+    @classmethod
+    def _kh_v2_sort_property(cls, sort_field: str) -> str:
+        """The property behind a sort field name, or a caller error."""
+        prop = cls._KH_V2_SORT_FIELDS.get(sort_field)
+        if prop is None:
+            raise ValueError(
+                f"Unsupported sort field: {sort_field!r}. "
+                f"Allowed: {sorted(cls._KH_V2_SORT_FIELDS)}"
+            )
+        return prop
+
+    def _kh_v2_sort_cypher(
+        self,
+        sort_field: str,
+        sort_order: str,
+        node_var: str = "node",
+        carry: tuple[str, ...] = (),
+        where: str = "",
+        reverse: bool = False,
+    ) -> str:
+        """Project the comparator's own output, then order by it.
+
+        ``reverse`` flips all three terms, for a previous page: the query takes
+        the rows just before the boundary, nearest first, and the caller turns
+        them back into page order.
+
+        ``sortKey`` and ``nullRank`` are returned to the caller, not just used
+        here: the cursor stores them as the resume point and the in-process
+        merge re-uses them to order rows across partitions. Emitting them makes
+        "the query and the merge share one comparator" true by construction
+        rather than by two implementations happening to agree.
+
+        ``nullRank`` sorts ascending in **both** directions, so nulls keep their
+        place when the sort flips, and the id tiebreak is likewise always
+        ascending — without that, ``prev`` would not return exactly the page the
+        user came from. ``app.connectors.sources.localKB.handlers.kh_merge``
+        implements the identical ordering.
+
+        The field is interpolated from the allowlist, never bound: Neo4j has no
+        dynamic property access, so v1 needs a CASE per field, and an
+        unvalidated name reaching the text would be an injection point.
+        """
+        prop = self._kh_v2_sort_property(sort_field)
+        direction = self._kh_v2_sort_direction(sort_order)
+        # Names sort case-insensitively (§3.9). Raw `name` puts every capital
+        # ahead of every lowercase letter, so a listing looks alphabetised until
+        # someone capitalises one. Lowering here rather than at comparison time
+        # is what keeps the cursor coherent: this expression's output *is* the
+        # stored sortKey, so the ordering and the resume point cannot disagree.
+        key_expr = f"{node_var}.{prop}"
+        if sort_field == "name":
+            key_expr = f"toLower({key_expr})"
+        # Cypher's WITH is a projection: every variable not named here is
+        # dropped. A caller carrying a total or a partition id through the sort
+        # must list it or lose it before the ORDER BY.
+        extra = "".join(f", {name}" for name in carry)
+        # The keyset predicate belongs here, not after the block: Cypher hangs
+        # WHERE off a WITH rather than off an ORDER BY, and filtering once the
+        # rows are ordered would re-project them. The sort owns the ORDER BY, so
+        # it owns the slot the keyset has to occupy -- the two are halves of one
+        # comparator and have to agree about direction and tiebreak.
+        keyset = f"\n            WHERE {where}" if where else ""
+        flipped = "ASC" if direction == "DESC" else "DESC"
+        null_dir, value_dir, id_dir = (
+            ("DESC", flipped, "DESC") if reverse else ("ASC", direction, "ASC")
+        )
+        return f"""
+            WITH {node_var}{extra}, {key_expr} AS sortKey
+            WITH {node_var}{extra}, sortKey,
+                 CASE WHEN sortKey IS NULL THEN 1 ELSE 0 END AS nullRank{keyset}
+            ORDER BY nullRank {null_dir}, sortKey {value_dir}, {node_var}.id {id_dir}
+        """
+
+    def _kh_v2_keyset_cypher(
+        self, sort_order: str, direction: str = "next", node_var: str = "node"
+    ) -> str:
+        """Resume after (or before) a cursor's boundary row.
+
+        The predicate is the lexicographic comparison the page order implies,
+        against the boundary the cursor stored — ``Boundary``'s
+        ``null_rank``/``sort_key``/``last_id``, supplied as ``$ks_null_rank``,
+        ``$ks_sort_key`` and ``$ks_id``.
+
+        The null bucket is compared by **id alone**, deliberately. Every row
+        with ``nullRank = 1`` has a null sort key, and in Cypher ``null = null``
+        is null rather than true, so the usual "values equal, fall through to
+        the id" term silently matches nothing there — the walk would skip the
+        whole bucket and those records would never appear on any page.
+
+        ``prev`` reverses all three comparisons, which is what makes the
+        previous page exact rather than the ``offset - limit`` approximation
+        the earlier cursor format was stuck with.
+        """
+        ascending = self._kh_v2_sort_direction(sort_order) == "ASC"
+        if direction not in ("next", "prev"):
+            raise ValueError(f"Unsupported cursor direction: {direction!r}.")
+        forward = direction == "next"
+        value_cmp = (">" if ascending else "<") if forward else ("<" if ascending else ">")
+        edge_cmp = ">" if forward else "<"
+        return f"""
+            ( nullRank {edge_cmp} $ks_null_rank
+              OR ( nullRank = $ks_null_rank AND $ks_null_rank = 1
+                   AND {node_var}.id {edge_cmp} $ks_id )
+              OR ( nullRank = $ks_null_rank AND $ks_null_rank = 0
+                   AND ( sortKey {value_cmp} $ks_sort_key
+                         OR ( sortKey = $ks_sort_key
+                              AND {node_var}.id {edge_cmp} $ks_id ) ) ) )
+        """
+
+    def _kh_v2_filters_cypher(
+        self,
+        search_query: str | None = None,
+        node_types: list[str] | None = None,
+        record_types: list[str] | None = None,
+        indexing_status: list[str] | None = None,
+        created_at: dict[str, int | None] | None = None,
+        updated_at: dict[str, int | None] | None = None,
+        size: dict[str, int | None] | None = None,
+        origins: list[str] | None = None,
+        connector_ids: list[str] | None = None,
+        *,
+        only_containers: bool = False,
+        record_group_ids: list[str] | None = None,
+    ) -> tuple[list[str], dict[str, Any]]:
+        """Filter conditions and their bind parameters, as ``(conditions, params)``.
+
+        Three things differ from the v1 builder, each because the two backends
+        disagree today and a tenant gets different results depending on which
+        store their instance runs:
+
+        * **Bounds are tested with ``is not None``.** v1 tests them for truth
+          here, so a bound of ``0`` — a legitimate "at least zero bytes", and
+          the epoch for a date — is silently dropped and the filter vanishes.
+          The Arango builder already got this right.
+        * **The search term is matched literally.** ``CONTAINS`` has no
+          wildcards, which is the behaviour to preserve; Arango's v1 uses
+          ``LIKE`` where ``%`` and ``_`` are wildcards, so ``a_b`` matches
+          ``axb`` there and not here.
+        * **``only_containers`` is applied.** v1 accepts the argument in this
+          builder and never uses it, so the search path silently ignores it on
+          Neo4j while Arango honours it. Browse applies it in its own query
+          text, which is why the gap only shows up in search.
+
+        Parameters are prefixed ``kh_`` so they cannot collide with the
+        traversal's own bind variables when both are spliced into one query.
+        """
+        conditions: list[str] = []
+        params: dict[str, Any] = {}
+
+        # Placeholder stubs have no content; they exist for reachability in
+        # browse and must never surface as results.
+        conditions.append("NOT coalesce(node.isPlaceholder, false)")
+
+        if search_query:
+            params["kh_search"] = search_query.lower()
+            conditions.append("toLower(node.name) CONTAINS $kh_search")
+
+        if node_types:
+            params["kh_node_types"] = node_types
+            conditions.append("node.nodeType IN $kh_node_types")
+
+        if record_types:
+            params["kh_record_types"] = record_types
+            conditions.append(
+                "(node.nodeType = 'record' AND node.recordType IN $kh_record_types)"
+            )
+
+        if indexing_status:
+            params["kh_indexing_status"] = indexing_status
+            conditions.append(
+                "(node.nodeType = 'record' AND node.indexingStatus IN $kh_indexing_status)"
+            )
+
+        for label, window in (("created", created_at), ("updated", updated_at)):
+            if not window:
+                continue
+            field = "createdAt" if label == "created" else "updatedAt"
+            if window.get("gte") is not None:
+                params[f"kh_{label}_gte"] = window["gte"]
+                conditions.append(f"node.{field} >= $kh_{label}_gte")
+            if window.get("lte") is not None:
+                params[f"kh_{label}_lte"] = window["lte"]
+                conditions.append(f"node.{field} <= $kh_{label}_lte")
+
+        if size:
+            # A record with no recorded size is excluded from a size window
+            # rather than treated as zero: "unknown" is not "empty".
+            if size.get("gte") is not None:
+                params["kh_size_gte"] = size["gte"]
+                conditions.append(
+                    "(node.nodeType = 'record' AND node.sizeInBytes IS NOT NULL "
+                    "AND node.sizeInBytes >= $kh_size_gte)"
+                )
+            if size.get("lte") is not None:
+                params["kh_size_lte"] = size["lte"]
+                conditions.append(
+                    "(node.nodeType = 'record' AND node.sizeInBytes IS NOT NULL "
+                    "AND node.sizeInBytes <= $kh_size_lte)"
+                )
+
+        if origins:
+            params["kh_origins"] = origins
+            conditions.append("node.origin IN $kh_origins")
+
+        if connector_ids:
+            params["kh_connector_ids"] = connector_ids
+            conditions.append(
+                "((node.nodeType = 'app' AND node.id IN $kh_connector_ids) "
+                "OR (node.connectorId IN $kh_connector_ids))"
+            )
+
+        # Only COLLECTION-origin groups are restricted by this list. Connector
+        # groups (Confluence spaces, Jira projects) are already scoped by
+        # connector_ids, and non-group nodes pass through.
+        if record_group_ids:
+            params["kh_record_group_ids"] = record_group_ids
+            conditions.append(
+                "(node.nodeType <> 'recordGroup' OR node.origin <> 'COLLECTION' "
+                "OR node.id IN $kh_record_group_ids)"
+            )
+
+        if only_containers:
+            conditions.append(
+                "(node.hasChildren = true "
+                "OR node.nodeType IN ['app', 'recordGroup', 'folder'])"
+            )
+
+        return conditions, params
+
+    def _kh_v2_projection_cypher(
+        self,
+        node_var: str = "node",
+        parent_var: str = "parent",
+        overrides: dict[str, str] | None = None,
+        include_comparator: bool = True,
+    ) -> str:
+        """The row a v2 listing returns, as a Cypher map expression.
+
+        **Ids are bare.** v1 emits `'apps/' + id` and `'recordGroups/' + id` at
+        six sites, leaking ArangoDB's collection/key form into a response the
+        Neo4j backend also serves — so a client cannot round-trip a parentId it
+        was given. Callers here pass ids through untouched.
+
+        **The parent triple travels with the row** (id, type and name), so a
+        search hit can render "in <folder>" without a second lookup; the parent
+        is already joined for placement, so the name is free.
+
+        **`overrides` replaces a field's expression, it never adds one.** The
+        defaults read storage properties, but several fields are computed rather
+        than stored and differ per branch: an App has no `origin` property (v1
+        derives it from `type`), no `connector`, and its own `webUrl` and
+        `sharingStatus` rules. Each branch overrides what it must compute.
+
+        An unknown key raises. A typo would otherwise add a field to one backend
+        and not the other, which is precisely the row-shape divergence the
+        parity test exists to catch — and it would pass that test, because both
+        sides would still be internally consistent.
+
+        **`sortKey` and `nullRank` are returned, not just used.** The cursor
+        stores them as its resume point and the merge orders partitions by them,
+        so returning the comparator's own output is what makes the query and the
+        merge share one ordering by construction rather than by agreement.
+
+        `include_comparator=False` omits them, which the listing queries need:
+        the row has to be projected *before* it can be sorted, because
+        `nodeType`, `origin` and `connector` are computed rather than stored and
+        sorting reads them from the projected map. At that point the
+        comparator's output does not exist yet, so the base row is built without
+        it and the final RETURN merges it back in.
+        """
+        fields = {
+            "id": f"{node_var}.id",
+            # Only an App stores `name`. A record stores `recordName` and a
+            # record group `groupName`, so reading `name` alone leaves every
+            # browse row nameless — which the root listing could not reveal,
+            # because it lists Apps exclusively.
+            "name": (
+                f"coalesce({node_var}.name, {node_var}.recordName, "
+                f"{node_var}.groupName)"
+            ),
+            "nodeType": "'record'",
+            "parentId": f"{parent_var}.id",
+            "parentType": "null",
+            # The same fallback as `name`: only an App stores `name`, so reading
+            # it alone left every record and group parent nameless (D69).
+            "parentName": (
+                f"coalesce({parent_var}.name, {parent_var}.recordName, "
+                f"{parent_var}.groupName)"
+            ),
+            # The partition merge keeps a real hierarchy parent over an internal
+            # one when two partitions return the same node (decision 67).
+            "parentIsInternal": f"coalesce({parent_var}.isInternal, false)",
+            "origin": f"{node_var}.origin",
+            "connector": f"{node_var}.connector",
+            "connectorId": f"{node_var}.connectorId",
+            "recordType": f"{node_var}.recordType",
+            "recordGroupType": f"{node_var}.groupType",
+            "indexingStatus": f"{node_var}.indexingStatus",
+            "createdAt": f"coalesce({node_var}.createdAtTimestamp, 0)",
+            "updatedAt": f"coalesce({node_var}.updatedAtTimestamp, 0)",
+            "sizeInBytes": f"{node_var}.sizeInBytes",
+            "mimeType": f"{node_var}.mimeType",
+            "extension": f"{node_var}.extension",
+            "webUrl": f"{node_var}.webUrl",
+            "sharingStatus": f"{node_var}.sharingStatus",
+            "isInternal": f"coalesce({node_var}.isInternal, false)",
+            "hasChildren": "false",
+            "userRole": "permission_role",
+        }
+        unknown = sorted(set(overrides or {}) - set(fields))
+        if unknown:
+            raise ValueError(
+                f"Unknown projection field(s): {unknown}. Known: {sorted(fields)}"
+            )
+        fields.update(overrides or {})
+        if include_comparator:
+            fields["sortKey"] = "sortKey"
+            fields["nullRank"] = "nullRank"
+        body = ",\n".join(f"            {key}: {expr}" for key, expr in fields.items())
+        return "{\n" + body + "\n        }"
+
+    async def get_knowledge_hub_root_nodes_v2(
+        self,
+        user_key: str,
+        org_id: str,
+        user_app_ids: list[str],
+        limit: int,
+        sort_field: str = "name",
+        sort_dir: str = "ASC",
+        *,
+        after: dict[str, Any] | None = None,
+        origins: list[str] | None = None,
+        node_types: list[str] | None = None,
+        only_containers: bool = False,
+        search_query: str | None = None,
+        record_types: list[str] | None = None,
+        indexing_status: list[str] | None = None,
+        created_at: dict[str, int | None] | None = None,
+        updated_at: dict[str, int | None] | None = None,
+        size: dict[str, int | None] | None = None,
+        connector_ids: list[str] | None = None,
+        direction: str = "next",
+        include_ids: bool = False,
+        transaction: str | None = None,
+    ) -> dict[str, Any]:
+        """The root listing (Apps), in the v2 partitioned shape.
+
+        It also serves global search's Apps partition, so it takes the same
+        filters, ``direction`` and ``include_ids`` as the browse method.
+
+        One partition, because a root listing performs no traversal and so has
+        nothing to merge across. It still returns the partitioned envelope, so
+        the service can treat all three v2 methods identically rather than
+        special-casing this one.
+
+        ``after`` is the keyset boundary the previous page ended on —
+        ``nullRank``, ``sortKey`` and ``id`` exactly as that page reported them.
+        ``total`` is counted **only on the first page**: the cursor caches it,
+        and recounting on every page would pay repeatedly for a number the
+        caller already holds. On later pages it comes back as ``None`` rather
+        than a wrong number.
+
+        ``limit + 1`` rows are fetched so ``hasMore`` is known without a second
+        query; the extra row is trimmed before returning.
+        """
+        permission_role = self._get_permission_role_cypher("app", "app", "u")
+        conditions, params = self._kh_v2_filters_cypher(
+            search_query, node_types, record_types, indexing_status,
+            created_at, updated_at, size, origins, connector_ids,
+            only_containers=only_containers,
+        )
+        # An App stores none of origin/connector/webUrl/sharingStatus; v1 derives
+        # each from `type`, and hasChildren is counted above.
+        row = self._kh_v2_projection_cypher(
+            node_var="app",
+            parent_var="parent",
+            overrides={
+                "nodeType": "'app'",
+                "origin": "CASE WHEN app.type = 'KB' THEN 'COLLECTION' ELSE 'CONNECTOR' END",
+                "connector": "app.type",
+                "connectorId": "app.id",
+                "webUrl": "'/app/' + app.id",
+                # The null guard is explicit on both backends even though Cypher
+                # does not need it: `null = null` is null here and true in AQL,
+                # so without it a collection with no recorded creator reads as
+                # *your* personal collection on Arango and as shared here. The
+                # two dialects must not disagree because of a comparison quirk.
+                "sharingStatus": (
+                    "CASE WHEN app.type = 'KB' AND app.createdBy IS NOT NULL "
+                    "AND (app.createdBy = u.userId OR app.createdBy = u.id) "
+                    "THEN 'personal' "
+                    "WHEN app.type = 'KB' THEN 'shared' "
+                    "ELSE coalesce(app.scope, 'personal') END"
+                ),
+                "hasChildren": "has_children",
+            },
+            include_comparator=False,
+        )
+        if direction not in ("next", "prev"):
+            raise ValueError(f"Unsupported page direction: {direction!r}.")
+        keyset = ""
+        if after is not None:
+            keyset = self._kh_v2_keyset_cypher(sort_dir, direction, node_var="node")
+            params.update({
+                "ks_null_rank": after["nullRank"],
+                "ks_sort_key": after.get("sortKey"),
+                "ks_id": after["id"],
+            })
+        sort = self._kh_v2_sort_cypher(
+            sort_field, sort_dir, carry=("total", "ids"), where=keyset,
+            reverse=direction == "prev",
+        )
+        # The type travels with the id because a global search counts types over
+        # the *union* of its partitions (PG-33): summing each partition's own
+        # counts would count a two-parent node twice.
+        ids_expr = (
+            "[x IN all_nodes | {id: x.id, nodeType: x.nodeType}]" if include_ids else "[]"
+        )
+        filter_clause = ""
+        if conditions:
+            filter_clause = "WHERE " + "\n          AND ".join(conditions)
+
+        query = f"""
+        MATCH (u:User {{id: $user_key}})
+        MATCH (app:App)
+        WHERE app.id IN $kh_app_ids
+          AND (app.type = 'KB' OR NOT coalesce(app.hideConnector, false))
+        OPTIONAL MATCH (rg:RecordGroup)
+          WHERE NOT (app.type = 'KB') AND rg.connectorId = app.id
+        OPTIONAL MATCH (kb_record:Record)-[:BELONGS_TO]->(app)
+          WHERE app.type = 'KB'
+        WITH app, u,
+             CASE WHEN app.type = 'KB'
+                  THEN count(DISTINCT kb_record) > 0
+                  ELSE count(DISTINCT rg) > 0
+             END AS has_children
+        {permission_role}
+        WITH app, u, has_children, permission_role, null AS parent
+        WITH {row} AS node
+        {filter_clause}
+        WITH collect(node) AS all_nodes
+        WITH all_nodes, size(all_nodes) AS total, {ids_expr} AS ids
+        UNWIND all_nodes AS node
+        {sort}
+        LIMIT $kh_limit
+        RETURN collect(node{{.*, sortKey: sortKey, nullRank: nullRank}}) AS rows,
+               coalesce(max(total), 0) AS total,
+               head(collect(ids)) AS ids
+        """
+        params.update({
+            "user_key": user_key,
+            "org_id": org_id,
+            "kh_app_ids": user_app_ids,
+            "kh_limit": limit + 1,
+        })
+
+        try:
+            results = await self.client.execute_query(
+                query, parameters=params, txn_id=transaction
+            )
+        except Exception as e:
+            # v1 swallows and returns an empty page here. An empty listing is
+            # indistinguishable from "you may see nothing", so a failed
+            # permission query would read as a correct answer.
+            self.logger.error(f"❌ get_knowledge_hub_root_nodes_v2 failed: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            raise
+
+        rows = results[0].get("rows") or [] if results else []
+        total = results[0].get("total") or 0 if results else 0
+        ids = (results[0].get("ids") or []) if results else []
+        has_more = len(rows) > limit
+        page_rows = rows[:limit]
+        if direction == "prev":
+            page_rows.reverse()
+        return {
+            "partitions": [{
+                "partitionId": "__root__",
+                "partitionKind": "ROOT",
+                "appId": None,
+                "rows": page_rows,
+                "ids": ids,
+                "hasMore": has_more,
+                "exhausted": not has_more,
+                "total": None if after is not None else total,
+                "countsByType": None,
+            }],
+            "scope": None,
+        }
+
+    async def get_knowledge_hub_partitions_v2(
+        self,
+        org_id: str,
+        gated_app_ids: list[str],
+        *,
+        transaction: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """The partitions a global search runs for these gated Apps (§3.9).
+
+        The query reports only facts per App; ``kh_partitions.build_partitions``
+        turns them into partitions, so both providers share one definition.
+        """
+        # Every aggregate sits alone in its column: Cypher rejects a grouping
+        # key beside an aggregate in one expression.
+        query = """
+        MATCH (a:App)
+        WHERE a.id IN $gated_app_ids AND a.orgId = $org_id
+        OPTIONAL MATCH (a)-[r:NODE_RELATION]->(child)
+        WHERE r.relationshipType IN $types
+        WITH a,
+             collect(DISTINCT CASE WHEN child:RecordGroup AND NOT coalesce(child.isDeleted, false)
+                                   THEN child.id END) AS groups,
+             count(CASE WHEN child IS NOT NULL AND NOT child:RecordGroup THEN 1 END) AS directChildren
+        RETURN a.id AS appId,
+               coalesce(a.type, '') = 'KB' AS isCollection,
+               groups,
+               directChildren > 0 AS hasDirect
+        """
+        try:
+            results = await self.client.execute_query(
+                query,
+                parameters={"org_id": org_id, "gated_app_ids": gated_app_ids,
+                            "types": ["PARENT_CHILD", "ATTACHMENT"]},
+                txn_id=transaction,
+            )
+        except Exception as e:
+            self.logger.error(f"❌ get_knowledge_hub_partitions_v2 failed: {str(e)}")
+            raise
+        return build_partitions(results or [])
+
+    async def get_knowledge_hub_access_context_v2(
+        self,
+        user_key: str,
+        org_id: str,
+        *,
+        transaction: str | None = None,
+    ) -> dict[str, list[str]]:
+        """Who the user is for the v2 queries: their grantees and the Apps they reach.
+
+        Every v2 method takes both. Resolved once per request, here, rather than
+        re-derived inside each query.
+
+        * ``grantee_ids``: the user, every group, role or team they hold a USER
+          permission on, and every group or organization they belong to. Those
+          are the five grant paths (D42).
+        * ``gated_app_ids``: Apps of this org the user has a user-app relation
+          to, or that any grantee holds a permission on (D43). A collection with
+          no grant stays out (D52).
+        """
+        query = """
+        MATCH (u:User {id: $user_key})
+        OPTIONAL MATCH (u)-[pm:PERMISSION]->(m)
+        WHERE pm.type = 'USER' AND (m:Group OR m:Role OR m:Teams)
+        WITH u, collect(DISTINCT m.id) AS viaPermission
+        OPTIONAL MATCH (u)-[:BELONGS_TO]->(b)
+        WHERE b:Group OR b:Organization
+        // Each aggregate gets its own WITH before lists are combined: Cypher
+        // rejects a grouping key beside an aggregate in one expression.
+        WITH u, viaPermission, collect(DISTINCT b.id) AS viaBelongs
+        WITH u, [u.id] + viaPermission + viaBelongs AS grantees
+        OPTIONAL MATCH (u)-[:USER_APP_RELATION]->(ra:App)
+        WHERE ra.orgId = $org_id
+        WITH grantees, collect(DISTINCT ra.id) AS relApps
+        OPTIONAL MATCH (g)-[:PERMISSION]->(ga:App)
+        WHERE g.id IN grantees AND ga.orgId = $org_id
+        WITH grantees, relApps, collect(DISTINCT ga.id) AS grantApps
+        RETURN grantees, relApps + grantApps AS gatedApps
+        """
+        try:
+            results = await self.client.execute_query(
+                query, parameters={"user_key": user_key, "org_id": org_id},
+                txn_id=transaction,
+            )
+        except Exception as e:
+            self.logger.error(f"❌ get_knowledge_hub_access_context_v2 failed: {str(e)}")
+            raise
+        payload = results[0] if results else {}
+        return {
+            "grantee_ids": list(dict.fromkeys(payload.get("grantees") or [])),
+            "gated_app_ids": list(dict.fromkeys(payload.get("gatedApps") or [])),
+        }
+
+    async def get_knowledge_hub_visible_sets_v2(
+        self,
+        app_id: str,
+        grantee_ids: list[str],
+        gated_app_ids: list[str],
+        *,
+        transaction: str | None = None,
+    ) -> dict[str, list[str]]:
+        """Decide visibility for one connector once, rather than per hop.
+
+        A partition query evaluates the per-hop rule about 400,000 times to
+        return a single row -- measured 4.0M db hits, of which the inheritance
+        probe alone was 1,725,316 returning zero rows. The same answer for a
+        whole connector costs 6-133ms here, because it is one downward pass
+        instead of one per candidate pair.
+
+        Two sets, because the two regions ask different questions:
+
+        * ``visible_ids`` -- reachable from the App by a rule-passing path, with
+          strictness allowed. This is region A's ``allow_strict="fromApp"``:
+          a node is in the set precisely when such a path exists, which is what
+          ``fromApp`` means, so the set decides it by construction.
+        * ``below_seed_ids`` -- the user's seeds and everything the rule reaches
+          below them with strict refused. This must be **seed-rooted**. An
+          App-rooted strict-refused pass was measured first and returns nothing
+          at all for a connector whose top-level groups are strict, because the
+          first hop already fails -- a different question from the one region B
+          asks.
+
+        Both are built from ``_kh_v2_rule_cypher``, the shipped rule, so the
+        pre-pass cannot drift from the per-hop form it replaces.
+        """
+        rule = self._kh_v2_rule_cypher(child="c", parent="p", edge="r")
+        seed_rule = self._kh_v2_rule_cypher(
+            child="c", parent="p", edge="r", allow_strict="false",
+        )
+        params = {
+            "kh_app": app_id,
+            "grantees": grantee_ids,
+            "kh_gated_apps": gated_app_ids,
+            "types": ["PARENT_CHILD", "ATTACHMENT"],
+            "allowStrict": True,
+            "skipChecks": False,
+        }
+        # The App itself belongs in the set: `fromApp` admits an App on the gate
+        # alone, so a set built only from what the walk *reaches* would leave an
+        # APP_DIRECT partition root outside its own visibility and answer 404.
+        visible_query = f"""
+        MATCH (kh_app:App {{id: $kh_app}})
+        OPTIONAL MATCH (kh_app) ((p)-[r:NODE_RELATION]->(c) WHERE {rule})+ (n)
+        WITH kh_app, [x IN collect(DISTINCT n.id) WHERE x IS NOT NULL] AS reached
+        RETURN reached + CASE WHEN kh_app.id IN $kh_gated_apps
+                              THEN [kh_app.id] ELSE [] END AS ids
+        """
+        # Deliberately **not** scoped to this connector. `connectorId` equals the
+        # App id on a synced store, but not everywhere -- the acceptance fixture
+        # writes a connector-instance id on records and none at all on groups --
+        # and a scope filter that silently matches nothing yields an empty set,
+        # which reads as "no seeds" rather than as an error. Region B already
+        # confines seeds to descendants of the scope (`khDescIds` plus the
+        # scope-chain clause), so a wider set stays exact; membership is only
+        # ever consulted for a node the traversal actually reached. Measured
+        # 3-276ms per connector, so the extra breadth costs nothing worth having.
+        seeds_query = f"""
+        MATCH (kh_sg)-[:PERMISSION]->(s)
+        WHERE kh_sg.id IN $grantees
+          AND (s:Record OR s:RecordGroup)
+          AND coalesce(s.accessRule, 'OPEN') = 'OPEN'
+          AND NOT coalesce(s.isDeleted, false)
+          // These two gate the *seed*, and omitting them makes this set a
+          // superset of viaSeed rather than an equal. That is harmless while it
+          // only feeds region B's descent, which re-gates anyway, and a leak the
+          // moment it stands in for admission: it would admit seeds beneath a
+          // hideChildren group (D78, ex-hmsg) and seeds under an ungated App --
+          // the connector gate (gate-r3) and org isolation (orgb-app via
+          // group-g). Both are P0 over-shares. Keep them in lockstep with
+          // `_kh_v2_rule_admission_cypher`'s viaSeed leg.
+          AND NOT EXISTS {{
+              MATCH (kh_h:RecordGroup)-[:NODE_RELATION*1..20]->(s)
+              WHERE coalesce(kh_h.hideChildren, false)
+          }}
+          AND any(kh_ga IN [(s)<-[:NODE_RELATION*1..20]-(kh_sroot:App) | kh_sroot.id]
+                  WHERE kh_ga IN $kh_gated_apps)
+        WITH collect(DISTINCT s) AS kh_seeds
+        UNWIND kh_seeds AS s
+        OPTIONAL MATCH (s) ((p)-[r:NODE_RELATION]->(c) WHERE {seed_rule})+ (n)
+        RETURN [x IN collect(DISTINCT s.id) + collect(DISTINCT n.id)
+                WHERE x IS NOT NULL] AS ids
+        """
+        try:
+            visible = await self.client.execute_query(
+                visible_query, parameters=params, txn_id=transaction,
+            )
+            seeded = await self.client.execute_query(
+                seeds_query, parameters=params, txn_id=transaction,
+            )
+        except Exception as e:
+            self.logger.error(f"❌ get_knowledge_hub_visible_sets_v2 failed: {str(e)}")
+            raise
+        return {
+            "visible_ids": (visible[0]["ids"] if visible else []) or [],
+            "below_seed_ids": (seeded[0]["ids"] if seeded else []) or [],
+        }
+
+    async def get_knowledge_hub_visible_set_v3(
+        self,
+        app_id: str,
+        org_id: str,
+        grantee_ids: list[str],
+        gated_app_ids: list[str],
+        granted_ids: list[str],
+        *,
+        transaction: str | None = None,
+    ) -> dict[str, object]:
+        """Everything a user can see inside one connector, as one set.
+
+        Replaces v2's two sets with three anchors and their union. A node is
+        visible when a walk reaches it from any of:
+
+        * the App, applying the per-hop rule (RESTRICTED needs inheritance AND
+          a grant, STRICT/OPEN need either);
+        * a declared group -- RECORD_GROUP_LEVEL, reached either by a grant or
+          by the App walk. Its contents come from BELONGS_TO rather than a
+          descent: a record points at its owning group however deep it sits in
+          folders, so one indexed hop replaces a 50-deep walk. Measured equal on
+          all 12 GitLab 2 declared groups, one of them 6,228 records;
+        * a seed -- a granted OPEN node the App walk missed, i.e. one below a
+          gap. Only OPEN qualifies, and the walk below a seed accepts only OPEN:
+          a seed sits below a gap by definition, so "ancestors reachable" is
+          already false and STRICT/RESTRICTED both fail their first condition.
+
+        Grantees, the gate and the granted ids all arrive from step 1
+        (``get_knowledge_hub_access_v3``), resolved once per request. Nothing
+        here re-expands a node's incoming PERMISSION edges: a grant is tested as
+        ``node.id IN $grantedIds``, a list lookup.
+
+        The gate is still enforced here rather than trusted. Handed an arbitrary
+        ``app_id`` a gateless query returns the connector's contents to anyone in
+        the org (gate-r3) -- measured, a user gating into no connector got 942
+        Jira ids before the gate was restored, and none after.
+
+        Known gap: a connector that sets both ``hideChildren`` and
+        RECORD_GROUP_LEVEL on the same group returns no records at all, because
+        the walk stops at the group while the declaration says to descend. Slack
+        does exactly this on all 43 of its top-level groups. Do not route the
+        shipped read path through this until that is resolved.
+        """
+        query = """
+        WITH $granteeIds AS granteeIds, $gatedAppIds AS gatedAppIds
+
+        MATCH (app:App {id: $app_id})
+        WHERE app.orgId = $org_id AND app.id IN gatedAppIds
+
+        // type = 'KB' carries no permissionModel but means the same as APP_LEVEL.
+        WITH granteeIds, app,
+             (coalesce(app.permissionModel, '') = 'APP_LEVEL'
+              OR app.type = 'KB') AS appOpensEverything
+
+        OPTIONAL MATCH (app)
+              ((pa)-[ha:NODE_RELATION]->(ca)
+               WHERE NOT coalesce(ca.isDeleted, false)
+                 AND NOT coalesce(pa.hideChildren, false)
+                 AND (appOpensEverything
+                   OR (coalesce(ca.accessRule, 'OPEN') = 'RESTRICTED'
+                       AND EXISTS { (ca)-[:INHERIT_PERMISSIONS]->(pa) }
+                       AND ca.id IN $grantedIds)
+                   OR (coalesce(ca.accessRule, 'OPEN') IN ['STRICT', 'OPEN']
+                       AND (EXISTS { (ca)-[:INHERIT_PERMISSIONS]->(pa) }
+                         OR ca.id IN $grantedIds)))
+              ){1,50} (na)
+        WITH granteeIds, app, collect(DISTINCT na.id) AS regionA
+
+        OPTIONAL MATCH (dg:RecordGroup)
+        WHERE dg.connectorId = app.id
+          AND NOT coalesce(dg.isDeleted, false)
+          AND NOT coalesce(dg.hideChildren, false)
+          AND dg.permissionModel = 'RECORD_GROUP_LEVEL'
+          AND (dg.id IN regionA OR dg.id IN $grantedIds)
+        WITH granteeIds, app, regionA, collect(DISTINCT dg.id) AS declaredIds
+
+        // A nested group carries its ancestor's declaration, and its records
+        // belong to IT: 13,803 records sit in nested groups and only 14 also
+        // point at the parent. Walks groups only -- 516 nodes, not 16,394.
+        OPTIONAL MATCH (db:RecordGroup)
+              ((pb)-[hb:NODE_RELATION]->(cb:RecordGroup)
+               WHERE NOT coalesce(cb.isDeleted, false)
+                 AND NOT coalesce(pb.hideChildren, false)
+              ){1,50} (nb:RecordGroup)
+        WHERE db.id IN declaredIds
+        WITH granteeIds, app, regionA, declaredIds,
+             collect(DISTINCT nb.id) AS nestedIds
+        WITH granteeIds, app, regionA, declaredIds + nestedIds AS declaredScope
+
+        OPTIONAL MATCH (mb:Record)-[:BELONGS_TO]->(mg:RecordGroup)
+        WHERE mg.id IN declaredScope AND NOT coalesce(mb.isDeleted, false)
+        WITH granteeIds, app, regionA, declaredScope,
+             collect(DISTINCT mb.id) AS belowDeclared
+
+        // Labelled in the pattern, not tested in the WHERE. `(sd) WHERE
+        // sd:Record OR sd:RecordGroup` gives the planner no way in and it
+        // scans every node; the label union lets it seek record_connector_id.
+        OPTIONAL MATCH (sd:Record|RecordGroup)
+        WHERE sd.connectorId = app.id
+          AND NOT coalesce(sd.isDeleted, false)
+          AND coalesce(sd.accessRule, 'OPEN') = 'OPEN'
+          AND NOT sd.id IN regionA
+          AND NOT sd.id IN belowDeclared
+          AND NOT sd.id IN declaredScope
+          // Step 1 already found every directly-granted node; this is the diff
+          // against what the App walk and the declarations reached.
+          AND sd.id IN $grantedIds
+          // The walks honour hideChildren hop by hop, but this anchor jumps
+          // straight to the granted node, so without an ancestor probe a grant
+          // deep inside a hidden subtree surfaces anyway. v2 carried the same
+          // guard and its comment calls dropping it a P0 over-share.
+          AND NOT EXISTS {
+              MATCH (hid:RecordGroup)-[:NODE_RELATION*1..20]->(sd)
+              WHERE coalesce(hid.hideChildren, false)
+          }
+        WITH granteeIds, app, regionA, declaredScope, belowDeclared,
+             collect(DISTINCT sd.id) AS seedIds
+
+        // `sc` is LABELLED deliberately. Left bare it was the dearest operator
+        // in the query: PROFILE showed AllNodesScan(sc) at 39,909 rows on
+        // GitLab 2 -- every node in the database, scanned then filtered against
+        // seedIds, and paid in full even when there are no seeds at all.
+        OPTIONAL MATCH (sc:Record|RecordGroup)
+              ((pc)-[hc:NODE_RELATION]->(cc)
+               WHERE NOT coalesce(cc.isDeleted, false)
+                 AND NOT coalesce(pc.hideChildren, false)
+                 AND coalesce(cc.accessRule, 'OPEN') = 'OPEN'
+                 AND (EXISTS { (cc)-[:INHERIT_PERMISSIONS]->(pc) }
+                   OR cc.id IN $grantedIds)
+              ){1,50} (nc)
+        WHERE sc.id IN seedIds
+        WITH app, regionA, declaredScope, belowDeclared, seedIds,
+             collect(DISTINCT nc.id) AS belowSeeds
+
+        // Collections: a KB's items hang off the App by BELONGS_TO and carry no
+        // hierarchy edge to it, so none of the walks above can reach them and
+        // every collection browses empty. v2 carried an equivalent arm.
+        OPTIONAL MATCH (cl:Record)-[:BELONGS_TO]->(app)
+        WHERE NOT coalesce(cl.isDeleted, false)
+          AND (app.type = 'KB'
+               OR coalesce(app.permissionModel, '') = 'APP_LEVEL')
+        WITH app, regionA, declaredScope, belowDeclared, seedIds, belowSeeds,
+             collect(DISTINCT cl.id) AS collectionIds
+
+        // The App's own id belongs in the set or an APP_DIRECT partition root
+        // answers 404 for the node the caller just opened. It also keeps the
+        // list non-empty, so the UNWIND below always yields a row.
+        WITH regionA, declaredScope, belowDeclared, seedIds, belowSeeds,
+             collectionIds,
+             [app.id] + regionA + declaredScope + belowDeclared
+                      + seedIds + belowSeeds + collectionIds AS allIds
+        UNWIND allIds AS vid
+        RETURN collect(DISTINCT vid) AS ids,
+               size(regionA) AS fromAppWalk,
+               size(declaredScope) AS declaredGroups,
+               size(belowDeclared) AS belowDeclaredGroups,
+               size(seedIds) AS seeds,
+               size(belowSeeds) AS belowSeedWalk,
+               size(collectionIds) AS collectionItems
+        """
+        params = {
+            "app_id": app_id,
+            "org_id": org_id,
+            "granteeIds": grantee_ids,
+            "gatedAppIds": gated_app_ids,
+            "grantedIds": granted_ids,
+        }
+        try:
+            rows = await self.client.execute_query(
+                query, parameters=params, txn_id=transaction,
+            )
+        except Exception as e:
+            self.logger.error(f"❌ get_knowledge_hub_visible_set_v3 failed: {str(e)}")
+            raise
+        payload = rows[0] if rows else {}
+        result = {
+            "visible_ids": payload.get("ids") or [],
+            "from_app_walk": payload.get("fromAppWalk") or 0,
+            "declared_groups": payload.get("declaredGroups") or 0,
+            "below_declared_groups": payload.get("belowDeclaredGroups") or 0,
+            "seeds": payload.get("seeds") or 0,
+            "below_seed_walk": payload.get("belowSeedWalk") or 0,
+            "collection_items": payload.get("collectionItems") or 0,
+        }
+        # Which anchor produced what. A total that looks plausible can still hide
+        # a dead arm -- Slack returned 43 ids for weeks while containing zero
+        # records -- so the breakdown is logged, not just the count.
+        self.logger.debug(
+            "kh v3 app=%s visible=%d "
+            "(appWalk=%d declared=%d belowDeclared=%d seeds=%d belowSeed=%d collection=%d)",
+            app_id, len(result["visible_ids"]),
+            result["from_app_walk"], result["declared_groups"],
+            result["below_declared_groups"], result["seeds"],
+            result["below_seed_walk"], result["collection_items"],
+        )
+        if not result["visible_ids"]:
+            self.logger.info(
+                "kh v3 app=%s returned NO ids -- app ungated, wrong org, "
+                "or every anchor empty", app_id,
+            )
+        return result
+
+    async def get_knowledge_hub_access_v3(
+        self,
+        user_key: str,
+        org_id: str,
+        *,
+        transaction: str | None = None,
+    ) -> dict[str, Any]:
+        """Step 1: who this user is, and every node handed to them directly.
+
+        Resolved once per request. Later queries test ``node.id IN $grantedIds``
+        instead of walking ``PERMISSION`` edges again.
+
+        Grants are returned already grouped by connector. A record or group
+        belongs to one connector (``connectorId``), so the buckets do not
+        overlap and each can be queried on its own. Every gated app is a key,
+        with an empty list when nothing was granted directly inside it — the
+        user may still see it by inheritance. A grant whose connector they cannot
+        enter is dropped.
+
+        Badges (groups, roles, teams, the org) are not grouped. One group can
+        hold grants in several connectors; only the granted node is per connector.
+        """
+        query = """
+        MATCH (u:User {id: $user_key})
+        OPTIONAL MATCH (u)-[:PERMISSION {type: 'USER'}]->(principal:Group|Role|Teams)
+        WITH u, collect(DISTINCT principal.id) AS viaMembership
+        OPTIONAL MATCH (u)-[:BELONGS_TO]->(userOrg:Organization)
+        WITH u, viaMembership, collect(DISTINCT userOrg.id) AS viaOrg
+        WITH [u.id] + viaMembership + viaOrg AS granteeIds
+
+        UNWIND granteeIds AS granteeId
+        MATCH (grantee:User|Group|Role|Teams|Organization {id: granteeId})
+        // ORG_APP_RELATION is deliberately absent: the Organization holds one
+        // to every app on the tenant, so honouring it gates everyone into
+        // everything -- measured, a user with no Jira access got 942 ids.
+        OPTIONAL MATCH (grantee)-[:PERMISSION|USER_APP_RELATION]->(gatedApp:App)
+        WHERE gatedApp.orgId = $org_id
+        WITH granteeIds, collect(DISTINCT gatedApp.id) AS gatedApps
+
+        UNWIND granteeIds AS granteeId
+        MATCH (grantee:User|Group|Role|Teams|Organization {id: granteeId})
+        OPTIONAL MATCH (grantee)-[:PERMISSION]->(granted:Record|RecordGroup)
+        WHERE NOT coalesce(granted.isDeleted, false)
+        WITH granteeIds, gatedApps,
+             collect(DISTINCT CASE
+                 WHEN granted IS NULL OR granted.connectorId IS NULL THEN null
+                 ELSE {id: granted.id, connectorId: granted.connectorId}
+             END) AS grants
+        RETURN granteeIds AS grantees, gatedApps, grants
+        """
+        self.logger.info(
+            "kh v3 access query:\n%s\nparams=%s",
+            query, {"user_key": user_key, "org_id": org_id},
+        )
+        try:
+            rows = await self.client.execute_query(
+                query,
+                parameters={"user_key": user_key, "org_id": org_id},
+                txn_id=transaction,
+            )
+        except Exception as e:
+            self.logger.error(f"❌ get_knowledge_hub_access_v3 failed: {str(e)}")
+            raise
+        payload = rows[0] if rows else {}
+        grantee_ids = [x for x in (payload.get("grantees") or []) if x]
+        gated_app_ids = [x for x in (payload.get("gatedApps") or []) if x]
+        by_connector: dict[str, list[str]] = {app_id: [] for app_id in gated_app_ids}
+        dropped = 0
+        for grant in payload.get("grants") or []:
+            if not grant or not grant.get("id"):
+                continue
+            connector_id = grant.get("connectorId")
+            bucket = by_connector.get(connector_id)
+            if bucket is None:
+                dropped += 1
+                continue
+            bucket.append(grant["id"])
+        for connector_id, ids in by_connector.items():
+            by_connector[connector_id] = list(dict.fromkeys(ids))
+        result = {
+            "grantee_ids": grantee_ids,
+            "gated_app_ids": gated_app_ids,
+            "by_connector": by_connector,
+        }
+        self.logger.debug(
+            "kh v3 access user=%s -> %d grantees, %d connectors, %d granted ids, %d dropped",
+            user_key, len(grantee_ids), len(by_connector),
+            sum(len(ids) for ids in by_connector.values()), dropped,
+        )
+        return result
+
+    def _kh_v3_granted_hop(self, child: str, parent: str) -> str:
+        """One hop of the v3 rule, using the granted ids from step 1.
+
+        ``appOpensEverything`` must already be in scope. A grant is ``id IN
+        $grantedIds``, not a fresh ``PERMISSION`` expansion.
+        """
+        # The inheritance probe is named ONCE. Spelled twice -- once in the
+        # RESTRICTED arm, once in the STRICT/OPEN arm -- the planner emits two
+        # Expand(Into) operators over INHERIT_PERMISSIONS and pays both: on the
+        # real store that measured 59,772 db hits each, 16% of the query.
+        #
+        # Equivalence, with R = accessRule, I = the probe, G = the grant test.
+        # Was:  (R='RESTRICTED' AND I AND G) OR (R IN ['STRICT','OPEN'] AND (I OR G))
+        # Now:  (I AND (R IN ['STRICT','OPEN'] OR (R='RESTRICTED' AND G)))
+        #       OR (R IN ['STRICT','OPEN'] AND G)
+        # R='RESTRICTED' -> I AND G; R IN ['STRICT','OPEN'] -> I OR G; and any
+        # OTHER value -> false in both forms. That last case is the point: the
+        # obvious three-conjunct compaction fails OPEN on an undeclared
+        # accessRule (decision 77), so this factors the probe out without
+        # touching the three-branch structure that keeps it failing closed.
+        return f"""NOT coalesce({child}.isDeleted, false)
+              AND NOT coalesce({parent}.hideChildren, false)
+              AND (appOpensEverything
+                OR (EXISTS {{ ({child})-[:INHERIT_PERMISSIONS]->({parent}) }}
+                    AND (coalesce({child}.accessRule, 'OPEN') IN ['STRICT', 'OPEN']
+                      OR (coalesce({child}.accessRule, 'OPEN') = 'RESTRICTED'
+                          AND {child}.id IN $grantedIds)))
+                OR (coalesce({child}.accessRule, 'OPEN') IN ['STRICT', 'OPEN']
+                    AND {child}.id IN $grantedIds))"""
+
+    def _kh_v3_empty_page(
+        self,
+        start_id: str | None,
+        *,
+        include_scope: bool,
+        include_total: bool,
+        admitted: bool,
+    ) -> dict[str, Any]:
+        scope = None
+        if include_scope:
+            scope = (
+                {"admitted": False, "nodeId": start_id}
+                if not admitted
+                else browse_scope(start_id or "", True, [], [])
+            )
+        return {
+            "rows": [],
+            "hasMore": False,
+            "total": 0 if include_total else None,
+            "counts": {} if include_total else None,
+            "scope": scope,
+        }
+
+    async def _kh_v3_connector_id(
+        self, node_id: str, transaction: str | None
+    ) -> str | None:
+        rows = await self.client.execute_query(
+            """
+            MATCH (n {id: $id})
+            WHERE n:Record OR n:RecordGroup OR n:App
+            RETURN CASE WHEN n:App THEN n.id ELSE n.connectorId END AS connectorId
+            """,
+            parameters={"id": node_id},
+            txn_id=transaction,
+        )
+        if not rows:
+            return None
+        return rows[0].get("connectorId")
+
+    async def get_knowledge_hub_connector_page_v3(
+        self,
+        app_id: str,
+        org_id: str,
+        grantee_ids: list[str],
+        gated_app_ids: list[str],
+        granted_ids: list[str] | None = None,
+        limit: int = 50,
+        *,
+        flatten: bool = True,
+        sort_field: str = "name",
+        sort_dir: str = "ASC",
+        after: dict[str, Any] | None = None,
+        direction: str = "next",
+        filters: dict[str, Any] | None = None,
+        include_total: bool = True,
+        start_id: str | None = None,
+        start_type: str = "app",
+        grants_by_connector: dict[str, list[str]] | None = None,
+        include_scope: bool = False,
+        via_parent_id: str | None = None,
+        transaction: str | None = None,
+    ) -> dict[str, Any]:
+        """One page of what is visible under one start node.
+
+        The start is the app for a global search. It is a record group or
+        folder when someone opens that node. ``flatten=false`` is one
+        ``NODE_RELATION`` hop down from the start. ``flatten=true`` from the
+        app is the whole connector; from anywhere else it is the descendants
+        of the start. A walk up to the app happens only when the start is not
+        the app. The hop rule reads ``$grantedIds``.
+
+        The first page counts matches from id and type only. The full row,
+        including the parent, is built for the page that is returned. Later
+        pages pass ``include_total=False``. The id list is never returned.
+        ``include_scope`` adds the browse scope (admission and breadcrumbs).
+        """
+        if direction not in ("next", "prev"):
+            raise ValueError(f"Unsupported page direction: {direction!r}.")
+        start_id = start_id or app_id
+        start_type = (start_type or "app").strip()
+        if start_type in ("app", "kb"):
+            start_type = "app"
+        start_is_app = start_type == "app" or start_id == app_id
+        if not start_is_app:
+            resolved = await self._kh_v3_connector_id(start_id, transaction)
+            if not resolved:
+                return self._kh_v3_empty_page(
+                    start_id, include_scope=include_scope,
+                    include_total=include_total, admitted=False,
+                )
+            app_id = resolved
+        if grants_by_connector is not None:
+            granted_ids = list(grants_by_connector.get(app_id) or [])
+        else:
+            granted_ids = list(granted_ids or [])
+        if app_id not in set(gated_app_ids):
+            return self._kh_v3_empty_page(
+                start_id, include_scope=include_scope,
+                include_total=include_total, admitted=False,
+            )
+        filters = filters or {}
+        conditions, params = self._kh_v2_filters_cypher(
+            filters.get("search_query"),
+            filters.get("node_types"),
+            filters.get("record_types"),
+            filters.get("indexing_status"),
+            filters.get("created_at"),
+            filters.get("updated_at"),
+            filters.get("size"),
+            filters.get("origins"),
+            filters.get("connector_ids"),
+            only_containers=bool(filters.get("only_containers")),
+            record_group_ids=filters.get("record_group_ids"),
+        )
+        hop = self._kh_v3_granted_hop("ca", "pa")
+        depth = "{1,50}" if flatten else "{1}"
+        # Anchors B and C only exist once the walk can pass a gap. A direct
+        # child of the app is one hop, and a seed is by definition not that.
+        # A folder or group start does not use them: it is admitted by a walk
+        # up to the app, then listed from that start.
+        scoped_start = not start_is_app
+        if start_is_app and flatten:
+            scope = f"""
+        OPTIONAL MATCH (app)
+              ((pa)-[:NODE_RELATION]->(ca) WHERE {hop}){depth} (na)
+        WITH app, appOpensEverything, collect(DISTINCT na.id) AS regionA
+
+        OPTIONAL MATCH (dg:RecordGroup)
+        WHERE dg.connectorId = app.id
+          AND NOT coalesce(dg.isDeleted, false)
+          AND NOT coalesce(dg.hideChildren, false)
+          AND dg.permissionModel = 'RECORD_GROUP_LEVEL'
+          AND (dg.id IN regionA OR dg.id IN $grantedIds)
+        WITH app, regionA, collect(DISTINCT dg.id) AS declaredIds
+
+        OPTIONAL MATCH (db:RecordGroup)
+              ((pb)-[:NODE_RELATION]->(cb:RecordGroup)
+               WHERE NOT coalesce(cb.isDeleted, false)
+                 AND NOT coalesce(pb.hideChildren, false)
+              ){{1,50}} (nb:RecordGroup)
+        WHERE db.id IN declaredIds
+        WITH app, regionA, declaredIds, collect(DISTINCT nb.id) AS nestedIds
+        WITH app, regionA, declaredIds + nestedIds AS declaredScope
+
+        OPTIONAL MATCH (mb:Record)-[:BELONGS_TO]->(mg:RecordGroup)
+        WHERE mg.id IN declaredScope AND NOT coalesce(mb.isDeleted, false)
+        WITH app, regionA, declaredScope, collect(DISTINCT mb.id) AS belowDeclared
+
+        OPTIONAL MATCH (sd:Record|RecordGroup)
+        WHERE sd.connectorId = app.id
+          AND NOT coalesce(sd.isDeleted, false)
+          AND coalesce(sd.accessRule, 'OPEN') = 'OPEN'
+          AND NOT sd.id IN regionA
+          AND NOT sd.id IN belowDeclared
+          AND NOT sd.id IN declaredScope
+          AND sd.id IN $grantedIds
+          AND NOT EXISTS {{
+              MATCH (hid:RecordGroup)-[:NODE_RELATION*1..20]->(sd)
+              WHERE coalesce(hid.hideChildren, false)
+          }}
+        WITH app, regionA, declaredScope, belowDeclared,
+             collect(DISTINCT sd.id) AS seedIds
+
+        OPTIONAL MATCH (sc:Record|RecordGroup)
+              ((pc)-[:NODE_RELATION]->(cc)
+               WHERE NOT coalesce(cc.isDeleted, false)
+                 AND NOT coalesce(pc.hideChildren, false)
+                 AND coalesce(cc.accessRule, 'OPEN') = 'OPEN'
+                 AND (EXISTS {{ (cc)-[:INHERIT_PERMISSIONS]->(pc) }}
+                   OR cc.id IN $grantedIds)
+              ){{1,50}} (nc)
+        WHERE sc.id IN seedIds
+        WITH app, regionA, declaredScope, belowDeclared, seedIds,
+             collect(DISTINCT nc.id) AS belowSeeds
+
+        OPTIONAL MATCH (cl:Record)-[:BELONGS_TO]->(app)
+        WHERE NOT coalesce(cl.isDeleted, false)
+          AND (app.type = 'KB'
+               OR coalesce(app.permissionModel, '') = 'APP_LEVEL')
+        WITH app, regionA, declaredScope, belowDeclared, seedIds, belowSeeds,
+             collect(DISTINCT cl.id) AS collectionIds
+        WITH app, regionA + declaredScope + belowDeclared + seedIds
+                 + belowSeeds + collectionIds AS allIds
+            """
+        elif start_is_app:
+            direct_hop = self._kh_v3_granted_hop("ca", "app")
+            scope = f"""
+        MATCH (app)-[:NODE_RELATION]->(ca)
+        WHERE {direct_hop}
+        WITH app, collect(DISTINCT ca.id) AS allIds
+            """
+        else:
+            scope = f"""
+        MATCH (start {{id: $start_id}})
+        WHERE (start:Record OR start:RecordGroup)
+          AND NOT coalesce(start.isDeleted, false)
+          AND start.connectorId = app.id
+        // Parents point at their children, so each step follows the edge
+        // backwards. Starting at the node and walking up is one parent per
+        // step. Starting at the app would search the whole tree for this node.
+        OPTIONAL MATCH pathUp = (start)
+              ((ca)<-[:NODE_RELATION]-(pa) WHERE {hop}){{1,50}} (app)
+        WITH app, start, appOpensEverything,
+             pathUp IS NOT NULL AS fromApp,
+             CASE WHEN pathUp IS NULL THEN []
+                  ELSE [n IN nodes(pathUp) | n.id] END AS pathIds
+        WITH app, start, appOpensEverything, fromApp, pathIds,
+             (NOT fromApp
+              AND start.id IN $grantedIds
+              AND coalesce(start.accessRule, 'OPEN') = 'OPEN'
+              AND NOT EXISTS {{
+                  MATCH (hid:RecordGroup)-[:NODE_RELATION*1..20]->(start)
+                  WHERE coalesce(hid.hideChildren, false)
+              }}) AS viaSeed
+        WHERE fromApp OR viaSeed
+        OPTIONAL MATCH (anc)-[:NODE_RELATION*1..50]->(start)
+        WITH app, start, appOpensEverything, fromApp, pathIds,
+             collect(DISTINCT anc) AS ancs
+        WITH app, start, appOpensEverything, fromApp, pathIds,
+             [start] + ancs + [app] AS members
+        WITH app, start, appOpensEverything, fromApp, pathIds, members,
+             [a IN members | {{
+                 id: a.id,
+                 name: coalesce(a.name, a.recordName, a.groupName),
+                 nodeType: CASE WHEN a:App THEN 'app'
+                                WHEN a:RecordGroup THEN 'recordGroup'
+                                ELSE 'record' END,
+                 subType: CASE WHEN a:App THEN a.type
+                               WHEN a:RecordGroup THEN a.groupType
+                               ELSE a.recordType END,
+                 isInternal: coalesce(a.isInternal, false),
+                 admitted: a = start OR a = app OR a.id IN pathIds,
+                 ownGroups: [(a)-[:BELONGS_TO]->(ag:RecordGroup) | ag.id]
+             }}] AS crumbNodes,
+             [(par)-[:NODE_RELATION]->(ch)
+                WHERE par IN members AND ch IN members
+                AND par.id IN pathIds AND ch.id IN pathIds |
+                {{parentId: par.id, childId: ch.id, lists: true}}] AS crumbEdges
+        OPTIONAL MATCH (start)
+              ((pa)-[:NODE_RELATION]->(ca) WHERE {hop}){depth} (na)
+        WITH app, crumbNodes, crumbEdges, collect(DISTINCT na.id) AS allIds
+            """
+
+        node_type_expr = (
+            "CASE WHEN node:RecordGroup THEN 'recordGroup' "
+            "WHEN node.mimeType IN ['application/vnd.folder', "
+            "'application/vnd.google-apps.folder'] "
+            "OR toUpper(coalesce(node.recordType, '')) = 'FOLDER' "
+            "THEN 'folder' ELSE 'record' END"
+        )
+        # Sort and filters read this map, and it is built for EVERY visible node
+        # -- tens of thousands on a large connector -- while only the page is
+        # returned. So build only the fields something downstream actually
+        # reads: the tail collects id/nodeType/sortKey, the sort reads the sort
+        # property, the filters read whatever they name, and `enrich` re-matches
+        # the page rows and rebuilds the full projection from the real node.
+        # The needed set is scanned out of the generated filter text rather than
+        # listed here, so a new filter cannot silently lose its field.
+        slim_fields = {
+            "id": "node.id",
+            "name": "coalesce(node.name, node.recordName, node.groupName)",
+            "nodeType": node_type_expr,
+            "recordType": "node.recordType",
+            "indexingStatus": "node.indexingStatus",
+            "createdAt": "coalesce(node.createdAtTimestamp, 0)",
+            "updatedAt": "coalesce(node.updatedAtTimestamp, 0)",
+            "sizeInBytes": "node.sizeInBytes",
+            "origin": (
+                "coalesce(node.origin, CASE WHEN app.type = 'KB'"
+                " THEN 'COLLECTION' ELSE 'CONNECTOR' END)"
+            ),
+            "connector": "coalesce(node.connector, app.type)",
+            "connectorId": "coalesce(node.connectorId, app.id)",
+            "isPlaceholder": "coalesce(node.isPlaceholder, false)",
+            "hasChildren": "false",
+        }
+        needed = {"id", "name", "nodeType", "isPlaceholder"}
+        needed.add(self._kh_v2_sort_property(sort_field))
+        needed.update(re.findall(r"node\.([A-Za-z_][A-Za-z0-9_]*)",
+                                 " ".join(conditions)))
+        # A filter naming a field this map cannot build would otherwise read as
+        # null and match nothing, silently. Fall back to the full projection:
+        # slower, but it cannot lose rows.
+        if not needed <= set(slim_fields):
+            needed = set(slim_fields)
+        slim = "{ " + ", ".join(
+            f"{key}: {expr}" for key, expr in slim_fields.items() if key in needed
+        ) + " }"
+        row = self._kh_v2_projection_cypher(
+            node_var="node",
+            parent_var="parent",
+            overrides={
+                "nodeType": node_type_expr,
+                "origin": (
+                    "coalesce(node.origin, CASE WHEN app.type = 'KB' "
+                    "THEN 'COLLECTION' ELSE 'CONNECTOR' END)"
+                ),
+                "connector": "coalesce(node.connector, app.type)",
+                "connectorId": "coalesce(node.connectorId, app.id)",
+                "parentType": (
+                    "CASE WHEN parent:App THEN 'app' "
+                    "WHEN parent:RecordGroup THEN 'recordGroup' "
+                    "WHEN parent:Record THEN 'record' ELSE null END"
+                ),
+                "userRole": "null",
+                # Only the page is projected, so this expand is one hop per
+                # returned row. Collection items often belong to the folder
+                # instead of hanging off it by NODE_RELATION.
+                "hasChildren": (
+                    "EXISTS { (node)-[hr:NODE_RELATION]->(ch) "
+                    "WHERE hr.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT'] "
+                    "AND NOT coalesce(ch.isDeleted, false) } "
+                    "OR EXISTS { (ch)-[:BELONGS_TO]->(node) "
+                    "WHERE NOT coalesce(ch.isDeleted, false) }"
+                ),
+            },
+            include_comparator=False,
+        )
+        keyset = ""
+        if after is not None:
+            keyset = self._kh_v2_keyset_cypher(sort_dir, direction, node_var="node")
+            params.update({
+                "ks_null_rank": after["nullRank"],
+                "ks_sort_key": after.get("sortKey"),
+                "ks_id": after["id"],
+            })
+        filter_clause = ""
+        if conditions:
+            filter_clause = "WHERE " + "\n          AND ".join(conditions)
+        if include_total:
+            sort = self._kh_v2_sort_cypher(
+                sort_field, sort_dir, where=keyset, reverse=direction == "prev",
+            )
+            # Ids only. The full record map is built after the page is cut.
+            tail = f"""
+        {filter_clause}
+        {sort}
+        WITH collect({{id: node.id, nodeType: node.nodeType,
+                       sortKey: sortKey, nullRank: nullRank}}) AS ordered
+        WITH ordered, size(ordered) AS total,
+             size([n IN ordered WHERE n.nodeType = 'record' | 1]) AS nRecord,
+             size([n IN ordered WHERE n.nodeType = 'folder' | 1]) AS nFolder,
+             size([n IN ordered WHERE n.nodeType = 'recordGroup' | 1]) AS nGroup
+        WITH total, nRecord, nFolder, nGroup, ordered[0..$kh_limit] AS page
+            """
+        else:
+            sort = self._kh_v2_sort_cypher(
+                sort_field, sort_dir, where=keyset, reverse=direction == "prev",
+            )
+            tail = f"""
+        {filter_clause}
+        {sort}
+        LIMIT $kh_limit
+        WITH collect({{id: node.id, nodeType: node.nodeType,
+                       sortKey: sortKey, nullRank: nullRank}}) AS page
+        WITH page, null AS total, null AS nRecord, null AS nFolder, null AS nGroup
+            """
+        enrich = f"""
+        UNWIND range(0, size(page) - 1) AS idx
+        WITH page[idx] AS item, idx, total, nRecord, nFolder, nGroup
+        MATCH (node:Record|RecordGroup {{id: item.id}})
+        MATCH (app:App {{id: $app_id}})
+        OPTIONAL MATCH (linked)-[:NODE_RELATION]->(node)
+        WHERE linked:App OR linked:RecordGroup OR linked:Record
+        WITH node, app, item, idx, total, nRecord, nFolder, nGroup,
+             [p IN collect(linked) WHERE p IS NOT NULL] AS parents
+        WITH node, app, item, idx, total, nRecord, nFolder, nGroup,
+             head([p IN parents WHERE NOT coalesce(p.isInternal, false) AND NOT p:App]) AS nested,
+             head([p IN parents WHERE NOT coalesce(p.isInternal, false)]) AS realParent
+        WITH node, coalesce(nested, realParent, app) AS parent,
+             item, idx, total, nRecord, nFolder, nGroup, app
+        WITH {row} AS node, item.sortKey AS sortKey, item.nullRank AS nullRank,
+             idx, total, nRecord, nFolder, nGroup
+        ORDER BY idx
+        RETURN collect(node{{.*, sortKey: sortKey, nullRank: nullRank}}) AS rows,
+               head(collect(total)) AS total,
+               head(collect(nRecord)) AS nRecord,
+               head(collect(nFolder)) AS nFolder,
+               head(collect(nGroup)) AS nGroup
+        """
+        # Dedup before the seeks, not after. The arms overlap heavily -- a
+        # record the App walk reaches is usually also below a declared group --
+        # so `allIds` carries roughly two entries per distinct node (measured:
+        # 25,849 for 12,931). Each duplicate paid a Record seek AND a
+        # RecordGroup seek before `WITH DISTINCT node` threw it away.
+        listing = f"""
+        UNWIND allIds AS rawVid
+        WITH app, collect(DISTINCT rawVid) AS dedupedIds
+        UNWIND dedupedIds AS vid
+        MATCH (node:Record|RecordGroup {{id: vid}})
+        WHERE NOT coalesce(node.isDeleted, false)
+          AND NOT coalesce(node.isPlaceholder, false)
+        WITH DISTINCT node, app
+        WITH {slim} AS node
+        {tail}
+        {enrich}
+        """
+        if scoped_start:
+            # An admitted start with no children must still return one row, or
+            # the breadcrumb scope disappears with the empty unwind.
+            query = f"""
+        MATCH (app:App {{id: $app_id}})
+        WHERE app.orgId = $org_id AND app.id IN $gatedAppIds
+        WITH app,
+             (coalesce(app.permissionModel, '') = 'APP_LEVEL'
+              OR app.type = 'KB') AS appOpensEverything
+        {scope}
+        CALL (app, allIds) {{
+            WITH app, allIds
+            UNWIND allIds + [null] AS vid
+            OPTIONAL MATCH (node:Record|RecordGroup {{id: vid}})
+            WHERE vid IS NOT NULL
+              AND NOT coalesce(node.isDeleted, false)
+              AND NOT coalesce(node.isPlaceholder, false)
+            WITH app, collect(DISTINCT node) AS rawNodes
+            WITH app, [n IN rawNodes WHERE n IS NOT NULL] AS rawNodes
+            UNWIND rawNodes + [null] AS node
+            WITH app, CASE WHEN node IS NULL THEN true ELSE false END AS sentinel,
+                 CASE WHEN node IS NULL THEN {{
+                     id: '', nodeType: '', name: '', recordType: null,
+                     indexingStatus: null, createdAt: 0, updatedAt: 0,
+                     sizeInBytes: null, origin: null, connector: null,
+                     connectorId: null, isPlaceholder: false, hasChildren: false
+                 }} ELSE {slim} END AS node
+            {("WHERE sentinel OR (" + " AND ".join(conditions) + ")" ) if conditions else ""}
+            {self._kh_v2_sort_cypher(
+                sort_field, sort_dir, carry=("sentinel",),
+                where=("sentinel OR (" + keyset + ")") if keyset else "",
+                reverse=direction == "prev",
+            )}
+            WITH collect({{id: node.id, nodeType: node.nodeType,
+                           sortKey: sortKey, nullRank: nullRank,
+                           sentinel: sentinel}}) AS ordered
+            WITH [n IN ordered WHERE n.id <> ''] AS ordered
+            WITH size(ordered) AS total,
+                 size([n IN ordered WHERE n.nodeType = 'record' | 1]) AS nRecord,
+                 size([n IN ordered WHERE n.nodeType = 'folder' | 1]) AS nFolder,
+                 size([n IN ordered WHERE n.nodeType = 'recordGroup' | 1]) AS nGroup,
+                 ordered[0..$kh_limit] AS page
+            WITH total, nRecord, nFolder, nGroup,
+                 CASE WHEN size(page) = 0 THEN [null] ELSE page END AS page
+            UNWIND page AS item
+            WITH item, total, nRecord, nFolder, nGroup,
+                 CASE WHEN item IS NULL THEN true ELSE false END AS sentinel
+            OPTIONAL MATCH (node:Record|RecordGroup {{id: item.id}})
+            WHERE NOT sentinel
+            OPTIONAL MATCH (app:App {{id: $app_id}})
+            OPTIONAL MATCH (linked)-[:NODE_RELATION]->(node)
+            WHERE node IS NOT NULL
+              AND (linked:App OR linked:RecordGroup OR linked:Record)
+            WITH node, app, item, sentinel, total, nRecord, nFolder, nGroup,
+                 [p IN collect(linked) WHERE p IS NOT NULL] AS parents
+            WITH node, app, item, sentinel, total, nRecord, nFolder, nGroup,
+                 head([p IN parents WHERE NOT coalesce(p.isInternal, false) AND NOT p:App]) AS nested,
+                 head([p IN parents WHERE NOT coalesce(p.isInternal, false)]) AS realParent
+            WITH node, coalesce(nested, realParent, app) AS parent,
+                 item, sentinel, total, nRecord, nFolder, nGroup, app
+            WITH CASE WHEN sentinel OR node IS NULL THEN null ELSE {row} END AS built,
+                 CASE WHEN item IS NULL THEN null ELSE item.sortKey END AS sortKey,
+                 CASE WHEN item IS NULL THEN null ELSE item.nullRank END AS nullRank,
+                 total, nRecord, nFolder, nGroup
+            RETURN [x IN collect(CASE WHEN built IS NULL THEN null
+                    ELSE built{{.*, sortKey: sortKey, nullRank: nullRank}} END)
+                    WHERE x IS NOT NULL] AS rows,
+                   head(collect(total)) AS total,
+                   head(collect(nRecord)) AS nRecord,
+                   head(collect(nFolder)) AS nFolder,
+                   head(collect(nGroup)) AS nGroup
+        }}
+        RETURN rows, total, nRecord, nFolder, nGroup,
+               crumbNodes, crumbEdges, true AS admitted
+            """
+        else:
+            query = f"""
+        MATCH (app:App {{id: $app_id}})
+        WHERE app.orgId = $org_id AND app.id IN $gatedAppIds
+        WITH app,
+             (coalesce(app.permissionModel, '') = 'APP_LEVEL'
+              OR app.type = 'KB') AS appOpensEverything
+        {scope}
+        {listing}
+            """
+        params.update({
+            "app_id": app_id,
+            "org_id": org_id,
+            "gatedAppIds": gated_app_ids,
+            "grantedIds": granted_ids,
+            "kh_limit": limit + 1,
+            "start_id": start_id,
+        })
+        self.logger.info(
+            "kh v3 connector page query app=%s flatten=%s:\n%s\nparams=%s",
+            app_id, flatten, query, params,
+        )
+        try:
+            rows = await self.client.execute_query(
+                query, parameters=params, txn_id=transaction,
+            )
+        except Exception as e:
+            self.logger.error(
+                f"❌ get_knowledge_hub_connector_page_v3 failed: {str(e)}"
+            )
+            raise
+        payload = rows[0] if rows else {}
+        if scoped_start and not payload:
+            return self._kh_v3_empty_page(
+                start_id, include_scope=include_scope,
+                include_total=include_total, admitted=False,
+            )
+        page = list(payload.get("rows") or [])
+        has_more = len(page) > limit
+        page = page[:limit]
+        if direction == "prev":
+            page.reverse()
+        total = None
+        counts = None
+        if include_total:
+            total = payload.get("total") or 0
+            counts = {
+                "record": payload.get("nRecord") or 0,
+                "folder": payload.get("nFolder") or 0,
+                "recordGroup": payload.get("nGroup") or 0,
+            }
+            counts = {key: value for key, value in counts.items() if value}
+        scope_out = None
+        if include_scope:
+            if scoped_start:
+                scope_out = browse_scope(
+                    start_id, True,
+                    payload.get("crumbNodes") or [],
+                    payload.get("crumbEdges") or [],
+                    via_parent_id=via_parent_id,
+                )
+            else:
+                scope_out = await self._kh_v3_app_scope(
+                    app_id, via_parent_id, transaction,
+                )
+        self.logger.debug(
+            "kh v3 page app=%s start=%s flatten=%s -> %d rows, total=%s (grantees=%d, granted=%d)",
+            app_id, start_id, flatten, len(page), total,
+            len(grantee_ids), len(granted_ids),
+        )
+        return {
+            "rows": page,
+            "hasMore": has_more,
+            "total": total,
+            "counts": counts,
+            "scope": scope_out,
+        }
+
+    async def _kh_v3_app_scope(
+        self, app_id: str, via_parent_id: str | None, transaction: str | None,
+    ) -> dict[str, Any]:
+        info = await self.client.execute_query(
+            """
+            MATCH (app:App {id: $id})
+            RETURN coalesce(app.name, '') AS name, app.type AS subType
+            """,
+            parameters={"id": app_id},
+            txn_id=transaction,
+        )
+        payload = info[0] if info else {}
+        return browse_scope(
+            app_id, True,
+            [{
+                "id": app_id,
+                "name": payload.get("name") or "",
+                "nodeType": "app",
+                "subType": payload.get("subType"),
+                "admitted": True,
+                "isInternal": False,
+                "ownGroups": [],
+            }],
+            [],
+            via_parent_id=via_parent_id,
+        )
+
+    async def get_knowledge_hub_children_v3(
+        self,
+        parent_id: str,
+        parent_type: str,
+        visible_ids: list[str],
+        limit: int,
+        *,
+        flatten: bool = False,
+        sort_field: str = "name",
+        sort_dir: str = "ASC",
+        skip: int = 0,
+        require_admitted: bool = True,
+        after: dict[str, Any] | None = None,
+        direction: str = "next",
+        filters: dict[str, Any] | None = None,
+        include_ids: bool = True,
+        transaction: str | None = None,
+    ) -> dict[str, object]:
+        """List what is under a node, using the visible set as the answer.
+
+        The v2 listing walks the hierarchy applying the permission rule at every
+        hop, then checks the result against the precomputed set. That is the
+        expensive half of the page -- 110 partition queries re-deciding what the
+        pre-pass already decided. Here the set IS the decision, so there is no
+        rule, no inheritance probe and no grant lookup in this query at all.
+
+        Flatten does not walk either. Every visible id already belongs to the
+        connector, so a flatten of an App is a property match on connectorId,
+        and a flatten of a record group is a match on recordGroupId. Only a
+        flatten rooted at a folder needs a descent, because folders are the one
+        level the data does not denormalise.
+
+        Browse (flatten=False) is one hop down and keeps the hierarchy, because
+        "direct children" is a structural question the set cannot answer.
+        """
+        # The start node must itself be visible, or this lists the contents of
+        # something the user cannot open. Membership IS admission here: every id
+        # in the set has already passed the gate and the rule. Callers that have
+        # already admitted the parent (partition roots come from gated
+        # discovery) can skip it, but the default is to check.
+        if require_admitted and parent_id not in set(visible_ids):
+            self.logger.info(
+                "kh v3 children REFUSED parent=%s -- not in the visible set",
+                parent_id,
+            )
+            return {"rows": [], "ids": [], "total": 0}
+
+        order = "DESC" if sort_dir.upper() == "DESC" else "ASC"
+        sort_key = {
+            "name": "coalesce(node.recordName, node.name, '')",
+            "updatedAt": "coalesce(node.updatedAtTimestamp, 0)",
+            "createdAt": "coalesce(node.createdAtTimestamp, 0)",
+        }.get(sort_field, "coalesce(node.recordName, node.name, '')")
+
+        if not flatten:
+            # One hop. The set decides visibility; the edge decides membership.
+            scope = """
+            MATCH (start {id: $parent_id})-[:NODE_RELATION]->(node)
+            WHERE node.id IN $visible_ids
+            """
+        elif parent_type == "app":
+            # Every visible id in this connector, no traversal whatsoever.
+            # The label is what makes this an index seek: bare `MATCH (node
+            # {id: vid})` cannot use record_id_unique, so each of the ~13k
+            # UNWIND rows degenerates into a scan.
+            scope = """
+            UNWIND $visible_ids AS vid
+            MATCH (node:Record|RecordGroup {id: vid})
+            WHERE node.connectorId = $parent_id
+            """
+        elif parent_type == "recordGroup":
+            # recordGroupId names the owning group however deep a record sits,
+            # so one property test replaces a descent. Nested groups are folded
+            # in first, since their records point at them and not at the root.
+            scope = """
+            MATCH (root:RecordGroup {id: $parent_id})
+            OPTIONAL MATCH (root)-[:NODE_RELATION*1..50]->(sub:RecordGroup)
+            WITH collect(DISTINCT sub.id) + [$parent_id] AS scope_ids
+            UNWIND $visible_ids AS vid
+            MATCH (node:Record|RecordGroup {id: vid})
+            WHERE node.recordGroupId IN scope_ids OR node.id IN scope_ids
+            """
+        else:
+            # A folder. No denormalised pointer exists for this, so it descends
+            # -- but structurally, with no permission work on the way down.
+            scope = """
+            MATCH (start {id: $parent_id})-[:NODE_RELATION*1..50]->(node)
+            WHERE node.id IN $visible_ids
+            """
+
+        if direction not in ("next", "prev"):
+            raise ValueError(f"Unsupported page direction: {direction!r}.")
+        # Resume from the shared boundary. Going back, nearest rows come first
+        # and are turned back into page order below. The id tiebreak stays
+        # ascending on the way forward so this order matches the merge.
+        keyset = ""
+        if after is not None:
+            keyset = "WHERE " + self._kh_v2_keyset_cypher(sort_dir, direction)
+        ids_expr = (
+            "[n IN all_rows | {id: n.id, nodeType: CASE "
+            "WHEN n.recordGroupId IS NULL AND n.connectorId IS NULL THEN 'app' "
+            "WHEN n.recordType IS NULL THEN 'recordGroup' ELSE 'record' END}]"
+            if include_ids else "[]"
+        )
+        reverse = direction == "prev"
+        null_order = "DESC" if reverse else "ASC"
+        value_order = ("ASC" if order == "DESC" else "DESC") if reverse else order
+        id_order = "DESC" if reverse else "ASC"
+        query = f"""
+        {scope}
+          AND NOT coalesce(node.isDeleted, false)
+        WITH DISTINCT node
+        WITH node, {sort_key} AS sortKey
+        WITH node, sortKey,
+             CASE WHEN sortKey IS NULL THEN 1 ELSE 0 END AS nullRank
+        {keyset}
+        ORDER BY nullRank {null_order}, sortKey {value_order}, node.id {id_order}
+        // Every matching node, then the page cut from it. The caller unions
+        // `ids` across partitions to get the exact total (PG-24: a two-parent
+        // record must not be counted twice), so this list cannot be the paged
+        // slice -- it has to be everything this partition matches.
+        WITH collect(node{{.*, sortKey: sortKey, nullRank: nullRank}}) AS all_rows
+        RETURN all_rows[$skip..$skip + $limit] AS rows,
+               {ids_expr} AS ids,
+               size(all_rows) AS total
+        """
+        params = {
+            "parent_id": parent_id,
+            "visible_ids": visible_ids,
+            "limit": limit,
+            "skip": skip,
+        }
+        if after is not None:
+            params.update({
+                "ks_null_rank": after["nullRank"],
+                "ks_sort_key": after.get("sortKey"),
+                "ks_id": after["id"],
+            })
+        try:
+            rows = await self.client.execute_query(
+                query, parameters=params, txn_id=transaction,
+            )
+        except Exception as e:
+            self.logger.error(f"❌ get_knowledge_hub_children_v3 failed: {str(e)}")
+            raise
+        payload = rows[0] if rows else {}
+        page = payload.get("rows") or []
+        if direction == "prev":
+            page.reverse()
+        ids = payload.get("ids") or []
+        self.logger.debug(
+            "kh v3 children parent=%s type=%s flatten=%s -> %d rows, %d ids (set=%d, filtered=%s)",
+            parent_id, parent_type, flatten, len(page), len(ids), len(visible_ids),
+            bool(filters),
+        )
+        return {
+            "rows": page,
+            "ids": ids,
+            "total": payload.get("total") or 0,
+        }
+
+    async def get_knowledge_hub_visible_set_for_group_v3(
+        self,
+        group_id: str,
+        grantee_ids: list[str],
+        gated_app_ids: list[str],
+        *,
+        transaction: str | None = None,
+    ) -> dict[str, object]:
+        """The same three anchors as the App-scoped form, rooted at one group.
+
+        Same rules, narrower scope: the walk starts at the group instead of the
+        App, and the declared-group and seed anchors are confined to the group
+        and everything nested under it.
+
+        Grantees and the gate arrive as parameters rather than being resolved
+        here. Resolving them per call is what made the first version slower than
+        the App-scoped form: the preamble costs about the same either way, so a
+        connector with 43 top-level groups paid it 43 times -- measured 833ms
+        against 29ms for the whole connector in one query.
+
+        The root is checked, not trusted. This is for groups that hang directly
+        off an App, so reaching the root is a single hop and the ordinary rule
+        applies to it. An earlier version admitted whatever group id it was
+        handed, which let a group the App-scoped query refuses become visible.
+
+        There is no collections arm here on purpose -- a KB holds its items
+        directly off the App and has no record groups at all, so a group-scoped
+        query never applies to one.
+        """
+        query = """
+        // The root must EARN its place: gated App, and the App -> root hop has
+        // to pass the same rule anchor A applies to every other hop.
+        MATCH (app:App)-[:NODE_RELATION]->(root:RecordGroup {id: $group_id})
+        WHERE app.id IN $gatedAppIds
+          AND NOT coalesce(root.isDeleted, false)
+          AND NOT coalesce(app.hideChildren, false)
+        WITH app, root,
+             (coalesce(app.permissionModel, '') = 'APP_LEVEL'
+              OR app.type = 'KB') AS appOpensEverything
+        WHERE appOpensEverything
+           OR (coalesce(root.accessRule, 'OPEN') = 'RESTRICTED'
+               AND EXISTS { (root)-[:INHERIT_PERMISSIONS]->(app) }
+               AND EXISTS { (gr)-[:PERMISSION]->(root) WHERE gr.id IN $granteeIds })
+           OR (coalesce(root.accessRule, 'OPEN') IN ['STRICT', 'OPEN']
+               AND (EXISTS { (root)-[:INHERIT_PERMISSIONS]->(app) }
+                 OR EXISTS { (gr)-[:PERMISSION]->(root) WHERE gr.id IN $granteeIds }))
+
+        WITH $granteeIds AS granteeIds, root
+
+        // Scope: this group plus every group nested beneath it. Groups only, so
+        // a few hundred nodes at most rather than the whole record set.
+        OPTIONAL MATCH (root)
+              ((gp)-[:NODE_RELATION]->(gc:RecordGroup)
+               WHERE NOT coalesce(gc.isDeleted, false)
+                 AND NOT coalesce(gp.hideChildren, false)
+              ){1,50} (gn:RecordGroup)
+        WITH granteeIds, root, collect(DISTINCT gn.id) AS nestedIds
+        WITH granteeIds, root, [root.id] + nestedIds AS groupScope
+
+        // Anchor A -- the ordinary walk, rooted here instead of at the App.
+        OPTIONAL MATCH (root)
+              ((pa)-[:NODE_RELATION]->(ca)
+               WHERE NOT coalesce(ca.isDeleted, false)
+                 AND NOT coalesce(pa.hideChildren, false)
+                 AND ((coalesce(ca.accessRule, 'OPEN') = 'RESTRICTED'
+                       AND EXISTS { (ca)-[:INHERIT_PERMISSIONS]->(pa) }
+                       AND EXISTS { (ga)-[:PERMISSION]->(ca) WHERE ga.id IN granteeIds })
+                   OR (coalesce(ca.accessRule, 'OPEN') IN ['STRICT', 'OPEN']
+                       AND (EXISTS { (ca)-[:INHERIT_PERMISSIONS]->(pa) }
+                         OR EXISTS { (ga)-[:PERMISSION]->(ca) WHERE ga.id IN granteeIds })))
+              ){1,50} (na)
+        WITH granteeIds, root, groupScope, collect(DISTINCT na.id) AS regionA
+
+        // Anchor B -- declared groups in scope; contents by BELONGS_TO.
+        // The root counts as reached: the caller only asks about a group it can
+        // already open.
+        OPTIONAL MATCH (dg:RecordGroup)
+        WHERE dg.id IN groupScope
+          AND NOT coalesce(dg.isDeleted, false)
+          AND NOT coalesce(dg.hideChildren, false)
+          AND dg.permissionModel = 'RECORD_GROUP_LEVEL'
+          AND (dg.id = root.id
+            OR dg.id IN regionA
+            OR EXISTS { (gd)-[:PERMISSION]->(dg) WHERE gd.id IN granteeIds })
+        WITH granteeIds, root, groupScope, regionA,
+             collect(DISTINCT dg.id) AS declaredIds
+
+        OPTIONAL MATCH (mb:Record)-[:BELONGS_TO]->(mg:RecordGroup)
+        WHERE mg.id IN declaredIds AND NOT coalesce(mb.isDeleted, false)
+        WITH granteeIds, root, groupScope, regionA, declaredIds,
+             collect(DISTINCT mb.id) AS belowDeclared
+
+        // Anchor C -- granted OPEN records in scope that the walk never reached.
+        // recordGroupId names the owning group, so scoping by it catches records
+        // nested any number of folders deep.
+        OPTIONAL MATCH (sd:Record)
+        WHERE sd.recordGroupId IN groupScope
+          AND NOT coalesce(sd.isDeleted, false)
+          AND coalesce(sd.accessRule, 'OPEN') = 'OPEN'
+          AND NOT sd.id IN regionA
+          AND NOT sd.id IN belowDeclared
+          AND EXISTS { (gs)-[:PERMISSION]->(sd) WHERE gs.id IN granteeIds }
+          AND NOT EXISTS {
+              MATCH (hid:RecordGroup)-[:NODE_RELATION*1..20]->(sd)
+              WHERE coalesce(hid.hideChildren, false)
+          }
+        WITH granteeIds, root, regionA, declaredIds, belowDeclared,
+             collect(DISTINCT sd.id) AS seedIds
+
+        // Below a seed only OPEN survives -- its ancestry is already broken.
+        // `sc` labelled for the same reason as the App-scoped form: bare, it
+        // plans as a scan of every node before the seedIds filter applies.
+        OPTIONAL MATCH (sc:Record|RecordGroup)
+              ((pc)-[:NODE_RELATION]->(cc)
+               WHERE NOT coalesce(cc.isDeleted, false)
+                 AND NOT coalesce(pc.hideChildren, false)
+                 AND coalesce(cc.accessRule, 'OPEN') = 'OPEN'
+                 AND (EXISTS { (cc)-[:INHERIT_PERMISSIONS]->(pc) }
+                   OR EXISTS { (gx)-[:PERMISSION]->(cc) WHERE gx.id IN granteeIds })
+              ){1,50} (nc)
+        WHERE sc.id IN seedIds
+        WITH root, regionA, declaredIds, belowDeclared, seedIds,
+             collect(DISTINCT nc.id) AS belowSeeds
+
+        WITH regionA, declaredIds, belowDeclared, seedIds, belowSeeds,
+             [root.id] + regionA + declaredIds + belowDeclared
+                       + seedIds + belowSeeds AS allIds
+        UNWIND allIds AS vid
+        RETURN collect(DISTINCT vid) AS ids,
+               size(regionA) AS fromGroupWalk,
+               size(declaredIds) AS declaredGroups,
+               size(belowDeclared) AS belowDeclaredGroups,
+               size(seedIds) AS seeds,
+               size(belowSeeds) AS belowSeedWalk
+        """
+        params = {
+            "group_id": group_id,
+            "granteeIds": grantee_ids,
+            "gatedAppIds": gated_app_ids,
+        }
+        try:
+            rows = await self.client.execute_query(
+                query, parameters=params, txn_id=transaction,
+            )
+        except Exception as e:
+            self.logger.error(
+                f"❌ get_knowledge_hub_visible_set_for_group_v3 failed: {str(e)}"
+            )
+            raise
+        payload = rows[0] if rows else {}
+        result = {
+            "visible_ids": payload.get("ids") or [],
+            "from_group_walk": payload.get("fromGroupWalk") or 0,
+            "declared_groups": payload.get("declaredGroups") or 0,
+            "below_declared_groups": payload.get("belowDeclaredGroups") or 0,
+            "seeds": payload.get("seeds") or 0,
+            "below_seed_walk": payload.get("belowSeedWalk") or 0,
+        }
+        self.logger.debug(
+            "kh v3 group=%s visible=%d "
+            "(groupWalk=%d declared=%d belowDeclared=%d seeds=%d belowSeed=%d)",
+            group_id, len(result["visible_ids"]),
+            result["from_group_walk"], result["declared_groups"],
+            result["below_declared_groups"], result["seeds"],
+            result["below_seed_walk"],
+        )
+        if not rows:
+            # No row at all means the root itself was refused -- ungated App, or
+            # the App -> root hop failed the rule. Distinct from "reachable but
+            # empty", and worth saying so: an earlier version trusted the caller
+            # here and admitted whatever group id it was handed.
+            self.logger.info(
+                "kh v3 group=%s REFUSED at the root (ungated app, or the "
+                "App -> group hop did not pass the rule)", group_id,
+            )
+        return result
+
+    async def get_knowledge_hub_visible_sets_by_group_v3(
+        self,
+        app_id: str,
+        user_key: str,
+        org_id: str,
+        *,
+        max_concurrency: int = 8,
+        transaction: str | None = None,
+    ) -> dict[str, dict[str, object]]:
+        """One visible set per top-level record group, computed concurrently.
+
+        The App-scoped form answers a whole connector in a single query, which
+        makes the largest connector the floor -- GitLab 2 alone is 248ms of a
+        285ms page. Per group the queries overlap, so the cost is the slowest
+        group rather than their sum. Measured earlier on this store, 43 group
+        queries ran 958ms serially against 1,258ms for one app-wide flatten, so
+        the split is cheaper before any overlap is counted.
+
+        Returns {group_id: payload}. Records hanging directly off the App rather
+        than under a group are not covered here; those are the caller's
+        APP_DIRECT partition.
+        """
+        # Resolved once and handed to every group. Doing it inside each group
+        # query is what made the first version slower than asking for the whole
+        # connector at once: the preamble costs roughly the same as the group's
+        # own work, so 43 top-level groups paid it 43 times.
+        #
+        # Resolved the way the v3 queries resolve it, NOT via
+        # get_knowledge_hub_access_context_v2. That one takes USER_APP_RELATION
+        # from the user alone, so a connector shared through a principal is
+        # absent from its gated list -- S3 is shared through a Teams node named
+        # all_<orgId>, and this method returned {} for it while the App-scoped
+        # v3 returned 77 ids. Two gates in one path disagree silently.
+        rows = await self.client.execute_query(
+            """
+            MATCH (u:User {id: $user_key})
+            OPTIONAL MATCH (u)-[:PERMISSION {type: 'USER'}]->(p:Group|Role|Teams)
+            WITH u, collect(DISTINCT p.id) AS vm
+            OPTIONAL MATCH (u)-[:BELONGS_TO]->(o:Organization)
+            WITH u, vm, collect(DISTINCT o.id) AS vo
+            WITH [u.id] + vm + vo AS granteeIds
+            UNWIND granteeIds AS gid
+            MATCH (g:User|Group|Role|Teams|Organization {id: gid})
+            OPTIONAL MATCH (g)-[:PERMISSION|USER_APP_RELATION]->(a:App)
+            WHERE a.orgId = $org_id
+            RETURN granteeIds AS grantees, collect(DISTINCT a.id) AS gated
+            """,
+            parameters={"user_key": user_key, "org_id": org_id},
+            txn_id=transaction,
+        )
+        access = rows[0] if rows else {}
+        grantee_ids = access.get("grantees") or []
+        gated_app_ids = [a for a in (access.get("gated") or []) if a]
+        if app_id not in gated_app_ids:
+            self.logger.debug(
+                "kh v3 by-group app=%s user=%s: app not gated, no sets",
+                app_id, user_key,
+            )
+            return {}
+
+        groups = await self.client.execute_query(
+            """
+            MATCH (app:App {id: $app_id})-[:NODE_RELATION]->(g:RecordGroup)
+            WHERE NOT coalesce(g.isDeleted, false)
+            RETURN collect(DISTINCT g.id) AS ids
+            """,
+            parameters={"app_id": app_id},
+            txn_id=transaction,
+        )
+        group_ids = (groups[0]["ids"] if groups else []) or []
+        if not group_ids:
+            return {}
+
+        # max_concurrency <= 0 means unbounded: fire every group at once.
+        # Measured across 200 top-level groups, more width is not better --
+        # serial 1,546ms, 8-at-a-time 2,707ms, unbounded 2,713ms. The driver
+        # pool is 100 and Neo4j saturates at about two effective parallel
+        # queries, so extra width queues rather than overlaps.
+        gate = asyncio.Semaphore(max_concurrency) if max_concurrency > 0 else None
+
+        async def one(group_id: str) -> tuple[str, dict[str, object]]:
+            if gate is None:
+                return group_id, await self.get_knowledge_hub_visible_set_for_group_v3(
+                    group_id=group_id,
+                    grantee_ids=grantee_ids,
+                    gated_app_ids=gated_app_ids,
+                    transaction=transaction,
+                )
+            async with gate:
+                return group_id, await self.get_knowledge_hub_visible_set_for_group_v3(
+                    group_id=group_id,
+                    grantee_ids=grantee_ids,
+                    gated_app_ids=gated_app_ids,
+                    transaction=transaction,
+                )
+
+        return dict(await asyncio.gather(*(one(g) for g in group_ids)))
+
+    def _kh_v2_rule_admission_cypher(
+        self, node: str, prefix: str = "", use_sets: bool = False,
+    ) -> str:
+        """Whether the permission rule alone lets a browse open ``node`` (§3.6).
+
+        Binds ``{prefix}fromApp`` and ``{prefix}viaSeed``.
+
+        * fromApp: at least one fully accessible path from a gated App; an App
+          is admissible on the gate alone.
+        * viaSeed: the node is, or sits below, a seed, meaning a granted OPEN
+          node the user can open on its own (decision 3). Every hop below it
+          must pass the rule, with nothing strict on the way. Without this, a
+          node below a gap answered 404 while the listings showed it.
+
+        viaSeed's gate check walks **up** from the seed. Written the obvious way
+        round -- ``EXISTS {{ (root:App)-[*1..20]->(kh_seed) WHERE root.id IN
+        $kh_gated_apps }}`` -- both ends are bound, since root is seekable on
+        App(id) and kh_seed is already bound, and 5.26 then plans
+        VarLengthExpand(Into), whose contract is to find *every* path between
+        two nodes rather than probe for one. Measured 523,199 db hits returning
+        zero rows across four sites, 70% of a partition query, growing with the
+        App's whole content rather than the partition's: an empty partition cost
+        19x more once an unrelated sibling gained 2,000 records. The
+        hideChildren check just above walks the same edges 216x cheaper only
+        because its far end carries no seekable id. A comprehension has one
+        bound end, so it cannot plan as Into; the empty partition went flat at
+        7,258 hits regardless of sibling size. The cost is a constant factor --
+        it always collects every App ancestor where EXISTS could stop at the
+        first -- which is worth roughly 2x on a small graph and 78x the other
+        way on a large one. Keep the comprehension, or re-measure before
+        changing it back.
+        """
+        if use_sets:
+            # Both terms were decided for this whole connector in one pass, so
+            # admission becomes two list lookups.
+            #
+            # This is where the cost actually was. viaSeed's inner walk is a
+            # both-ends-bound quantified path, which 5.26 plans as
+            # Repeat(Trail): it enumerates relationship-unique *paths*, not
+            # nodes, so a node reachable by k paths is produced k times.
+            # Measured on one partition returning a single row --
+            # Repeat(Trail) 39,768-79,536 rows across four sites, feeding
+            # Expand(All) at 398,034 rows. Three earlier attempts made the
+            # per-hop *predicate* cheaper and all landed at ~1.0x, because the
+            # walk has already produced those rows before any predicate runs.
+            #
+            # The sets must stay exactly in step with the arms below --
+            # `get_knowledge_hub_visible_sets_v2` carries the same seed gating
+            # (hideChildren, gated App) for that reason.
+            return f"""
+        WITH *, {node}.id IN $khVisibleIds AS {prefix}fromApp,
+                {node}.id IN $khBelowSeedIds AS {prefix}viaSeed
+        """
+        up_rule = self._kh_v2_rule_cypher(child="c", parent="p", edge="r")
+        # Below a seed something above is inaccessible, so reading (b) can never
+        # admit a STRICT or RESTRICTED node there (§3.6 arm 2).
+        seed_rule = self._kh_v2_rule_cypher(
+            child="c", parent="p", edge="r", allow_strict="false",
+        )
+        return f"""
+        CALL ({node}) {{
+            WITH {node}
+            RETURN CASE WHEN 'App' IN labels({node})
+                        THEN {node}.id IN $kh_gated_apps
+                        ELSE EXISTS {{
+                            MATCH (root:App)
+                                  ((p)-[r:NODE_RELATION]->(c) WHERE {up_rule})+ ({node})
+                            WHERE root.id IN $kh_gated_apps
+                        }}
+                   END AS {prefix}fromApp
+        }}
+        CALL ({node}) {{
+            OPTIONAL MATCH (kh_sg)-[:PERMISSION]->(kh_seed)
+            WHERE kh_sg.id IN $grantees
+              AND (kh_seed:Record OR kh_seed:RecordGroup)
+              AND coalesce(kh_seed.accessRule, 'OPEN') = 'OPEN'
+              AND NOT coalesce(kh_seed.isDeleted, false)
+              AND ( kh_seed = {node}
+                    OR EXISTS {{
+                        MATCH (kh_seed)((p)-[r:NODE_RELATION]->(c) WHERE {seed_rule})+ ({node})
+                    }} )
+              AND NOT EXISTS {{
+                  MATCH (h:RecordGroup)-[:NODE_RELATION*1..20]->(kh_seed)
+                  WHERE coalesce(h.hideChildren, false)
+              }}
+              // One bound end, so this cannot plan as Into. See the docstring.
+              AND any(kh_ga IN [(kh_seed)<-[:NODE_RELATION*1..20]-(kh_root:App)
+                                | kh_root.id]
+                      WHERE kh_ga IN $kh_gated_apps)
+            RETURN count(kh_seed) > 0 AS {prefix}viaSeed
+        }}
+        """
+
+    def _kh_v2_opener_cypher(self, node: str, prefix: str = "") -> str:
+        """Whether ``node`` opens everything below it (§3.8, decision 52).
+
+        A gated collection or APP_LEVEL App, or a RECORD_GROUP_LEVEL group that
+        the rule itself admits. Needs ``{prefix}fromApp`` and ``{prefix}viaSeed``.
+        """
+        return (
+            f"( ( {node}:App AND {node}.id IN $kh_gated_apps "
+            f"AND ({node}.type = 'KB' OR {node}.permissionModel = 'APP_LEVEL') ) "
+            f"OR ( {node}:RecordGroup AND {node}.permissionModel = 'RECORD_GROUP_LEVEL' "
+            f"AND ({prefix}fromApp OR {prefix}viaSeed) ) )"
+        )
+
+    def _kh_v2_admission_cypher(
+        self, node: str, prefix: str = "", use_sets: bool = False,
+    ) -> str:
+        """Whether a browse may open ``node``: the three ways in.
+
+        Binds ``{prefix}fromApp``, ``{prefix}viaSeed`` and ``{prefix}inScope``;
+        the node is admitted when any holds. The start node, every breadcrumb
+        ancestor, and every parent or group a placement decision consults share
+        this one text, so listing, placement and trail cannot disagree about
+        what the user may open.
+
+        inScope: an opener above the node reaches it structurally, through
+        hierarchy edges with no deleted child and no ``hideChildren`` parent.
+        Nothing below a declaration is checked (§3.8, decision 39), and a
+        collection's items carry no inheritance or grants of their own
+        (decision 52). Every subquery imports only its node, so helper-internal
+        names cannot bind to a caller's variables.
+        """
+        opener_rule = self._kh_v2_rule_admission_cypher(
+            "kh_o", prefix="kh_o_", use_sets=use_sets)
+        opener = self._kh_v2_opener_cypher("kh_o", prefix="kh_o_")
+        return self._kh_v2_rule_admission_cypher(node, prefix, use_sets) + f"""
+        CALL ({node}) {{
+            OPTIONAL MATCH kh_pth = (kh_o)-[:NODE_RELATION*1..50]->({node})
+            WHERE ( kh_o:App OR kh_o.permissionModel = 'RECORD_GROUP_LEVEL' )
+              AND all(x IN relationships(kh_pth) WHERE x.relationshipType IN $types)
+              AND all(x IN nodes(kh_pth)[1..] WHERE NOT coalesce(x.isDeleted, false))
+              AND all(x IN nodes(kh_pth)[..-1] WHERE NOT coalesce(x.hideChildren, false))
+            WITH DISTINCT kh_o
+            WHERE kh_o IS NOT NULL
+            {opener_rule}
+            WITH kh_o, {opener} AS kh_is_opener
+            WHERE kh_is_opener
+            RETURN count(kh_o) > 0 AS {prefix}kh_hier
+        }}
+        CALL ({node}) {{
+            // A collection's items hang off the App by BELONGS_TO, never by
+            // hierarchy: `kb_service` writes "records+files+isOfType,
+            // belongsTo->apps/<kbId>" and no NODE_RELATION from the App, which
+            // is what the design doc declares (KB record -> KB App, BELONGS_TO
+            // tagged entityType KB) and how v1 read them back. Membership is
+            // therefore one hop, not a path -- every item carries the edge,
+            // nested ones included -- so this decides visibility only, and
+            // placement stays hierarchical.
+            OPTIONAL MATCH ({node})-[kh_btr:BELONGS_TO]->(kh_kb:App)
+            WHERE coalesce(kh_btr.entityType, '') = 'KB'
+              AND kh_kb.type = 'KB'
+              AND kh_kb.id IN $kh_gated_apps
+              AND NOT coalesce({node}.isDeleted, false)
+            RETURN count(kh_kb) > 0 AS {prefix}kh_collection
+        }}
+        WITH *, ({prefix}kh_hier OR {prefix}kh_collection) AS {prefix}inScope
+        """
+
+    def _kh_v2_open_region_cypher(self, openers: str, out: str) -> str:
+        """(node, parent) pairs for everything structurally below ``openers``.
+
+        Binds ``{out}``. Below an opener nothing is checked (§3.8, decision 52),
+        but a deleted node and anything under a ``hideChildren`` parent still
+        stay out. The parent is the node before it on the path.
+        """
+        return f"""
+                CALL ({openers}) {{
+                    CALL ({openers}) {{
+                        UNWIND {openers} AS kh_open
+                        OPTIONAL MATCH kh_op = (kh_open)-[:NODE_RELATION*1..50]->(kh_d)
+                        WHERE all(x IN relationships(kh_op) WHERE x.relationshipType IN $types)
+                          AND all(x IN nodes(kh_op)[1..] WHERE NOT coalesce(x.isDeleted, false))
+                          AND all(x IN nodes(kh_op)[..-1] WHERE NOT coalesce(x.hideChildren, false))
+                        RETURN [x IN collect(DISTINCT {{n: kh_d, parent: nodes(kh_op)[-2]}})
+                                WHERE x.n IS NOT NULL] AS kh_hier_pairs
+                    }}
+                    // A collection reaches its items by BELONGS_TO, so the walk
+                    // above finds none of them. Placement stays hierarchical:
+                    // every item carries the edge, nested ones too, so the
+                    // parent is the record above it when there is one and the
+                    // App otherwise -- otherwise a nested item would surface
+                    // under both its folder and the collection (NV-36, NV-39).
+                    CALL ({openers}) {{
+                        UNWIND {openers} AS kh_kbopen
+                        OPTIONAL MATCH (kh_item)-[kh_bt:BELONGS_TO]->(kh_kbopen)
+                        WHERE kh_kbopen:App AND kh_kbopen.type = 'KB'
+                          AND coalesce(kh_bt.entityType, '') = 'KB'
+                          AND NOT coalesce(kh_item.isDeleted, false)
+                        OPTIONAL MATCH (kh_ip)-[kh_ipr:NODE_RELATION]->(kh_item)
+                        WHERE kh_ipr.relationshipType IN $types
+                          AND NOT coalesce(kh_ip.isDeleted, false)
+                        RETURN [x IN collect(DISTINCT {{n: kh_item,
+                                                       parent: coalesce(kh_ip, kh_kbopen)}})
+                                WHERE x.n IS NOT NULL] AS kh_kb_pairs
+                    }}
+                    // Self-contained: the builder must RETURN from inside its
+                    // own CALL. An earlier version ended with a caller-scope
+                    // `WITH *`, which silently dropped `pairsOA` before the
+                    // second splice re-projected, and broke every flatten.
+                    RETURN kh_hier_pairs + kh_kb_pairs AS {out}
+                }}"""
+
+    def _kh_v2_open_parent_cypher(
+        self, node: str, prefix: str = "", use_sets: bool = False,
+    ) -> str:
+        """Whether ``node`` already lists under a parent the user may open.
+
+        Binds ``{prefix}hasOpenParent``. Placement by own group or App applies
+        only to a chain-top (§3.3). For a granted OPEN node every hierarchy
+        parent passes the hop rule unless it hides its children, so an admitted
+        parent that does not hide them is one the node lists under (NV-37).
+        """
+        parent_admission = self._kh_v2_admission_cypher(
+            "kh_par", prefix="kh_par_", use_sets=use_sets)
+        return f"""
+        CALL ({node}) {{
+            OPTIONAL MATCH (kh_par)-[kh_pr:NODE_RELATION]->({node})
+            WHERE kh_pr.relationshipType IN $types
+              AND NOT coalesce(kh_par.hideChildren, false)
+            WITH DISTINCT kh_par
+            WHERE kh_par IS NOT NULL
+            {parent_admission}
+            WITH kh_par, kh_par_fromApp OR kh_par_viaSeed OR kh_par_inScope AS kh_open
+            WHERE kh_open
+            RETURN count(kh_par) > 0 AS {prefix}hasOpenParent
+        }}
+        """
+
+    async def get_knowledge_hub_children_v2(
+        self,
+        user_key: str,
+        org_id: str,
+        parent_id: str,
+        limit: int,
+        grantee_ids: list[str],
+        gated_app_ids: list[str],
+        sort_field: str = "name",
+        sort_dir: str = "ASC",
+        *,
+        after: dict[str, Any] | None = None,
+        only_containers: bool = False,
+        via_parent_id: str | None = None,
+        flatten: bool = False,
+        search_query: str | None = None,
+        node_types: list[str] | None = None,
+        record_types: list[str] | None = None,
+        indexing_status: list[str] | None = None,
+        created_at: dict[str, int | None] | None = None,
+        updated_at: dict[str, int | None] | None = None,
+        size: dict[str, int | None] | None = None,
+        origins: list[str] | None = None,
+        connector_ids: list[str] | None = None,
+        record_group_ids: list[str] | None = None,
+        partition: str | None = None,
+        direction: str = "next",
+        include_ids: bool = False,
+        visible_ids: list[str] | None = None,
+        below_seed_ids: list[str] | None = None,
+        transaction: str | None = None,
+    ) -> dict[str, Any]:
+        """Browse one level, or flatten the whole subtree, in the v2 shape.
+
+        ``direction="prev"`` returns the page *before* ``after``, in page order,
+        with ``hasMore`` meaning more rows lie before it (PG-13).
+        ``include_ids`` also returns every matching id, so a global search can
+        count a node found in two partitions once (PG-24).
+
+        ``partition`` runs one partition of a global search (§3.9): ``"group"``
+        with a top-level record group as ``parent_id``, or ``"app_direct"``
+        with an App. A partition is a flatten that answers even when its root
+        cannot be opened, because a grant inside a closed group is still found
+        and placed under the App (PG-04). The root's own row appears only when
+        it can be opened (PG-41).
+
+        Filters apply to the rows the traversal admitted, after placement, so a
+        match never opens a path and a non-match never prunes one (§3.4 step 6,
+        PG-36, PG-37).
+
+        ``flatten`` switches the arms and nothing else. Admission, breadcrumbs,
+        role, projection, filters, sort and keyset are shared, so the two modes
+        cannot disagree about who may open what (decision 28).
+
+        **One query, not partitioned** (§3.9): partitions exist for global
+        search, filter and flatten; browse and subtree-scoped requests are a
+        single query, so there is nothing to merge across.
+
+        **No dispatch on parent type.** v1 branches into app / recordGroup /
+        record helpers because the pre-rename hierarchy edge only ever linked
+        record → record. `NODE_RELATION` now links App → group, group → group,
+        group → record and record → record uniformly (§3.7), so one depth-1
+        traversal serves every parent.
+
+        The children are the union of two arms (§3.6):
+
+        * the **root pass** — direct children admitted by the per-hop rule
+          against this parent;
+        * the **seeds arm** — nodes the user holds a direct grant on, whose
+          `accessRule` is OPEN, and whose *placement* resolves to this parent:
+          a record appears under its **own** record group (§3.3, decision 13),
+          not the nearest accessible ancestor. That is the `pl-r11` case — a
+          grant two levels below an accessible record still lists under the
+          group, not under that record.
+
+        `admitted` answers whether the caller may see this node at all. A
+        downward walk cannot decide it, because it depends on ancestors the
+        listing never visits (AC-57), so it comes from one bounded upward walk.
+        It holds on any of three paths: a fully accessible one from a gated
+        App; one down from a seed, so a node below a gap opens (NV-28,
+        SEC-01); or an opener above it, meaning a granted collection, a gated
+        APP_LEVEL App or an openable RECORD_GROUP_LEVEL group (§3.8, decision
+        52, NV-30). Only the first lets strict children list by the rule;
+        below an opener nothing is checked.
+        False means the router answers **404 with a constant body** — the
+        response must not confirm the node exists (SEC-02).
+
+        A third arm applies when browsing an App: a granted node whose own
+        record group **cannot be opened** lists directly under the App (§3.3,
+        NV-07, decision 78). Arms 2 and 3 list only chain-tops, nodes with no
+        openable parent, so a granted record under an open folder is not listed
+        again under its group (NV-37). Anything beneath a `hideChildren` group
+        stays hidden instead of surfacing one level up.
+
+        `scope` carries `currentNode`, `parentNode` and the breadcrumbs, which
+        follow placement rather than the raw hierarchy, so an inaccessible
+        ancestor is replaced and never named (NV-28, SEC-01). The query returns
+        the flags and `kh_breadcrumbs` picks the trail; `via_parent_id` chooses
+        the first step for a node with two parents (decision 79).
+
+        **Flatten** returns every node whose placement chain passes through this
+        one (NV-36, NV-39), once, under its preferred placement parent inside
+        the scope: non-internal first, so the drive location beats Shared with
+        Me (decision 67). A granted node placed above the scope is out of reach
+        here (AC-59, NV-45). The arms build (node, parent) pairs region by
+        region, so every row's ``parentId`` comes out of the traversal itself
+        rather than a membership lookup per row.
+        """
+        if partition not in (None, "group", "app_direct"):
+            raise ValueError(f"unknown partition kind {partition!r}")
+        flatten = flatten or partition is not None
+        # Strict children list only when a full path from the App reaches this
+        # node: below a seed, reading (b) can never admit them (§3.6 arm 2).
+        # Opt-in: without the precomputed sets every caller keeps the per-hop
+        # rule, so browse and the existing tests are untouched.
+        child_rule = self._kh_v2_rule_cypher(
+            child="c", parent="p", edge="r", allow_strict="fromApp",
+            member_of="$khVisibleIds" if visible_ids is not None else None,
+        )
+        # The same listing condition for any breadcrumb edge, keyed on whether
+        # that edge's parent has a full path from the App.
+        crumb_rule = self._kh_v2_rule_cypher(
+            child="ch", parent="par", edge="pr",
+            allow_strict="par.id IN kh_from_app_ids",
+        )
+        # Admission takes the membership route only when the caller supplied
+        # both sets; every other caller, browse included, keeps the walks.
+        use_sets = visible_ids is not None and below_seed_ids is not None
+        admission = self._kh_v2_admission_cypher("start", use_sets=use_sets)
+        start_opener = self._kh_v2_opener_cypher("start")
+        crumb_admission = self._kh_v2_admission_cypher(
+            "a", prefix="a_", use_sets=use_sets)
+        crumb_opener = self._kh_v2_opener_cypher("a", prefix="a_")
+        seed_open_parent = self._kh_v2_open_parent_cypher(
+            "s", prefix="s_", use_sets=use_sets)
+        group_admission = self._kh_v2_admission_cypher(
+            "grp", prefix="grp_", use_sets=use_sets)
+        # The collection's own role, resolved once per request. Only the app
+        # variant applies: the record and recordGroup variants dispatch on a
+        # single node type, and a browse listing is mixed.
+        app_role = self._get_permission_role_cypher("app", "ownerApp", "u")
+        conditions, params = self._kh_v2_filters_cypher(
+            search_query, node_types, record_types, indexing_status,
+            created_at, updated_at, size, origins, connector_ids,
+            only_containers=only_containers, record_group_ids=record_group_ids,
+        )
+        # Browse lists everything under the start node; flatten gives each row
+        # the parent its arm chose.
+        parent_var = "parent" if flatten else "start"
+        row = self._kh_v2_projection_cypher(
+            node_var="n",
+            parent_var=parent_var,
+            overrides={
+                "nodeType": (
+                    "CASE WHEN 'RecordGroup' IN labels(n) THEN 'recordGroup' "
+                    "WHEN 'App' IN labels(n) THEN 'app' ELSE 'record' END"
+                ),
+                "parentType": (
+                    f"CASE WHEN 'RecordGroup' IN labels({parent_var}) THEN 'recordGroup' "
+                    f"WHEN 'App' IN labels({parent_var}) THEN 'app' ELSE 'record' END"
+                ),
+                "origin": "coalesce(n.origin, 'CONNECTOR')",
+                "connector": "coalesce(n.connectorName, n.type)",
+                "hasChildren": (
+                    "EXISTS { (n)-[hr:NODE_RELATION]->() "
+                    "WHERE hr.relationshipType IN $types }"
+                ),
+                # Null for connector items (decision 34); a collection's items
+                # carry the role held on the collection itself (decision 52).
+                # Resolved once per request above, not per row -- the per-node
+                # role helpers dispatch on a single node type and a browse
+                # listing is mixed, so neither would have applied here anyway.
+                "userRole": "collection_role",
+            },
+            include_comparator=False,
+        )
+        if direction not in ("next", "prev"):
+            raise ValueError(f"Unsupported page direction: {direction!r}.")
+        keyset = ""
+        if after is not None:
+            keyset = self._kh_v2_keyset_cypher(sort_dir, direction, node_var="node")
+            params.update({
+                "ks_null_rank": after["nullRank"],
+                "ks_sort_key": after.get("sortKey"),
+                "ks_id": after["id"],
+            })
+        sort = self._kh_v2_sort_cypher(
+            sort_field, sort_dir, carry=("total", "ids"), where=keyset,
+            reverse=direction == "prev",
+        )
+        # The type travels with the id because a global search counts types over
+        # the *union* of its partitions (PG-33): summing each partition's own
+        # counts would count a two-parent node twice.
+        ids_expr = (
+            "[x IN all_nodes | {id: x.id, nodeType: x.nodeType}]" if include_ids else "[]"
+        )
+        filter_clause = ""
+        if conditions:
+            filter_clause = "WHERE " + "\n          AND ".join(conditions)
+
+        browse_arms = f"""
+            CALL (start, fromApp, opensBelow) {{
+                WITH start AS p, fromApp, opensBelow
+                MATCH (p)-[r:NODE_RELATION]->(c)
+                WHERE {child_rule}
+                   OR ( opensBelow
+                        AND r.relationshipType IN $types
+                        AND NOT coalesce(c.isDeleted, false)
+                        AND NOT coalesce(p.hideChildren, false) )
+                RETURN c AS n
+              UNION
+            // Arm 1b: a collection's root items. They hang off the App by
+            // BELONGS_TO (entityType KB) and carry no hierarchy edge from it,
+            // so the match above finds none of them -- which is why a
+            // collection browsed as empty on a real instance while the fixture,
+            // which invented that edge, listed it correctly. Only items with no
+            // hierarchy parent belong here; nested ones list under their folder
+            // through arm 1, and returning them here as well would place the
+            // same row twice (NV-37).
+                // No `opensBelow` term: admission refuses an ungated collection
+                // before this arm runs, so it could never be the deciding
+                // condition. Measured -- removing it changed nothing, and kb-2
+                // still lists nothing because `inScope` already said no.
+                WITH start
+                MATCH (c)-[kh_cbt:BELONGS_TO]->(start)
+                WHERE start:App AND start.type = 'KB'
+                  AND coalesce(kh_cbt.entityType, '') = 'KB'
+                  AND NOT coalesce(c.isDeleted, false)
+                  AND NOT EXISTS {{
+                      MATCH ()-[kh_cpr:NODE_RELATION]->(c)
+                      WHERE kh_cpr.relationshipType IN $types
+                  }}
+                RETURN c AS n
+              UNION
+            // Arm 2: chain-tops placed here by their own record group, meaning
+            // granted OPEN nodes with no parent the user may open (§3.3, NV-37).
+                WITH start
+                MATCH (g)-[:PERMISSION]->(s)
+                WHERE g.id IN $grantees
+                  AND coalesce(s.accessRule, 'OPEN') = 'OPEN'
+                  AND NOT coalesce(s.isDeleted, false)
+                  AND (s)-[:BELONGS_TO]->(start)
+                  AND NOT EXISTS {{
+                      MATCH (h:RecordGroup)-[:NODE_RELATION*1..20]->(s)
+                      WHERE coalesce(h.hideChildren, false)
+                  }}
+                WITH DISTINCT s
+                {seed_open_parent}
+                WITH s, s_hasOpenParent
+                WHERE NOT s_hasOpenParent
+                RETURN s AS n
+              UNION
+            // Arm 3: the App fallback (§3.3, decisions 13 and 78). A chain-top
+            // whose own record group is structurally under this App but cannot
+            // be opened lists directly under the App. Anything beneath a
+            // hideChildren group is dropped first, so hideChildren keeps its
+            // contents hidden rather than surfacing them one level up.
+                WITH start
+                MATCH (g)-[:PERMISSION]->(s)
+                WHERE 'App' IN labels(start)
+                  AND g.id IN $grantees
+                  AND coalesce(s.accessRule, 'OPEN') = 'OPEN'
+                  AND NOT coalesce(s.isDeleted, false)
+                  AND NOT EXISTS {{
+                      MATCH (h:RecordGroup)-[:NODE_RELATION*1..20]->(s)
+                      WHERE coalesce(h.hideChildren, false)
+                  }}
+                MATCH (s)-[:BELONGS_TO]->(grp:RecordGroup)
+                WHERE NOT coalesce(grp.isDeleted, false)
+                  AND EXISTS {{ (start)-[:NODE_RELATION*1..20]->(grp) }}
+                WITH DISTINCT s, grp
+                {group_admission}
+                WITH s, grp_fromApp OR grp_viaSeed OR grp_inScope AS grpOpen
+                WHERE NOT grpOpen
+                WITH DISTINCT s
+                {seed_open_parent}
+                WITH s, s_hasOpenParent
+                WHERE NOT s_hasOpenParent
+                RETURN s AS n
+            }}
+            WITH DISTINCT n, start"""
+
+        # A partition places its seeds as the App's flatten would, so no seed is
+        # held to the scope-chain check, and a seed whose own group cannot be
+        # opened falls back to the App rather than the partition root.
+        seed_any_scope = "true" if partition else "'App' IN labels(start)"
+        # A partition's guard is the literal `true`, so the disjunct it heads is
+        # unreachable -- but 5.26 plans it anyway, and what it plans is a
+        # {0,20} quantified walk over BELONGS_TO with a PERMISSION subquery per
+        # hop. Emitting nothing is boolean reduction, not a rule change: the
+        # non-partition form below is byte-identical to what shipped.
+        seed_scope_clause = "" if seed_any_scope == "true" else f"""AND ( {seed_any_scope}
+                            OR EXISTS {{
+                                MATCH (s)-[:BELONGS_TO]->(kh_g1:RecordGroup)
+                                      ((kh_ga:RecordGroup)-[:BELONGS_TO]->(kh_gb:RecordGroup)
+                                        WHERE coalesce(kh_ga.accessRule, 'OPEN') = 'OPEN'
+                                          AND NOT coalesce(kh_ga.isDeleted, false)
+                                          AND EXISTS {{
+                                              (kh_gg)-[:PERMISSION]->(kh_ga)
+                                              WHERE kh_gg.id IN $grantees
+                                          }}
+                                      ){{0,20}}
+                                      (kh_gk:RecordGroup)
+                                WHERE kh_gk IN inner
+                            }} )"""
+        seed_fallback = "kh_app" if partition == "group" else "start"
+        include_root = "true" if partition == "group" else "false"
+        app_direct_filter = (
+            "WHERE NOT EXISTS { MATCH (start)-[:NODE_RELATION]->(kh_tg:RecordGroup)"
+            "-[:NODE_RELATION*0..50]->(n) }"
+            if partition == "app_direct" else ""
+        )
+        # Flatten (decision 28): (node, parent) pairs region by region, then one
+        # parent per node, non-internal first (decision 67).
+        # Region B walks down from each seed with strict refused, so it needs its
+        # own set -- computed seed-rooted, not App-rooted. Measured: an
+        # App-rooted strict-refused pass returns nothing at all for a connector
+        # whose top-level groups are strict, which is a different question.
+        flat_seed_rule = self._kh_v2_rule_cypher(
+            child="c", parent="p", edge="r", allow_strict="false",
+            member_of="$khBelowSeedIds" if below_seed_ids is not None else None,
+        )
+        open_region_a = self._kh_v2_open_region_cypher("openersA", "pairsOA")
+        open_region_b = self._kh_v2_open_region_cypher("openersB", "pairsOB")
+        flatten_arms = f"""
+            CALL (start, fromApp, opensBelow, admitted) {{
+                // The App this node hangs from. A partition places a seed whose
+                // own group cannot be opened under it (PG-04).
+                CALL (start) {{
+                    OPTIONAL MATCH (kh_a0:App)-[:NODE_RELATION]->(start)
+                    // Aggregate first: Cypher rejects `start` beside an aggregate
+                    // in one expression, as an implicit grouping key.
+                    WITH start, head(collect(kh_a0)) AS kh_parent_app
+                    RETURN coalesce(kh_parent_app, start) AS kh_app
+                }}
+                // Region A: what the rule reaches from here (§3.6 arm 1). The rule
+                // assumes an open parent, so a closed partition root has none.
+                CALL (start, fromApp, admitted) {{
+                    OPTIONAL MATCH (start)((p)-[r:NODE_RELATION]->(c) WHERE {child_rule})+ (a)
+                    WHERE admitted
+                    RETURN [x IN collect(DISTINCT {{n: a, parent: last(p)}})
+                            WHERE x.n IS NOT NULL] AS pairsA
+                }}
+                // Openers: this node when it opens its subtree, and every
+                // RECORD_GROUP_LEVEL group the rule reached (§3.8).
+                WITH start, kh_app, admitted, pairsA,
+                     [x IN pairsA WHERE 'RecordGroup' IN labels(x.n)
+                          AND x.n.permissionModel = 'RECORD_GROUP_LEVEL' | x.n]
+                     + CASE WHEN opensBelow THEN [start] ELSE [] END AS openersA
+                {open_region_a}
+                // Region B: chain-tops below a gap whose placement stays inside
+                // this scope, and what the rule reaches below them with nothing
+                // strict (§3.6 arm 2, NV-32). Placement above the scope is out of
+                // reach here (AC-59, NV-45).
+                CALL (start, kh_app, admitted, pairsA, pairsOA) {{
+                    WITH start, kh_app,
+                         CASE WHEN admitted THEN [start] ELSE [] END
+                         + [x IN pairsA | x.n] + [x IN pairsOA | x.n] AS inner
+                    // The scope-chain test used to be a per-candidate
+                    // `EXISTS {{ (start)-[*1..50]->(s) }}`. With both ends bound,
+                    // 5.26 plans that as VarLengthExpand(Into), whose documented
+                    // contract is to find *all* variable-length relationships
+                    // connecting the two nodes -- not to probe for one. Measured
+                    // 11.6M db hits returning 0 rows, on a 5-row estimate: 92% of
+                    // the whole query. Materialising the descendant set once turns
+                    // that into a single pruning-eligible expansion; the set is
+                    // then a list membership test. Measured 12,638,074 -> 900,190
+                    // db hits with an identical id set on both a content-heavy and
+                    // a seed-bearing root.
+                    CALL (start) {{
+                        MATCH kh_dp = (start)-[:NODE_RELATION*1..50]->(kh_d)
+                        WHERE all(x IN relationships(kh_dp) WHERE x.relationshipType IN $types)
+                        RETURN collect(DISTINCT kh_d.id) AS khDescIds
+                    }}
+                    WITH start, kh_app, inner, khDescIds
+                    OPTIONAL MATCH (g)-[:PERMISSION]->(s)
+                    WHERE g.id IN $grantees
+                      AND (s:Record OR s:RecordGroup)
+                      AND coalesce(s.accessRule, 'OPEN') = 'OPEN'
+                      AND NOT coalesce(s.isDeleted, false)
+                      AND NOT s IN inner
+                      AND s.id IN khDescIds
+                      AND NOT EXISTS {{
+                          MATCH (h:RecordGroup)-[:NODE_RELATION*1..20]->(s)
+                          WHERE coalesce(h.hideChildren, false)
+                      }}
+                      {seed_scope_clause}
+                    WITH start, kh_app, inner, collect(DISTINCT s) AS seeds
+                    CALL (start, kh_app, inner, seeds) {{
+                        UNWIND seeds AS sd
+                        // Keep only groups that are in scope before choosing
+                        // one: a seed can belong to several, and collapsing
+                        // first would pick an out-of-scope group and fall back
+                        // to the App while a usable one existed. ORDER BY is
+                        // preserved through collect(), so the pick is
+                        // deterministic and ranks as kh_breadcrumbs does --
+                        // non-internal before internal, then by id (D67).
+                        //
+                        // Two rewrites of this block -- reduce() over nodes, and
+                        // collect-then-filter-then-UNWIND -- each made even the
+                        // smallest flatten exceed 300s, far worse than this
+                        // shape. Measure before changing it.
+                        OPTIONAL MATCH (sd)-[:BELONGS_TO]->(og:RecordGroup)
+                        WHERE og IN inner OR og IN seeds
+                        WITH start, kh_app, inner, seeds, sd, og
+                        ORDER BY coalesce(og.isInternal, false), og.id
+                        WITH start, kh_app, inner, seeds, sd, head(collect(og)) AS ownG
+                        RETURN collect({{
+                            n: sd,
+                            parent: CASE WHEN ownG IS NOT NULL
+                                         THEN ownG ELSE {seed_fallback} END
+                        }}) AS seedPairs
+                    }}
+                    CALL (seeds) {{
+                        UNWIND seeds AS sd
+                        OPTIONAL MATCH (sd)((p)-[r:NODE_RELATION]->(c) WHERE {flat_seed_rule})+ (b)
+                        RETURN [x IN collect(DISTINCT {{n: b, parent: last(p)}})
+                                WHERE x.n IS NOT NULL] AS belowPairs
+                    }}
+                    RETURN seedPairs + belowPairs AS pairsB
+                }}
+                WITH start, kh_app, admitted, pairsA + pairsOA AS pairsIn, pairsB,
+                     [x IN pairsB WHERE 'RecordGroup' IN labels(x.n)
+                          AND x.n.permissionModel = 'RECORD_GROUP_LEVEL' | x.n] AS openersB
+                {open_region_b}
+                // A group partition lists its own root under the App, but only
+                // when the root can be opened (PG-41).
+                UNWIND pairsIn + pairsB + pairsOB
+                       + CASE WHEN {include_root} AND admitted
+                              THEN [{{n: start, parent: kh_app}}] ELSE [] END AS pair
+                WITH start, kh_app, pair.n AS n, pair.parent AS parent
+                WHERE n <> start OR ({include_root} AND parent = kh_app)
+                WITH start, n, parent
+                ORDER BY coalesce(parent.isInternal, false), parent.id
+                WITH start, n, head(collect(parent)) AS parent
+                {app_direct_filter}
+                RETURN n, parent
+            }}
+            WITH n, parent"""
+        arms = flatten_arms if flatten else browse_arms
+
+        # An unlabelled MATCH cannot use any index, so this was an AllNodesScan
+        # of every node in the store on every call -- measured 69,155 db hits
+        # against 3 when labelled, and it runs once per partition (102 per page
+        # here). A partition root is only ever a top-level RecordGroup or an App
+        # (GROUP/APP_DIRECT/COLLECTION), verified across every root this org has,
+        # and both labels carry a RANGE index on id. Browse cannot take the same
+        # treatment: it starts from whatever the user opened -- a Record, folder,
+        # mail or ticket -- so labelling there would silently match nothing.
+        start_match = (
+            "MATCH (start:RecordGroup|App {id: $kh_parent_id})" if partition
+            else "MATCH (start {id: $kh_parent_id})"
+        )
+
+        query = f"""
+        MATCH (u:User {{id: $user_key}})
+        {start_match}
+
+        // A collection behaves differently from a connector subtree (decision
+        // 52). Its items carry no inheritance edges at all, so the ordinary
+        // rule would hide every one of them; they are visible because the user
+        // holds a grant on the *collection*, and they carry that grant's role.
+        // Connector items carry no role (decision 34), so this resolves once
+        // per request rather than once per row.
+        // Keyed lookups rather than a label scan: :App(id) carries a RANGE
+        // index, so each of these seeks. The scan ran once per browse or
+        // flatten call and grew with the tenant's App count. coalesce keeps the
+        // original precedence -- the node itself, then its connector, then the
+        // edge. Where the connector and the edge name different KB apps the old
+        // form took scan order, i.e. arbitrary; this prefers the connector.
+        OPTIONAL MATCH (kh_kb_self:App {{id: start.id}})
+        WHERE kh_kb_self.type = 'KB'
+        OPTIONAL MATCH (kh_kb_conn:App {{id: start.connectorId}})
+        WHERE kh_kb_conn.type = 'KB'
+        OPTIONAL MATCH (start)-[:BELONGS_TO]->(kh_kb_edge:App)
+        WHERE kh_kb_edge.type = 'KB'
+        WITH u, start, coalesce(kh_kb_self, kh_kb_conn, kh_kb_edge) AS ownerApp
+        {app_role}
+        WITH u, start, ownerApp, permission_role,
+             ownerApp IS NOT NULL AS isCollection,
+             CASE WHEN ownerApp IS NULL THEN null ELSE permission_role END
+                  AS collection_role
+
+        // Admissibility: fromApp, viaSeed, inScope (§3.6, §3.8, decision 52).
+        {admission}
+        WITH start, collection_role, fromApp,
+             fromApp OR viaSeed OR inScope AS admitted,
+             {start_opener} OR inScope AS opensBelow
+
+        // Breadcrumbs (§3.3, decision 5): the start node and every hierarchy
+        // ancestor, each with the same admissibility flags and its own record
+        // group, plus for each hierarchy edge between them whether the child
+        // lists under that parent. kh_breadcrumbs walks these flags to pick the
+        // trail, so no permission decision is re-derived in Python.
+        CALL (start) {{
+            OPTIONAL MATCH (anc)-[ar:NODE_RELATION*1..50]->(start)
+            WHERE all(x IN ar WHERE x.relationshipType IN $types)
+            WITH start, collect(DISTINCT anc) AS ancs
+            // A collection's items have no hierarchy ancestor, so the walk above
+            // finds nothing and the trail would stop at the item itself. The
+            // owning App reaches them by BELONGS_TO (entityType KB), so add it
+            // as a member; the edge below then gives kh_breadcrumbs a parent to
+            // step to, and no Python-side rule changes.
+            OPTIONAL MATCH (start)-[kh_cbt:BELONGS_TO]->(kh_ckb:App)
+            WHERE coalesce(kh_cbt.entityType, '') = 'KB' AND kh_ckb.type = 'KB'
+            WITH start, ancs, collect(DISTINCT kh_ckb) AS kbApps
+            WITH [start] + ancs + [x IN kbApps WHERE NOT x IN ancs] AS members
+            UNWIND members AS a
+            {crumb_admission}
+            // Every own group, not the lowest id. A node can belong to more
+            // than one -- a shared-with-me record keeps its drive group beside
+            // the inbox -- and collapsing here hides an openable group behind
+            // an unopenable one that happens to sort first.
+            OPTIONAL MATCH (a)-[:BELONGS_TO]->(ag:RecordGroup)
+            WITH members, a, a_fromApp, a_viaSeed, a_inScope,
+                 collect(DISTINCT ag.id) AS ownGroups
+            WITH members, collect({{
+                id: a.id,
+                name: coalesce(a.name, a.recordName, a.groupName),
+                nodeType: CASE WHEN 'RecordGroup' IN labels(a) THEN 'recordGroup'
+                               WHEN 'App' IN labels(a) THEN 'app' ELSE 'record' END,
+                subType: CASE WHEN 'App' IN labels(a) THEN a.type
+                              WHEN 'RecordGroup' IN labels(a) THEN
+                                   CASE WHEN a.connectorName = 'KB' THEN 'COLLECTION'
+                                        ELSE coalesce(a.groupType, a.connectorName) END
+                              ELSE a.recordType END,
+                isInternal: coalesce(a.isInternal, false),
+                admitted: a_fromApp OR a_viaSeed OR a_inScope,
+                fromApp: a_fromApp,
+                opensBelow: {crumb_opener} OR a_inScope,
+                ownGroups: ownGroups
+            }}) AS nodes
+            WITH members, nodes,
+                 [x IN nodes WHERE x.fromApp | x.id] AS kh_from_app_ids,
+                 [x IN nodes WHERE x.opensBelow | x.id] AS kh_opens_below_ids
+            CALL (members, kh_from_app_ids, kh_opens_below_ids) {{
+                UNWIND members AS ch
+                MATCH (par)-[pr:NODE_RELATION]->(ch)
+                WHERE par IN members
+                RETURN collect({{
+                    parentId: par.id,
+                    childId: ch.id,
+                    lists: ( {crumb_rule} )
+                        OR ( par.id IN kh_opens_below_ids
+                             AND pr.relationshipType IN $types
+                             AND NOT coalesce(ch.isDeleted, false)
+                             AND NOT coalesce(par.hideChildren, false) )
+                }}) AS hierEdges
+            }}
+            // No collection edge is emitted. Adding the App to `members` above
+            // is what makes the trail reach it: `kh_breadcrumbs` falls back to
+            // an admitted App when a node has no listing parent, so the edge
+            // was redundant. Measured -- forcing its `lists` false changed no
+            // trail on either engine, while removing the App from `members`
+            // collapses kb-f1 to ['kb-f1'] and kb-f2 to ['kb-f1','kb-f2'].
+            WITH nodes, hierEdges AS edges
+            RETURN nodes AS crumbNodes, edges AS crumbEdges
+        }}
+
+        // The whole row pipeline lives in its own subquery so it cannot swallow
+        // `admitted`. A subquery ending in aggregation returns exactly one row,
+        // so the outer RETURN still has a row when the listing is empty. Read
+        // the other way round -- `head(collect(admitted))` after an UNWIND over
+        // zero rows -- the aggregation collects nothing, yields null, and an
+        // admissible node with no children reports as a 404.
+        CALL (start, collection_role, fromApp, opensBelow, admitted) {{
+            // Browse: arm 1 lists direct children, by the rule or because this
+            // node opens everything below it (a declaration or a collection).
+            // Flatten: the whole subtree, each row with its own parent.
+            {arms}
+            WITH {row} AS node
+            {filter_clause}
+            WITH collect(node) AS all_nodes
+            WITH all_nodes, size(all_nodes) AS total, {ids_expr} AS ids
+            UNWIND all_nodes AS node
+            {sort}
+            LIMIT $kh_limit
+            RETURN collect(node{{.*, sortKey: sortKey, nullRank: nullRank}}) AS rows,
+                   coalesce(max(total), 0) AS total,
+                   head(collect(ids)) AS ids
+        }}
+
+        RETURN rows, total, ids, admitted,
+               crumbNodes, crumbEdges
+        """
+        params.update({
+            "user_key": user_key,
+            "org_id": org_id,
+            "kh_parent_id": parent_id,
+            "kh_gated_apps": gated_app_ids,
+            "grantees": grantee_ids,
+            "types": ["PARENT_CHILD", "ATTACHMENT"],
+            "allowStrict": True,
+            "skipChecks": False,
+            "kh_limit": limit + 1,
+            # Bound unconditionally: Cypher ignores a parameter the query never
+            # mentions. (Declaring only what is referenced is Arango's rule, not
+            # this one.)
+            "khVisibleIds": visible_ids or [],
+            "khBelowSeedIds": below_seed_ids or [],
+        })
+
+        try:
+            results = await self.client.execute_query(
+                query, parameters=params, txn_id=transaction
+            )
+        except Exception as e:
+            self.logger.error(f"❌ get_knowledge_hub_children_v2 failed: {str(e)}")
+            self.logger.error(traceback.format_exc())
+            raise
+
+        payload = results[0] if results else {}
+        rows = payload.get("rows") or []
+        total = payload.get("total") or 0
+        admitted = bool(payload.get("admitted"))
+        has_more = len(rows) > limit
+        # A previous page was fetched nearest the boundary first; hand it back
+        # in page order.
+        page_rows = rows[:limit]
+        if direction == "prev":
+            page_rows.reverse()
+        # A partition's rows stand on their own admission; only browse and a
+        # scoped flatten hide everything behind the start node's (SEC-02).
+        visible = admitted or partition is not None
+        return {
+            "partitions": [{
+                "partitionId": parent_id,
+                "partitionKind": {"group": "GROUP", "app_direct": "APP_DIRECT"}.get(
+                    partition, "SUBTREE" if flatten else "BROWSE"
+                ),
+                "appId": None,
+                "rows": page_rows if visible else [],
+                "hasMore": has_more if visible else False,
+                "exhausted": (not has_more) if visible else True,
+                "total": (None if after is not None else total) if visible else 0,
+                "ids": (payload.get("ids") or []) if visible else [],
+                "countsByType": None,
+            }],
+            "scope": browse_scope(
+                parent_id, admitted,
+                payload.get("crumbNodes") or [], payload.get("crumbEdges") or [],
+                via_parent_id=via_parent_id,
+            ),
+        }
+
     async def get_knowledge_hub_breadcrumbs(
         self,
         node_id: str,
@@ -14208,11 +17265,11 @@ class Neo4jProvider(IGraphDBProvider):
 
         NOTE(N+1 Queries): Uses iterative parent lookup (one query per level) because a single
         graph traversal isn't feasible here. Parent relationships are stored via multiple
-        edge types: RECORD_RELATION (record->record) and BELONGS_TO (record->recordGroup,
+        edge types: NODE_RELATION (record->record) and BELONGS_TO (record->recordGroup,
         recordGroup->recordGroup, recordGroup->app).
 
         Traversal logic:
-        - Records: Check RECORD_RELATION edge from another record first, then BELONGS_TO to recordGroup
+        - Records: Check NODE_RELATION edge from another record first, then BELONGS_TO to recordGroup
         - RecordGroups: Check BELONGS_TO edge to another recordGroup, then to app (excluding KB apps)
         - Apps: No parent (root level)
         """
@@ -14254,10 +17311,10 @@ class Neo4jProvider(IGraphDBProvider):
                      coalesce(record, rg, app) AS node
 
                 // Get parent for records - REFACTORED LOGIC:
-                // Step 1: Check RECORD_RELATION edge from another RECORD only
+                // Step 1: Check NODE_RELATION edge from another RECORD only
                 // Edge direction: parent -> child (edge from parent, to current record)
                 // Use LIMIT 1 to ensure only one parent
-                OPTIONAL MATCH (parent_rec:Record)-[rr:RECORD_RELATION]->(record:Record)
+                OPTIONAL MATCH (parent_rec:Record)-[rr:NODE_RELATION]->(record:Record)
                 WHERE record IS NOT NULL
                       AND rr IS NOT NULL
                       AND rr.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT']
@@ -14292,7 +17349,7 @@ class Neo4jProvider(IGraphDBProvider):
 
                 // Determine parent ID
                 // For Records:
-                //   1. Check RECORD_RELATION edge from another RECORD only
+                //   1. Check NODE_RELATION edge from another RECORD only
                 //   2. If no record parent, check BELONGS_TO to RecordGroup
                 //   3. If no RecordGroup parent, check BELONGS_TO to App (KB folders)
                 // For RecordGroups:
@@ -14304,7 +17361,7 @@ class Neo4jProvider(IGraphDBProvider):
                          // Apps have no parent
                          WHEN app IS NOT NULL THEN null
 
-                         // Records: RECORD_RELATION → RecordGroup → App (KB folders)
+                         // Records: NODE_RELATION → RecordGroup → App (KB folders)
                          WHEN record IS NOT NULL THEN CASE
                              WHEN parent_rec IS NOT NULL THEN parent_rec.id
                              WHEN rg_parent_from_record IS NOT NULL THEN rg_parent_from_record.id
@@ -14677,7 +17734,7 @@ class Neo4jProvider(IGraphDBProvider):
             closure_query = f"""
             UNWIND $record_ids AS rid
             MATCH (start:Record {{id: rid, orgId: $org_id}})
-            OPTIONAL MATCH (parent:Record)-[rr:RECORD_RELATION*0..{depth}]->(start)
+            OPTIONAL MATCH (parent:Record)-[rr:NODE_RELATION*0..{depth}]->(start)
             WHERE parent.orgId = $org_id
               AND ALL(rel IN rr WHERE rel.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT'])
             WITH collect(DISTINCT start.id) + collect(DISTINCT parent.id) AS recIds
@@ -14714,7 +17771,7 @@ class Neo4jProvider(IGraphDBProvider):
                       WHEN rg IS NOT NULL THEN rg
                       ELSE app END AS node
             WHERE node IS NOT NULL
-            OPTIONAL MATCH (pRec:Record)-[rr:RECORD_RELATION]->(rec)
+            OPTIONAL MATCH (pRec:Record)-[rr:NODE_RELATION]->(rec)
             WHERE rec IS NOT NULL
               AND rr.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT']
               AND pRec.orgId = $org_id
@@ -14732,7 +17789,7 @@ class Neo4jProvider(IGraphDBProvider):
                         THEN coalesce(rg.groupName, rg.name, rg.id)
                         ELSE coalesce(app.name, app.appName, app.id) END AS name,
                    collect(DISTINCT CASE WHEN pRec IS NOT NULL
-                     THEN {parent_id: pRec.id, parent_type: 'record', via: 'recordRelations'}
+                     THEN {parent_id: pRec.id, parent_type: 'record', via: 'nodeRelations'}
                      ELSE null END) AS rrParents,
                    collect(DISTINCT CASE WHEN pRg IS NOT NULL
                      THEN {parent_id: pRg.id, parent_type: 'recordGroup', via: 'belongsTo'}
@@ -15153,7 +18210,7 @@ class Neo4jProvider(IGraphDBProvider):
             MATCH (u:User {id: $user_key})
             MATCH (source:Record {id: $record_id, orgId: $org_id})
 
-            MATCH (source)-[e:RECORD_RELATION]-(v:Record)
+            MATCH (source)-[e:NODE_RELATION]-(v:Record)
             WHERE e.relationshipType IN $relation_types
               AND (v.orgId = $org_id)
               AND (v.isDeleted IS NULL OR v.isDeleted = false)
@@ -15166,9 +18223,9 @@ class Neo4jProvider(IGraphDBProvider):
             )
 
             WITH v, e
-            OPTIONAL MATCH (v)-[:RECORD_RELATION {relationshipType: 'PARENT_CHILD'}]->(:Record)
+            OPTIONAL MATCH (v)-[:NODE_RELATION {relationshipType: 'PARENT_CHILD'}]->(:Record)
             WITH v, e, count(*) > 0 AS has_child_pc
-            OPTIONAL MATCH (v)-[:RECORD_RELATION {relationshipType: 'ATTACHMENT'}]->(:Record)
+            OPTIONAL MATCH (v)-[:NODE_RELATION {relationshipType: 'ATTACHMENT'}]->(:Record)
             WITH v, e, has_child_pc, count(*) > 0 AS has_child_att
 
             RETURN {
@@ -15230,11 +18287,11 @@ class Neo4jProvider(IGraphDBProvider):
                  ) AS is_kb_record
 
             // ==================== Record Parent Logic ====================
-            // For KB records: check RECORD_RELATION, then BELONGS_TO to recordGroup
-            // For connector records: check RECORD_RELATION, then BELONGS_TO (to recordGroup OR record), then INHERIT_PERMISSIONS
+            // For KB records: check NODE_RELATION, then BELONGS_TO to recordGroup
+            // For connector records: check NODE_RELATION, then BELONGS_TO (to recordGroup OR record), then INHERIT_PERMISSIONS
 
-            // Step 1: Check RECORD_RELATION edge (parent folder/record)
-            OPTIONAL MATCH (parent_from_rel:Record)-[rr:RECORD_RELATION]->(record)
+            // Step 1: Check NODE_RELATION edge (parent folder/record)
+            OPTIONAL MATCH (parent_from_rel:Record)-[rr:NODE_RELATION]->(record)
             WHERE record IS NOT NULL AND rr.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT']
 
             // Step 2: Check BELONGS_TO edge (can point to RecordGroup, Record, or App for KB)
@@ -15387,7 +18444,7 @@ class Neo4jProvider(IGraphDBProvider):
 
         For KB apps (type = 'KB'):
           - Children are root-level records/folders linked via BELONGS_TO
-          - Root-level = no incoming PARENT_CHILD edge (from recordRelations)
+          - Root-level = no incoming PARENT_CHILD edge (from nodeRelations)
         For other (external connector) apps:
           - Children are RecordGroups linked via BELONGS_TO
         """
@@ -15408,7 +18465,7 @@ class Neo4jProvider(IGraphDBProvider):
             // Root records are those without an incoming PARENT_CHILD edge
             MATCH (record:Record)-[:BELONGS_TO]->(app)
             WHERE NOT EXISTS {{
-                MATCH ()-[rel:RECORD_RELATION {{relationshipType: 'PARENT_CHILD'}}]->(record)
+                MATCH ()-[rel:NODE_RELATION {{relationshipType: 'PARENT_CHILD'}}]->(record)
             }}
 
             {record_permission_role_cypher}
@@ -15417,7 +18474,7 @@ class Neo4jProvider(IGraphDBProvider):
             WHERE permission_role IS NOT NULL AND permission_role <> ''
 
             OPTIONAL MATCH (record)-[:IS_OF_TYPE]->(file_info:File)
-            OPTIONAL MATCH (record)-[child_rel:RECORD_RELATION {{relationshipType: 'PARENT_CHILD'}}]->(child:Record)
+            OPTIONAL MATCH (record)-[child_rel:NODE_RELATION {{relationshipType: 'PARENT_CHILD'}}]->(child:Record)
             WITH record, permission_role, parent_id, file_info, count(DISTINCT child) > 0 AS has_children
 
             RETURN collect({{
@@ -15547,7 +18604,7 @@ class Neo4jProvider(IGraphDBProvider):
                  CASE WHEN file_info IS NOT NULL AND file_info.isFile = false THEN true ELSE false END AS is_folder
 
             // Simple hasChildren check
-            OPTIONAL MATCH (record)-[rr:RECORD_RELATION]->(child:Record)
+            OPTIONAL MATCH (record)-[rr:NODE_RELATION]->(child:Record)
             WHERE rr.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT']
             AND child IS NOT NULL
             WITH record, parent_id, permission_role, file_info, is_folder,
@@ -15712,7 +18769,7 @@ class Neo4jProvider(IGraphDBProvider):
                  CASE WHEN file_info IS NOT NULL AND file_info.isFile = false THEN true ELSE false END AS is_folder
 
             // Simple hasChildren check
-            OPTIONAL MATCH (record)-[rr:RECORD_RELATION]->(child:Record)
+            OPTIONAL MATCH (record)-[rr:NODE_RELATION]->(child:Record)
             WHERE rr.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT']
             AND child IS NOT NULL
             WITH record, parent_id, permission_role, file_info, is_folder,
@@ -15762,7 +18819,7 @@ class Neo4jProvider(IGraphDBProvider):
         """Generate Cypher sub-query to fetch children of a Folder/Record.
 
         Simplified unified approach:
-        - Uses RECORD_RELATION edge with relationshipType filter (PARENT_CHILD, ATTACHMENT)
+        - Uses NODE_RELATION edge with relationshipType filter (PARENT_CHILD, ATTACHMENT)
         - Uses _get_permission_role_cypher for comprehensive permission checking (all 10 paths)
         - Applies permission checks to both KB and Connector records
         - Returns only children where user has permission
@@ -15778,8 +18835,8 @@ class Neo4jProvider(IGraphDBProvider):
 
         WITH parent_record, u, $parent_id AS parent_id, $org_id AS org_id
 
-        // Get children via RECORD_RELATION (direction: parent -> child)
-        OPTIONAL MATCH (parent_record)-[rr:RECORD_RELATION]->(record:Record)
+        // Get children via NODE_RELATION (direction: parent -> child)
+        OPTIONAL MATCH (parent_record)-[rr:NODE_RELATION]->(record:Record)
         WHERE rr.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT']
 
         WITH parent_record, u, parent_id, org_id, collect(DISTINCT record) AS all_children
@@ -15805,7 +18862,7 @@ class Neo4jProvider(IGraphDBProvider):
              CASE WHEN file_info IS NOT NULL AND file_info.isFile = false THEN true ELSE false END AS is_folder
 
         // Simple hasChildren check (no permission filtering on grandchildren)
-        OPTIONAL MATCH (record)-[rr:RECORD_RELATION]->(child:Record)
+        OPTIONAL MATCH (record)-[rr:NODE_RELATION]->(child:Record)
         WHERE rr.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT']
           AND child IS NOT NULL
         WITH parent_record, u, parent_id, record, permission_role, file_info, is_folder,
@@ -16484,7 +19541,7 @@ class Neo4jProvider(IGraphDBProvider):
             WHERE rg2.isDeleted <> true
             OPTIONAL MATCH (rg_top:Record)-[:BELONGS_TO]->(rg2)
             WHERE rg_top.orgId = $org_id
-            OPTIONAL MATCH rg_child_path = (rg_top)-[:RECORD_RELATION*1..{remaining}]->(rg_child:Record)
+            OPTIONAL MATCH rg_child_path = (rg_top)-[:NODE_RELATION*1..{remaining}]->(rg_child:Record)
             WHERE rg_child.orgId = $org_id
               AND ALL(rel IN relationships(rg_child_path)
                       WHERE rel.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT'])
@@ -16494,7 +19551,7 @@ class Neo4jProvider(IGraphDBProvider):
             // Depth>=3: children of KB-direct records
             OPTIONAL MATCH (kb_top:Record)-[:BELONGS_TO]->(kb_app2:App {{id: $parent_doc_id}})
             WHERE kb_top.orgId = $org_id
-            OPTIONAL MATCH kb_child_path = (kb_top)-[:RECORD_RELATION*1..{remaining}]->(kb_child:Record)
+            OPTIONAL MATCH kb_child_path = (kb_top)-[:NODE_RELATION*1..{remaining}]->(kb_child:Record)
             WHERE kb_child.orgId = $org_id
               AND ALL(rel IN relationships(kb_child_path)
                       WHERE rel.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT'])
@@ -16560,15 +19617,15 @@ class Neo4jProvider(IGraphDBProvider):
             """
 
         elif parent_type in ("record", "folder"):
-            # For Record/Folder: traverse RECORD_RELATION to find child records
+            # For Record/Folder: traverse NODE_RELATION to find child records
             max_depth = min(max(1, depth), 100) if depth is not None else 100
             return f"""
             // ========== CHILDREN TRAVERSAL & INTERSECTION (record/folder parent) ==========
             // Get parent Record
             MATCH (parent_record:Record {{id: $parent_doc_id}})
 
-            // Find all child Records via RECORD_RELATION (recursive)
-            OPTIONAL MATCH (parent_record)-[rr:RECORD_RELATION*1..{max_depth}]->(child_record:Record)
+            // Find all child Records via NODE_RELATION (recursive)
+            OPTIONAL MATCH (parent_record)-[rr:NODE_RELATION*1..{max_depth}]->(child_record:Record)
             WHERE child_record.orgId = $org_id
               AND ALL(rel IN rr WHERE rel.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT'])
             WITH accessible_rgs, accessible_records, parent_record,
@@ -17093,7 +20150,7 @@ class Neo4jProvider(IGraphDBProvider):
         WHERE record IS NOT NULL
         WITH matched_nodes, rg_nodes, record, file_info
 
-        OPTIONAL MATCH (record)-[rr:RECORD_RELATION]->(child:Record)
+        OPTIONAL MATCH (record)-[rr:NODE_RELATION]->(child:Record)
         WHERE record IS NOT NULL
           AND rr.relationshipType IN ['PARENT_CHILD', 'ATTACHMENT']
         WITH matched_nodes, rg_nodes, record, file_info,

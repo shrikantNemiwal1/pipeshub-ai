@@ -475,7 +475,8 @@ class ArangoHTTPClient:
         query: str,
         bind_vars: Optional[Dict] = None,
         txn_id: Optional[str] = None,
-        batch_size: int = 1000
+        batch_size: int = 1000,
+        options: Optional[Dict] = None,
     ) -> List[Dict]:
         """
         Execute AQL query.
@@ -485,6 +486,7 @@ class ArangoHTTPClient:
             bind_vars: Query bind variables
             txn_id: Optional transaction ID
             batch_size: Batch size for cursor
+            options: Optional cursor ``options`` (e.g. optimizer rules)
 
         Returns:
             List[Dict]: Query results
@@ -500,6 +502,8 @@ class ArangoHTTPClient:
             "count": True,
             "batchSize": batch_size
         }
+        if options:
+            payload["options"] = options
 
         headers = {"x-arango-trx-id": txn_id} if txn_id else {}
 
@@ -945,6 +949,53 @@ class ArangoHTTPClient:
                 self.logger.info(f"✅ Schema for '{name}' already configured, skipping")
                 return True
             self.logger.error(f"❌ Error updating collection schema: {error_msg}")
+            return False
+
+    async def rename_collection(self, name: str, new_name: str) -> bool:
+        """Rename a collection.
+
+        Safe for a collection inside a named graph: ArangoDB updates the graph's
+        edge definitions to the new name itself (verified on 3.12.4), so no
+        gharial repair is needed afterwards.
+        """
+        url = f"{self.base_url}/_db/{self.database}/_api/collection/{name}/rename"
+
+        try:
+            session = await self._get_session()
+            async with session.put(url, json={"name": new_name}) as resp:
+                if resp.status == HttpStatusCode.OK.value:
+                    self.logger.info(f"✅ Renamed collection '{name}' -> '{new_name}'")
+                    return True
+
+                self.logger.warning(
+                    f"Failed to rename collection '{name}' -> '{new_name}': "
+                    f"{resp.status} {await resp.text()}"
+                )
+                return False
+
+        except Exception as e:
+            self.logger.error(f"❌ Error renaming collection '{name}': {e}")
+            return False
+
+    async def delete_collection(self, name: str) -> bool:
+        """Drop a collection and everything in it."""
+        url = f"{self.base_url}/_db/{self.database}/_api/collection/{name}"
+
+        try:
+            session = await self._get_session()
+            async with session.delete(url) as resp:
+                if resp.status == HttpStatusCode.OK.value:
+                    self.logger.info(f"✅ Dropped collection '{name}'")
+                    return True
+
+                self.logger.warning(
+                    f"Failed to drop collection '{name}': "
+                    f"{resp.status} {await resp.text()}"
+                )
+                return False
+
+        except Exception as e:
+            self.logger.error(f"❌ Error dropping collection '{name}': {e}")
             return False
 
     # ==================== Graph Operations ====================

@@ -2531,7 +2531,7 @@ class KnowledgeBaseService:
                 }
             self.logger.info(f"KB context: {kb_context}")
 
-            # ── 4. Get current parent via RECORD_RELATIONS ───────────────────
+            # ── 4. Get current parent via NODE_RELATIONS ───────────────────
             parent_info = await self.graph_provider.get_record_parent_info(record_id)
             self.logger.info(f"Parent info: {parent_info}")
             # parent_info = {"parentId": str, "parentType": "record"|"recordGroup", "edgeKey": str} | None
