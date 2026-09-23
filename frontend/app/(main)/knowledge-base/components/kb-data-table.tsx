@@ -33,12 +33,14 @@ interface KbDataTableProps {
   isRefreshing?: boolean;
   error?: string | null;
   pagination?: {
-    page: number;
     limit: number;
     totalItems: number;
-    totalPages: number;
+    startIndex?: number;
+    endIndex?: number;
     hasNext: boolean;
     hasPrev: boolean;
+    nextCursor?: string | null;
+    prevCursor?: string | null;
   };
   permissions?: NodePermissions;
   currentNodeName?: string;
@@ -49,7 +51,7 @@ interface KbDataTableProps {
   hasSearchQuery?: boolean;
   hasCollections?: boolean;
   onRefresh?: () => void;
-  onPageChange?: (page: number) => void;
+  onCursorChange?: (cursor: string | null) => void;
   onLimitChange?: (limit: number) => void;
   onItemClick: (item: TableItem) => void;
   onPreview?: (item: TableItem) => void;
@@ -80,7 +82,7 @@ export function KbDataTable({
   hasSearchQuery = false,
   hasCollections = false,
   onRefresh,
-  onPageChange,
+  onCursorChange,
   onLimitChange,
   onItemClick,
   onPreview,
@@ -396,7 +398,7 @@ export function KbDataTable({
           selectedItems={activeSelectedItems}
           showCheckbox={showCheckbox}
           pagination={pagination}
-          onPageChange={onPageChange}
+          onCursorChange={onCursorChange}
           onLimitChange={onLimitChange}
           onSelectItem={activeToggleSelection}
           onItemClick={onItemClick}
@@ -417,7 +419,7 @@ export function KbDataTable({
           showCheckbox={showCheckbox}
           sort={isAllRecords ? allRecordsSort : sort}
           pagination={pagination}
-          onPageChange={onPageChange}
+          onCursorChange={onCursorChange}
           onLimitChange={onLimitChange}
           onSelectAll={handleSelectAll}
           onSort={isAllRecords ? setAllRecordsSort : setSort}

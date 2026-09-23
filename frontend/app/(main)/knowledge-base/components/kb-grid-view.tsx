@@ -693,16 +693,18 @@ interface KbGridViewProps {
   selectedItems: Set<string>;
   showCheckbox?: boolean;
   pagination?: {
-    page: number;
     limit: number;
     totalItems: number;
-    totalPages: number;
+    startIndex?: number;
+    endIndex?: number;
     hasNext: boolean;
     hasPrev: boolean;
+    nextCursor?: string | null;
+    prevCursor?: string | null;
   };
   onSelectItem: (id: string) => void;
   onItemClick: (item: TableItem) => void;
-  onPageChange?: (page: number) => void;
+  onCursorChange?: (cursor: string | null) => void;
   onLimitChange?: (limit: number) => void;
   onPreview?: (item: TableItem) => void;
   onRename?: (item: TableItem, newName: string) => Promise<void>;
@@ -720,7 +722,7 @@ export function KbGridView({
   pagination,
   onSelectItem,
   onItemClick,
-  onPageChange,
+  onCursorChange,
   onLimitChange,
   onPreview,
   onRename,
@@ -785,7 +787,7 @@ export function KbGridView({
           }}
         >
           <Text size="2" style={{ color: 'var(--slate-9)' }}>
-            Showing {((pagination.page - 1) * pagination.limit) + 1}-{Math.min(pagination.page * pagination.limit, pagination.totalItems)} of {pagination.totalItems} Items
+            Showing {pagination.startIndex ?? 0}-{pagination.endIndex ?? 0} of {pagination.totalItems} Items
           </Text>
           <Flex gap="3" align="center">
             {/* Previous Button */}
@@ -797,13 +799,13 @@ export function KbGridView({
                 opacity: pagination.hasPrev ? 1 : 0.5,
                 color: 'var(--slate-11)',
               }}
-              onClick={() => pagination.hasPrev && onPageChange?.(pagination.page - 1)}
+              onClick={() => pagination.hasPrev && onCursorChange?.(pagination.prevCursor ?? null)}
             >
               <MaterialIcon name="chevron_left" size={16} />
               <Text size="2">Previous</Text>
             </Flex>
 
-            {/* Page Number Box */}
+            {/* Derived position — see kb-list-view for why it is not a page number. */}
             <Box
               style={{
                 padding: 'var(--space-1) var(--space-3)',
@@ -814,7 +816,7 @@ export function KbGridView({
               }}
             >
               <Text size="2" weight="medium" style={{ color: 'var(--slate-12)' }}>
-                {pagination.page}
+                {Math.floor(((pagination.startIndex ?? 1) - 1) / Math.max(1, pagination.limit)) + 1}
               </Text>
             </Box>
 
@@ -827,7 +829,7 @@ export function KbGridView({
                 opacity: pagination.hasNext ? 1 : 0.5,
                 color: 'var(--slate-11)',
               }}
-              onClick={() => pagination.hasNext && onPageChange?.(pagination.page + 1)}
+              onClick={() => pagination.hasNext && onCursorChange?.(pagination.nextCursor ?? null)}
             >
               <Text size="2">Next</Text>
               <MaterialIcon name="chevron_right" size={16} />

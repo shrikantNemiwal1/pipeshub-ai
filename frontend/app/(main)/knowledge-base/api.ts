@@ -23,7 +23,7 @@ function getNodeChildrenCacheKey(
   nodeType: NodeType,
   nodeId: string,
   params?: {
-    page?: number;
+    cursor?: string;
     limit?: number;
     include?: string;
     onlyContainers?: boolean;
@@ -31,13 +31,13 @@ function getNodeChildrenCacheKey(
     sortOrder?: 'asc' | 'desc';
   }
 ) {
-  const page = params?.page ?? 1;
+  const cursor = params?.cursor ?? '';
   const limit = params?.limit ?? 50;
   const include = params?.include ?? '';
   const sortBy = params?.sortBy ?? '';
   const sortOrder = params?.sortOrder ?? '';
   const onlyContainers = params?.onlyContainers !== false;
-  return `${nodeType}\0${nodeId}\0${page}\0${limit}\0${include}\0${onlyContainers ? '1' : '0'}\0${sortBy}\0${sortOrder}`;
+  return `${nodeType}\0${nodeId}\0${cursor}\0${limit}\0${include}\0${onlyContainers ? '1' : '0'}\0${sortBy}\0${sortOrder}`;
 }
 
 function filterSidebarItems(items: KnowledgeHubApiResponse['items']) {
@@ -84,7 +84,6 @@ export const KnowledgeHubApi = {
       `${BASE_URL}/knowledge-hub/nodes`,
       {
         params: {
-          page: 1,
           limit: DEFAULT_PAGE_SIZE,
           include: 'counts',
         },
@@ -109,7 +108,6 @@ export const KnowledgeHubApi = {
       {
         params: {
           nodeId,
-          page: 1,
           limit: DEFAULT_PAGE_SIZE,
         },
       }
@@ -139,7 +137,6 @@ export const KnowledgeHubApi = {
       `${BASE_URL}/knowledge-hub/nodes/${nodeType}/${nodeId}`,
       {
         params: {
-          page: 1,
           limit: DEFAULT_PAGE_SIZE,
           include: 'counts,permissions,breadcrumbs,availableFilters',
           // Data area: Never use onlyContainers (we need both folders AND files)
@@ -184,7 +181,6 @@ export const KnowledgeHubApi = {
       `${BASE_URL}/knowledge-hub/nodes`,
       {
         params: {
-          page: 1,
           limit: DEFAULT_PAGE_SIZE,
           include: 'counts,permissions,availableFilters',
           // Data area: Never use onlyContainers (we need all record types)
@@ -211,7 +207,7 @@ export const KnowledgeHubApi = {
     nodeId: string,
     params?: {
       onlyContainers?: boolean;
-      page?: number;
+      cursor?: string;
       limit?: number;
       include?: string;
       sortBy?: string;
@@ -230,7 +226,8 @@ export const KnowledgeHubApi = {
           `${BASE_URL}/knowledge-hub/nodes/${nodeType}/${nodeId}`,
           {
             params: {
-              page: params?.page ?? 1,
+              // Omitted, not defaulted: no cursor means the first page.
+              ...(params?.cursor ? { cursor: params.cursor } : {}),
               limit: params?.limit ?? 50,
               include: params?.include,
               onlyContainers,
@@ -259,7 +256,7 @@ export const KnowledgeHubApi = {
    * @param params - Query parameters
    * @returns Root nodes
    */
-  async getRootNodes(params?: { page?: number; limit?: number; onlyContainers?: boolean }) {
+  async getRootNodes(params?: { cursor?: string; limit?: number; onlyContainers?: boolean }) {
     if (params?.onlyContainers !== false) {
       return this.initializeSidebar();
     }
@@ -282,7 +279,6 @@ export const KnowledgeHubApi = {
       `${BASE_URL}/knowledge-hub/nodes`,
       {
         params: {
-          page: 1,
           limit: DEFAULT_PAGE_SIZE,
           include: 'counts,permissions,breadcrumbs,availableFilters',
           // Data area: Never use onlyContainers (we need all root items including records)

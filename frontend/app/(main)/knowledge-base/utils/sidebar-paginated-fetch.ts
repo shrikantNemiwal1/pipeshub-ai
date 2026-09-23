@@ -2,7 +2,7 @@ import { KnowledgeHubApi } from '../api';
 import { useKnowledgeBaseStore } from '../store';
 import { SIDEBAR_PAGINATION_PAGE_SIZE } from '../constants';
 import { buildConnectorAppSidebarTree, treeHasNodeWithId } from './tree-builder';
-import { sidebarNodeChildrenMetaAfterPage } from './sidebar-child-pagination-meta';
+import { sidebarNodeChildrenMetaFromResponse } from './sidebar-child-pagination-meta';
 import { toast } from '@/lib/store/toast-store';
 import type { KnowledgeHubNode } from '../types';
 
@@ -31,7 +31,7 @@ export async function loadMoreRootAppList(): Promise<void> {
   setLoadingRootAppListMore(true);
   try {
     const response = await KnowledgeHubApi.getNavigationNodes({
-      page: meta.nextPage,
+      cursor: meta.nextCursor ?? undefined,
       limit: SIDEBAR_PAGINATION_PAGE_SIZE,
       include: 'counts',
       sortBy: 'updatedAt',
@@ -43,11 +43,8 @@ export async function loadMoreRootAppList(): Promise<void> {
 
     const p = response.pagination;
     setAppRootListPagination(
-      p
-        ? {
-            hasNext: p.hasNext,
-            nextPage: p.hasNext ? p.page + 1 : p.page,
-          }
+      p?.nextCursor
+        ? { hasNext: p.hasNext, nextCursor: p.nextCursor }
         : null
     );
   } catch (error) {
@@ -83,7 +80,7 @@ export async function loadMoreAppChildPage(appId: string): Promise<void> {
   try {
     const response = await KnowledgeHubApi.getNodeChildren('app', appId, {
       onlyContainers: true,
-      page: childMeta.nextPage,
+      cursor: childMeta.nextCursor ?? undefined,
       limit: SIDEBAR_PAGINATION_PAGE_SIZE,
       sortBy: 'name',
       sortOrder: 'asc',
@@ -96,12 +93,9 @@ export async function loadMoreAppChildPage(appId: string): Promise<void> {
     const p = response.pagination;
     setAppChildPagination(
       appId,
-      p
-        ? {
-            hasNext: p.hasNext,
-            nextPage: p.hasNext ? p.page + 1 : p.page,
-          }
-        : { hasNext: false, nextPage: 1 }
+      p?.nextCursor
+        ? { hasNext: p.hasNext, nextCursor: p.nextCursor }
+        : { hasNext: false, nextCursor: null }
     );
 
     // Build the tree for BOTH KB and connector apps — see
@@ -141,7 +135,7 @@ export async function loadMoreNodeChildrenPage(parentId: string): Promise<void> 
   try {
     const response = await KnowledgeHubApi.getNodeChildren(meta.nodeType, parentId, {
       onlyContainers: true,
-      page: meta.nextPage,
+      cursor: meta.nextCursor ?? undefined,
       limit: SIDEBAR_PAGINATION_PAGE_SIZE,
       sortBy: 'name',
       sortOrder: 'asc',
@@ -153,13 +147,7 @@ export async function loadMoreNodeChildrenPage(parentId: string): Promise<void> 
 
     setNodeChildrenPagination(
       parentId,
-      sidebarNodeChildrenMetaAfterPage(
-        response.pagination,
-        response.items.length,
-        SIDEBAR_PAGINATION_PAGE_SIZE,
-        meta.nextPage,
-        meta.nodeType
-      )
+      sidebarNodeChildrenMetaFromResponse(response.pagination, meta.nodeType)
     );
 
     addNodes(response.items);

@@ -57,7 +57,7 @@ import {
   applyClientSideFilters,
   isKbCollectionsHubApp,
 } from './utils/all-records-transformer';
-import { buildFilterParams, buildAllRecordsFilterParams, hasKnowledgeHubFlatteningFilters } from './utils';
+import { buildFilterParams, buildAllRecordsFilterParams, hasKnowledgeHubFlatteningFilters, toTablePagination } from './utils';
 import { ShareSidebar } from '@/app/components/share';
 import type { SharedAvatarMember } from '@/app/components/share';
 import { createKBShareAdapter } from './share-adapter';
@@ -103,6 +103,7 @@ import {
 } from '@/app/components/file-preview/utils';
 import { useDebouncedSearch } from './hooks/use-debounced-search';
 import { ErrorType, getUserFacingErrorMessage, isProcessedError } from '@/lib/api/api-error';
+import { isRejectedCursorError } from './utils/cursor-recovery';
 import { useUserPermission } from '@/config';
 
 function KnowledgeBasePageContent() {
@@ -145,7 +146,7 @@ function KnowledgeBasePageContent() {
     setTableDataError,
     setSelectedNode,
     setCollectionsPagination,
-    setCollectionsPage,
+    setCollectionsCursor,
     setCollectionsLimit,
     collectionsPagination,
     clearTableData,
@@ -200,7 +201,6 @@ function KnowledgeBasePageContent() {
     rawFilter.indexingStatus?.join(','),
     rawFilter.origins?.join(','),
     rawFilter.connectorIds?.join(','),
-    rawFilter.kbIds?.join(','),
     rawFilter.sizeRange,
     rawFilter.createdAfter,
     rawFilter.createdBefore,
@@ -324,7 +324,9 @@ function KnowledgeBasePageContent() {
       store.setAllRecordsSort(parsed.sort);
       store.setAllRecordsLimit(parsed.limit);
       store.setAllRecordsSearchQuery(parsed.searchQuery);
-      store.setAllRecordsPage(parsed.page);
+      // Last: the setters above each clear the cursor, so hydrating it first
+      // would be undone by them.
+      store.setAllRecordsCursor(parsed.cursor);
       setIsSearchOpen(!!parsed.searchQuery);
     } else {
       const parsed = parseCollectionsParams(searchParams);
@@ -332,7 +334,7 @@ function KnowledgeBasePageContent() {
       store.setSort(parsed.sort);
       store.setCollectionsLimit(parsed.limit);
       store.setSearchQuery(parsed.searchQuery);
-      store.setCollectionsPage(parsed.page);
+      store.setCollectionsCursor(parsed.cursor);
       setIsSearchOpen(!!parsed.searchQuery);
     }
   }, [searchParams]);
@@ -354,13 +356,13 @@ function KnowledgeBasePageContent() {
       ? serializeAllRecordsParams(
           store.allRecordsFilter,
           store.allRecordsSort,
-          { page: store.allRecordsPagination.page, limit: store.allRecordsPagination.limit },
+          { cursor: store.allRecordsPagination.cursor, limit: store.allRecordsPagination.limit },
           debouncedAllRecordsSearchQuery
         )
       : serializeCollectionsParams(
           store.filter,
           store.sort,
-          { page: store.collectionsPagination.page, limit: store.collectionsPagination.limit },
+          { cursor: store.collectionsPagination.cursor, limit: store.collectionsPagination.limit },
           debouncedSearchQuery
         );
 
@@ -374,8 +376,8 @@ function KnowledgeBasePageContent() {
       router.replace(newUrl);
     }
   }, [
-    filter, sort, collectionsPagination.page, collectionsPagination.limit, debouncedSearchQuery,
-    allRecordsFilter, allRecordsSort, allRecordsPagination.page, allRecordsPagination.limit, debouncedAllRecordsSearchQuery,
+    filter, sort, collectionsPagination.cursor, collectionsPagination.limit, debouncedSearchQuery,
+    allRecordsFilter, allRecordsSort, allRecordsPagination.cursor, allRecordsPagination.limit, debouncedAllRecordsSearchQuery,
     isAllRecordsMode,
     searchParams,
     router,
@@ -405,8 +407,7 @@ function KnowledgeBasePageContent() {
       filter.updatedAfter ||
       filter.updatedBefore ||
       filter.origins?.length ||
-      filter.connectorIds?.length ||
-      filter.kbIds?.length
+      filter.connectorIds?.length
     );
   }, [isAllRecordsMode, allRecordsFilter, filter]);
 
@@ -486,10 +487,10 @@ function KnowledgeBasePageContent() {
   const { maxFileSizeBytes, maxFileSizeMB } = useUploadLimits();
 
   /**
-   * Tracks last page we fetched for so filter/sort resets (page → 1) do not trigger a
-   * duplicate fetch from the pagination effect when page actually changes (e.g. 2 → 1).
+   * The cursor we last fetched for, so a filter/sort reset (cursor → null) does
+   * not also trigger the pagination effect when the cursor actually changes.
    */
-  const prevAllRecordsPageRef = useRef(allRecordsPagination.page);
+  const prevAllRecordsCursorRef = useRef(allRecordsPagination.cursor);
 
   // Sync current folder from URL params (Collections mode only).
   // In All Records mode the active node is tracked via nodeId + auto-expansion
@@ -506,7 +507,6 @@ function KnowledgeBasePageContent() {
       try {
         setLoadingFlatCollections(true);
         const response = await KnowledgeHubApi.getNavigationNodes({
-          page: 1,
           limit: SIDEBAR_PAGINATION_PAGE_SIZE,
           include: 'counts',
           sortBy: 'updatedAt',
@@ -521,12 +521,7 @@ function KnowledgeBasePageContent() {
 
         const p = response.pagination;
         setAppRootListPagination(
-          p
-            ? {
-                hasNext: p.hasNext,
-                nextPage: p.hasNext ? p.page + 1 : p.page,
-              }
-            : null
+          p?.nextCursor ? { hasNext: p.hasNext, nextCursor: p.nextCursor } : null
         );
       } catch (error) {
         console.error('Error fetching app nodes:', error);
@@ -542,7 +537,6 @@ function KnowledgeBasePageContent() {
       try {
         setLoadingFlatCollections(true);
         const response = await KnowledgeHubApi.getNavigationNodes({
-          page: 1,
           limit: SIDEBAR_PAGINATION_PAGE_SIZE,
           include: 'counts',
           sortBy: 'updatedAt',
@@ -555,12 +549,7 @@ function KnowledgeBasePageContent() {
 
         const p = response.pagination;
         setAppRootListPagination(
-          p
-            ? {
-                hasNext: p.hasNext,
-                nextPage: p.hasNext ? p.page + 1 : p.page,
-              }
-            : null
+          p?.nextCursor ? { hasNext: p.hasNext, nextCursor: p.nextCursor } : null
         );
       } catch (error) {
         console.error('Error fetching KB app nodes:', error);
@@ -634,12 +623,22 @@ function KnowledgeBasePageContent() {
         data = await KnowledgeHubApi.getAllRootItems(params);
       }
       setAllRecordsTableData(data);
-      // Sync derived pagination metadata (totalItems, totalPages, hasNext, hasPrev)
-      // without overwriting user-controlled page/limit to avoid triggering effect loops
+      // Sync what the response decided (totals, indices, the two cursors)
+      // without touching the cursor the user asked for — overwriting that would
+      // re-trigger the effect watching it.
       if (data.pagination) {
-        syncAllRecordsPaginationMeta(data.pagination);
+        syncAllRecordsPaginationMeta(
+          toTablePagination(data.pagination, currentPagination.cursor)
+        );
       }
     } catch (error) {
+      // A refused cursor goes back to the first page instead of erroring; the
+      // effect watching the cursor issues that fetch.
+      const rejectedCursor = useKnowledgeBaseStore.getState().allRecordsPagination.cursor;
+      if (isRejectedCursorError(error, rejectedCursor)) {
+        useKnowledgeBaseStore.getState().setAllRecordsCursor(null);
+        return;
+      }
       console.error('Error fetching all records:', error);
       setAllRecordsTableError('Failed to load records');
     } finally {
@@ -686,25 +685,25 @@ function KnowledgeBasePageContent() {
     // setAllRecordsFilter / setAllRecordsSort reset page to 1; sync ref so pagination effect
     // does not duplicate-fetch when page changes (e.g. 2 → 1), without a skip flag that can
     // stick when page stays 1 and the pagination effect never runs.
-    prevAllRecordsPageRef.current =
-      useKnowledgeBaseStore.getState().allRecordsPagination.page;
+    prevAllRecordsCursorRef.current =
+      useKnowledgeBaseStore.getState().allRecordsPagination.cursor;
     fetchAllRecordsTableData(allRecordsNodeType ?? undefined, allRecordsNodeId ?? undefined);
   }, [allRecordsFilter, allRecordsSort]);
 
-  // All Records mode: Re-fetch when pagination page changes
+  // All Records mode: Re-fetch when the cursor moves (Next/Previous)
   useEffect(() => {
     if (!isAllRecordsMode) return;
-    if (allRecordsPagination.page === prevAllRecordsPageRef.current) return;
-    prevAllRecordsPageRef.current = allRecordsPagination.page;
+    if (allRecordsPagination.cursor === prevAllRecordsCursorRef.current) return;
+    prevAllRecordsCursorRef.current = allRecordsPagination.cursor;
     fetchAllRecordsTableData(allRecordsNodeType ?? undefined, allRecordsNodeId ?? undefined);
-  }, [allRecordsPagination.page]);
+  }, [allRecordsPagination.cursor]);
 
   // All Records mode: Re-fetch when pagination limit changes
   useEffect(() => {
     if (!isAllRecordsMode || allRecordsPagination.limit === DEFAULT_PAGE_SIZE) return;
     // setAllRecordsLimit resets page to 1; keep pagination ref in sync (same as filter effect).
-    prevAllRecordsPageRef.current =
-      useKnowledgeBaseStore.getState().allRecordsPagination.page;
+    prevAllRecordsCursorRef.current =
+      useKnowledgeBaseStore.getState().allRecordsPagination.cursor;
     fetchAllRecordsTableData(allRecordsNodeType ?? undefined, allRecordsNodeId ?? undefined);
   }, [allRecordsPagination.limit]);
 
@@ -782,7 +781,9 @@ function KnowledgeBasePageContent() {
 
         // Update pagination from response
         if (data.pagination) {
-          setCollectionsPagination(data.pagination);
+          setCollectionsPagination(
+            toTablePagination(data.pagination, currentPagination.cursor)
+          );
         }
         setSelectedNode({ nodeType, nodeId });
 
@@ -816,7 +817,6 @@ function KnowledgeBasePageContent() {
               try {
                 const kbChildren = await KnowledgeHubApi.getNodeChildren(kbNodeType, kbBreadcrumb.id, {
                   onlyContainers: true,
-                  page: 1,
                   limit: 50,
                 });
                 const kbEffectiveHasChildFolders = effectiveHasChildrenAfterSidebarExpand(
@@ -864,7 +864,7 @@ function KnowledgeBasePageContent() {
                   const folderChildren = await KnowledgeHubApi.getNodeChildren(
                     breadcrumb.nodeType as NodeType,
                     breadcrumb.id,
-                    { onlyContainers: true, page: 1, limit: 50 }
+                    { onlyContainers: true, limit: 50 }
                   );
                   const effectiveHasChildFolders = effectiveHasChildrenAfterSidebarExpand(
                     folderChildren.items,
@@ -901,6 +901,13 @@ function KnowledgeBasePageContent() {
         useKnowledgeBaseStore.getState().reMergeCachedChildrenIntoTree();
 
       } catch (error) {
+        // A refused cursor goes back to the first page instead of erroring;
+        // clearing it rewrites the URL, which re-runs this fetch without one.
+        const rejectedCursor = useKnowledgeBaseStore.getState().collectionsPagination.cursor;
+        if (isRejectedCursorError(error, rejectedCursor)) {
+          useKnowledgeBaseStore.getState().setCollectionsCursor(null);
+          return;
+        }
         const status = isProcessedError(error) ? error.statusCode : (error as { statusCode?: number })?.statusCode;
         const isNotFound =
           status === 404 || (isProcessedError(error) && error.type === ErrorType.NOT_FOUND);
@@ -1024,9 +1031,18 @@ function KnowledgeBasePageContent() {
       setTableData(data);
       setSelectedNode(null);
       if (data.pagination) {
-        setCollectionsPagination(data.pagination);
+        setCollectionsPagination(
+          toTablePagination(data.pagination, currentPagination.cursor)
+        );
       }
     } catch (error: unknown) {
+      // A refused cursor goes back to the first page instead of erroring;
+      // clearing it rewrites the URL, which re-runs this fetch without one.
+      const rejectedCursor = useKnowledgeBaseStore.getState().collectionsPagination.cursor;
+      if (isRejectedCursorError(error, rejectedCursor)) {
+        useKnowledgeBaseStore.getState().setCollectionsCursor(null);
+        return;
+      }
       const err = error as { response?: { data?: { message?: string } }; message?: string };
       setTableDataError(err?.response?.data?.message || err?.message || 'Failed to load collections');
     } finally {
@@ -1097,8 +1113,8 @@ function KnowledgeBasePageContent() {
     }
 
     // setAllRecordsSearchQuery resets page to 1; keep pagination ref in sync (same as filter effect).
-    prevAllRecordsPageRef.current =
-      useKnowledgeBaseStore.getState().allRecordsPagination.page;
+    prevAllRecordsCursorRef.current =
+      useKnowledgeBaseStore.getState().allRecordsPagination.cursor;
     fetchAllRecordsTableData(allRecordsNodeType ?? undefined, allRecordsNodeId ?? undefined);
   }, [debouncedAllRecordsSearchQuery, isAllRecordsMode]);
 
@@ -1191,8 +1207,8 @@ function KnowledgeBasePageContent() {
     setIsSearchOpen(false);
     if (isAllRecordsMode) {
       setAllRecordsSearchQuery('');
-      prevAllRecordsPageRef.current =
-        useKnowledgeBaseStore.getState().allRecordsPagination.page;
+      prevAllRecordsCursorRef.current =
+        useKnowledgeBaseStore.getState().allRecordsPagination.cursor;
       // Immediate refetch when clearing search (bypasses debounce).
       // Preserve drill-down: fetchAllRecordsTableData() with no args loads the global root only.
       const nt = searchParams.get('nodeType');
@@ -1241,7 +1257,6 @@ function KnowledgeBasePageContent() {
     try {
       const response = await KnowledgeHubApi.getNodeChildren(nodeType, nodeId, {
         onlyContainers: true,
-        page: 1,
         limit: SIDEBAR_PAGINATION_PAGE_SIZE,
         include: 'counts',
         sortBy: 'name',
@@ -1257,12 +1272,9 @@ function KnowledgeBasePageContent() {
         const p = response.pagination;
         state.setAppChildPagination(
           selectedApp.id,
-          p
-            ? {
-                hasNext: p.hasNext,
-                nextPage: p.hasNext ? p.page + 1 : p.page,
-              }
-            : { hasNext: false, nextPage: 1 }
+          p?.nextCursor
+            ? { hasNext: p.hasNext, nextCursor: p.nextCursor }
+            : { hasNext: false, nextCursor: null }
         );
 
         if (!isKbCollectionsHubApp(selectedApp)) {
@@ -1278,12 +1290,7 @@ function KnowledgeBasePageContent() {
       state.cacheNodeChildren(nodeId, response.items);
       state.setNodeChildrenPagination(
         nodeId,
-        sidebarNodeChildrenMetaFromResponse(
-          response.pagination,
-          response.items.length,
-          SIDEBAR_PAGINATION_PAGE_SIZE,
-          nodeType
-        )
+        sidebarNodeChildrenMetaFromResponse(response.pagination, nodeType)
       );
       state.addNodes(response.items);
 
@@ -2991,11 +2998,11 @@ function KnowledgeBasePageContent() {
           hasSearchQuery={hasSearchQuery}
           hasCollections={hasCollections}
           onRefresh={() => { void handleRefresh(); }}
-          onPageChange={(page) => {
+          onCursorChange={(cursor) => {
             if (isAllRecordsMode) {
-              useKnowledgeBaseStore.getState().setAllRecordsPage(page);
+              useKnowledgeBaseStore.getState().setAllRecordsCursor(cursor);
             } else {
-              setCollectionsPage(page);
+              setCollectionsCursor(cursor);
             }
           }}
           onLimitChange={(limit) => {

@@ -169,7 +169,6 @@ function KnowledgeBaseSidebarSlotContent() {
         const resolvedNodeType = (nodeInStore?.nodeType ?? nodeType) as NodeType;
         const response = await KnowledgeHubApi.getNodeChildren(resolvedNodeType, nodeId, {
           onlyContainers: true,
-          page: 1,
           limit: SIDEBAR_PAGINATION_PAGE_SIZE,
           include: 'counts',
           sortBy: 'name',
@@ -183,12 +182,7 @@ function KnowledgeBaseSidebarSlotContent() {
         if (resolvedNodeType !== 'app') {
           setNodeChildrenPagination(
             nodeId,
-            sidebarNodeChildrenMetaFromResponse(
-              response.pagination,
-              response.items.length,
-              SIDEBAR_PAGINATION_PAGE_SIZE,
-              resolvedNodeType
-            )
+            sidebarNodeChildrenMetaFromResponse(response.pagination, resolvedNodeType)
           );
         }
 

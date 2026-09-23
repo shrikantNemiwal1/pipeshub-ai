@@ -28,7 +28,6 @@ export async function refreshKbTree(afterRefresh?: () => void): Promise<void> {
   // Always re-fetch root app nodes from the API — this is a "refresh", so
   // stale in-memory data (e.g. a KB that was just renamed) must not be reused.
   const response = await KnowledgeHubApi.getNavigationNodes({
-    page: 1,
     limit: SIDEBAR_PAGINATION_PAGE_SIZE,
     include: 'counts',
     sortBy: 'updatedAt',
@@ -40,12 +39,7 @@ export async function refreshKbTree(afterRefresh?: () => void): Promise<void> {
   setAppNodes([...freshKbApps, ...connectorApps]);
   const p = response.pagination;
   setAppRootListPagination(
-    p
-      ? {
-          hasNext: p.hasNext,
-          nextPage: p.hasNext ? p.page + 1 : p.page,
-        }
-      : null
+    p?.nextCursor ? { hasNext: p.hasNext, nextCursor: p.nextCursor } : null
   );
 
   let kbApps = freshKbApps;
