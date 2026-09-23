@@ -12,7 +12,7 @@ def _get_enum_values(enum_class: Type[Enum]) -> List[str]:
     return [item.value for item in enum_class]
 
 
-record_relations_schema = {
+node_relations_schema = {
     "rule": {
         "type": "object",
         "properties": {

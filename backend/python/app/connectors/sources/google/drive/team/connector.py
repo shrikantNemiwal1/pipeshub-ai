@@ -790,9 +790,8 @@ class GoogleDriveTeamConnector(BaseConnector):
             return PermissionType.OWNER
         elif role_lower in ["fileorganizer", "writer"]:
             return PermissionType.WRITE
-        elif role_lower == "commenter":
-            return PermissionType.COMMENT
-        elif role_lower == "reader":
+        # A commenter is written as a reader (decision 41).
+        elif role_lower in ["commenter", "reader"]:
             return PermissionType.READ
         else:
             # Default to read for unknown roles
@@ -816,11 +815,8 @@ class GoogleDriveTeamConnector(BaseConnector):
         elif perm_type_lower == "group":
             return EntityType.GROUP
         elif perm_type_lower == "domain":
-            return EntityType.DOMAIN
-        elif perm_type_lower == "anyone":
-            return EntityType.ANYONE
-        elif perm_type_lower in ["anyonewithlink", "anyone_with_link"]:
-            return EntityType.ANYONE_WITH_LINK
+            # Domain-wide sharing is an org grant (decision 59).
+            return EntityType.ORG
         else:
             # Default to user for unknown types
             self.logger.warning(f"Unknown Google Drive permission type '{permission_type}', defaulting to USER")
@@ -886,8 +882,15 @@ class GoogleDriveTeamConnector(BaseConnector):
                         role = perm_data.get("role", "reader")
                         perm_type = perm_data.get("type", "user")
 
-                        # Map role and type
                         permission_type = self._map_drive_role_to_permission_type(role)
+
+                        # Link sharing names no grantee, so it is not stored as a
+                        # grant (decision 59). It still becomes a direct grant for
+                        # the syncing user, below.
+                        if perm_type.lower() in ("anyone", "anyonewithlink", "anyone_with_link"):
+                            anyone_with_link_permission_type = permission_type
+                            continue
+
                         entity_type = self._map_drive_permission_type_to_entity_type(perm_type)
 
                         # Extract email or domain based on permission type
@@ -911,10 +914,6 @@ class GoogleDriveTeamConnector(BaseConnector):
                             detail.get("permissionType") == "file" for detail in permission_details
                         ):
                             individually_shared_emails.add(email)
-
-                        # Track "anyone with link" permission type for fallback
-                        if entity_type == EntityType.ANYONE:
-                            anyone_with_link_permission_type = permission_type
 
                     except Exception as e:
                         resource_type = "drive" if is_drive else "file"

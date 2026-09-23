@@ -771,7 +771,7 @@ GRAPH_CONTEXT_ENRICHMENT_CONNECTORS: frozenset[Connectors] = frozenset({
     Connectors.CONFLUENCE,
 })
 
-RECORD_RELATION_ENRICHMENT_TYPES: frozenset[RecordRelations] = frozenset({
+NODE_RELATION_ENRICHMENT_TYPES: frozenset[RecordRelations] = frozenset({
     RecordRelations.ATTACHMENT,
     RecordRelations.PARENT_CHILD,
 })
@@ -1246,7 +1246,7 @@ async def _relations_per_record(
     record_ids: list[str],
     relation_types: list[str],
 ) -> dict[str, dict[str, list[dict[str, Any]]]]:
-    """Per-record equivalent of `get_record_relations_batch`, used when the
+    """Per-record equivalent of `get_node_relations_batch`, used when the
     batch fails. Concurrent, and a failing pair costs only itself."""
     async def one(record_id: str, relation_type: str, *, outgoing: bool) -> list[dict[str, Any]]:
         fetch = (
@@ -1299,9 +1299,9 @@ async def _fetch_edges_for_records(
     """
     if not record_ids:
         return {}
-    by_value = {rel.value: rel for rel in RECORD_RELATION_ENRICHMENT_TYPES}
+    by_value = {rel.value: rel for rel in NODE_RELATION_ENRICHMENT_TYPES}
     try:
-        relations = await graph_provider.get_record_relations_batch(
+        relations = await graph_provider.get_node_relations_batch(
             record_ids, list(by_value),
         )
     except Exception as e:
@@ -1583,13 +1583,13 @@ def _annotate_dependent_parents(
     )
 
 
-def _annotate_record_relations(
+def _annotate_node_relations(
     relation_buckets: list[tuple[str, dict[str, Any], dict[str, dict[str, Any]]]],
     doc_index: dict[str, dict[str, Any]],
     in_context_ids: set[str],
     context_map: dict[str, str],
 ) -> None:
-    """Attach record_relations to hit records from relation buckets."""
+    """Attach node_relations to hit records from relation buckets."""
     enriched_count = 0
     for vrid, record, bucket in relation_buckets:
         relations: list[dict[str, Any]] = []
@@ -1606,7 +1606,7 @@ def _annotate_record_relations(
                 rel["context_metadata"] = context_map[rid]
             relations.append(rel)
         if relations:
-            record["record_relations"] = relations
+            record["node_relations"] = relations
             enriched_count += 1
 
     logger.info("Record relation enrichment: %d records enriched", enriched_count)
@@ -1625,7 +1625,7 @@ async def enrich_records_with_graph_context(
     """
     Unified graph context enrichment for search results. Performs both:
       1. Dependent parent annotation (isDependentNode -> parent metadata on flattened_results)
-      2. Record relation enrichment (graph edges -> record_relations on hit records)
+      2. Record relation enrichment (graph edges -> node_relations on hit records)
 
     All graph/blob calls are batched and deduplicated across both paths.
     """
@@ -1679,7 +1679,7 @@ async def enrich_records_with_graph_context(
             in_context_ids, doc_index, context_map,
         )
     if relation_buckets:
-        _annotate_record_relations(
+        _annotate_node_relations(
             relation_buckets, doc_index, in_context_ids, context_map,
         )
 
@@ -1702,14 +1702,14 @@ def build_parent_info(result: dict[str, Any]) -> str:
     parent_info = "\n".join(lines) + "\n"
     return parent_info
 
-def build_record_relations_info(record: dict[str, Any]) -> str:
+def build_node_relations_info(record: dict[str, Any]) -> str:
     """Build related records grouped by relation label (ATTACHMENT/CHILD/PARENT).
 
     Each label is rendered once as a heading with all its records listed
     underneath, so a label never repeats per row. A record reached via more than
     one relation type appears under each of its labels.
     """
-    relations = record.get("record_relations")
+    relations = record.get("node_relations")
     if not relations:
         return ""
 
@@ -4379,7 +4379,7 @@ def build_message_content_array(
             parent_info = build_parent_info(result)
             if parent_info:
                 record_header_text = f"{record_header_text}{parent_info}"
-            relations_info = build_record_relations_info(record)
+            relations_info = build_node_relations_info(record)
             if relations_info:
                 record_header_text = f"{record_header_text}{relations_info}"
             if record_id_shortener is not None:

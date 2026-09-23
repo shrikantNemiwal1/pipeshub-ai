@@ -96,6 +96,7 @@ export const getKnowledgeHubNodes =
         updatedAt: 'updated_at',
         size: 'size',
         include: 'include',
+        cursor: 'cursor',
       };
 
       for (const [key, snakeKey] of Object.entries(paramMapping)) {

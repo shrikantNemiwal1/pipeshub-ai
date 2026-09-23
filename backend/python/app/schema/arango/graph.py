@@ -4,17 +4,35 @@ from app.config.constants.arangodb import CollectionNames
 EDGE_DEFINITIONS = [
     {
         "edge_collection": CollectionNames.BELONGS_TO.value,
-        "from_vertex_collections": [CollectionNames.USERS.value,CollectionNames.RECORDS.value,CollectionNames.FILES.value],
+        # A record group belongs to its org, its App and its parent group; the
+        # processor writes all three on every sync.
+        "from_vertex_collections": [
+            CollectionNames.USERS.value,
+            CollectionNames.RECORDS.value,
+            CollectionNames.FILES.value,
+            CollectionNames.RECORD_GROUPS.value,
+        ],
         "to_vertex_collections": [
             CollectionNames.GROUPS.value,
             CollectionNames.ORGS.value,
-            CollectionNames.RECORD_GROUPS.value
+            CollectionNames.RECORD_GROUPS.value,
+            CollectionNames.APPS.value,
         ],
     },
     {
         "edge_collection": CollectionNames.INHERIT_PERMISSIONS.value,
-        "from_vertex_collections": [CollectionNames.RECORD_GROUPS.value],
-        "to_vertex_collections": [CollectionNames.RECORDS.value],
+        # Child -> parent, the direction every write actually uses: a record
+        # inherits from its parent record or its record group, and a top-level
+        # group from its App. The previous definition declared the reverse.
+        "from_vertex_collections": [
+            CollectionNames.RECORDS.value,
+            CollectionNames.RECORD_GROUPS.value,
+        ],
+        "to_vertex_collections": [
+            CollectionNames.RECORDS.value,
+            CollectionNames.RECORD_GROUPS.value,
+            CollectionNames.APPS.value,
+        ],
     },
     {
         "edge_collection": CollectionNames.ORG_DEPARTMENT_RELATION.value,
@@ -67,9 +85,19 @@ EDGE_DEFINITIONS = [
         ],
     },
     {
-        "edge_collection": CollectionNames.RECORD_RELATIONS.value,
-        "from_vertex_collections": [CollectionNames.RECORDS.value, CollectionNames.FILES.value,CollectionNames.RECORD_GROUPS.value],
-        "to_vertex_collections": [CollectionNames.RECORDS.value, CollectionNames.FILES.value],
+        "edge_collection": CollectionNames.NODE_RELATIONS.value,
+        # The hierarchy spans App -> record group -> record, so both ends widen.
+        "from_vertex_collections": [
+            CollectionNames.RECORDS.value,
+            CollectionNames.FILES.value,
+            CollectionNames.RECORD_GROUPS.value,
+            CollectionNames.APPS.value,
+        ],
+        "to_vertex_collections": [
+            CollectionNames.RECORDS.value,
+            CollectionNames.FILES.value,
+            CollectionNames.RECORD_GROUPS.value,
+        ],
     },
     {
         "edge_collection": CollectionNames.USER_DRIVE_RELATION.value,
@@ -89,7 +117,8 @@ EDGE_DEFINITIONS = [
     {
         "edge_collection": CollectionNames.PERMISSION.value,
         "from_vertex_collections": [CollectionNames.USERS.value, CollectionNames.TEAMS.value, CollectionNames.ROLES.value, CollectionNames.GROUPS.value, CollectionNames.ORGS.value],
-        "to_vertex_collections": [CollectionNames.AGENT_INSTANCES.value, CollectionNames.AGENT_TEMPLATES.value, CollectionNames.TEAMS.value, CollectionNames.ROLES.value, CollectionNames.RECORDS.value, CollectionNames.RECORD_GROUPS.value, CollectionNames.AGENT_SKILLS.value],
+        # APPS: a collection grant is a permission edge from the user to the App.
+        "to_vertex_collections": [CollectionNames.AGENT_INSTANCES.value, CollectionNames.AGENT_TEMPLATES.value, CollectionNames.TEAMS.value, CollectionNames.ROLES.value, CollectionNames.RECORDS.value, CollectionNames.RECORD_GROUPS.value, CollectionNames.AGENT_SKILLS.value, CollectionNames.APPS.value],
     },
     {
         "edge_collection": CollectionNames.ENTITY_RELATIONS.value,

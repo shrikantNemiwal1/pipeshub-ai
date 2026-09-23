@@ -17,6 +17,7 @@ from app.core.signed_url import SignedUrlConfig, SignedUrlHandler
 from app.health.health import Health
 from app.migrations.all_team_migration import run_all_team_migration
 from app.migrations.kb_apps_migration import run_kb_apps_migration
+from app.migrations.node_relation_migration import run_node_relation_migration
 from app.services.graph_db.graph_db_provider_factory import GraphDBProviderFactory
 from app.services.graph_db.interface.graph_db_provider import IGraphDBProvider
 from app.utils.logger import create_logger
@@ -143,6 +144,41 @@ async def initialize_container(container) -> bool:
         if not data_store:
             raise Exception("Failed to initialize data store")
         logger.info("✅ Data store initialized")
+
+        # Rename the hierarchy edge before schema init, not after it like the
+        # migrations below: schema init would otherwise create an empty
+        # nodeRelations collection on a deployment whose edges still live under
+        # the old name, stranding them in an orphan while the app reads the
+        # empty one. No-op on a fresh install and on an already-migrated one.
+        try:
+            logger.info("🔄 Running node relation migration...")
+
+            node_relation_result = await run_node_relation_migration(
+                graph_provider=data_store.graph_provider,
+                config_service=config_service,
+                logger=logger
+            )
+
+            if node_relation_result.get("success"):
+                if node_relation_result.get("skipped"):
+                    logger.info("✅ Node relation migration already completed")
+                else:
+                    logger.info(
+                        f"✅ Node relation migration completed: "
+                        f"{node_relation_result.get('migrated', 0)} edge(s) migrated"
+                    )
+            else:
+                raise Exception(
+                    node_relation_result.get("error", "Unknown error")
+                )
+        except Exception as e:
+            # Deliberately fatal, unlike the migrations below. ensure_schema()
+            # runs next and would create an empty nodeRelations collection,
+            # stranding the edges that still carry the old name — the service
+            # would then serve a graph with no hierarchy at all. Failing here
+            # leaves the data intact for the next attempt.
+            logger.error(f"❌ Node relation migration error: {e}")
+            raise
 
         # Schema init: collections, graph, departments seed
         await data_store.graph_provider.ensure_schema()

@@ -41,9 +41,9 @@ _TYPE_LABELS: dict[str, str] = {
 
 
 def pick_parent(edges: Sequence[Mapping[str, Any]]) -> Mapping[str, Any] | None:
-    """Breadcrumb priority: recordRelations record → belongsTo RG → belongsTo app."""
+    """Breadcrumb priority: nodeRelations record → belongsTo RG → belongsTo app."""
     for via, ptype in (
-        ("recordRelations", "record"),
+        ("nodeRelations", "record"),
         ("belongsTo", "recordGroup"),
         ("belongsTo", "app"),
     ):

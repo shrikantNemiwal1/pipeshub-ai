@@ -1,4 +1,5 @@
 from app.config.constants.arangodb import (
+    AccessRule,
     Connectors,
     ConnectorScopes,
     OriginTypes,
@@ -301,6 +302,16 @@ record_schema = {
             "hideWeburl": {"type": "boolean", "default": False},
             "isInternal": {"type": "boolean", "default": False},
             "isPlaceholder": {"type": "boolean", "default": False},
+            # Permission traversal input, read per visited node. Per node and
+            # mixable within a connector; RESTRICTED applies to the node it is
+            # on and is never inherited by its children. The enum is what makes
+            # the retired (non-strict, restricted) combination unrepresentable
+            # in storage; absent reads as OPEN, so it stays out of "required".
+            "accessRule": {
+                "type": "string",
+                "enum": [rule.value for rule in AccessRule],
+                "default": AccessRule.OPEN.value,
+            },
             "md5Checksum": {"type": ["string", "null"]},
             "sizeInBytes": {"type": ["number", "null"]},
             "storageDocumentId": {"type": ["string", "null"]},
@@ -743,6 +754,13 @@ record_group_schema = {
             },
             "isInternal": {"type": ["boolean", "null"], "default": False},
             "hideChildren": {"type": ["boolean", "null"], "default": False},
+            # Permission traversal input, as on records: per node, and
+            # RESTRICTED never cascades to children.
+            "accessRule": {
+                "type": "string",
+                "enum": [rule.value for rule in AccessRule],
+                "default": AccessRule.OPEN.value,
+            },
             # Whether container-filtered search may trust this group's grant
             # instead of checking each record. Null means "verify" — the safe
             # state, and the only one until a connector proves otherwise.

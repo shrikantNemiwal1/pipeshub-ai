@@ -115,6 +115,28 @@ class PermissionModel(Enum):
     RECORD_GROUP_LEVEL = "RECORD_GROUP_LEVEL"
 
 
+class AccessRule(Enum):
+    """How a node's own permissions combine with its ancestors'.
+
+    ``OPEN``: inheritance from an accessible parent, or a direct grant, is
+    enough — nothing above the parent is consulted.
+    ``STRICT``: every ancestor up to the App must be accessible as well.
+    ``RESTRICTED``: implies strict, and inheritance alone is not sufficient —
+    the node's own grant is required on top of it.
+
+    Replaces the ``is_strict``/``has_restriction`` pair. Restriction was only
+    ever read on a strict node (decision 3), so the fourth combination was
+    inert; it folds into ``OPEN``. A missing value reads as ``OPEN`` (decision
+    38 — a connector that declares nothing gets the permissive reading), but an
+    *unrecognised* value reads as ``RESTRICTED``, so corruption or a foreign
+    writer fails closed rather than exposing a node.
+    """
+
+    OPEN = "OPEN"
+    STRICT = "STRICT"
+    RESTRICTED = "RESTRICTED"
+
+
 class AppGroups(Enum):
     GOOGLE_WORKSPACE = "Google Workspace"
     NOTION = "Notion"
@@ -170,7 +192,7 @@ class GraphNames(Enum):
 class CollectionNames(Enum):
     # Records and Record relations
     RECORDS = "records"
-    RECORD_RELATIONS = "recordRelations"
+    NODE_RELATIONS = "nodeRelations"
     RECORD_GROUPS = "recordGroups"
     SYNC_POINTS = "syncPoints"
     INHERIT_PERMISSIONS = "inheritPermissions"
@@ -208,9 +230,9 @@ class CollectionNames(Enum):
     GROUPS = "groups"
     ROLES = "roles"
     ORGS = "organizations"
-    # DOMAINS = "domains"
+    # Retained for the pre-v2 permission queries, which still read these nodes.
+    # No grant type writes them any more (decision 59).
     ANYONE = "anyone"
-    # ANYONE_WITH_LINK = "anyoneWithLink"
     BELONGS_TO = "belongsTo"
     TEAMS = "teams"
 
@@ -627,9 +649,9 @@ class RecordRelations(Enum):
     # running a specific version of a CODE artifact. Auto-captured by the
     # harness (`sandbox_bridge.py`'s POST_TOOL_USE hook) — never asserted
     # by the model — carrying `sourceVersion`/`derivedVersion` custom
-    # properties (see `record_relations_schema`, which allows additional
+    # properties (see `node_relations_schema`, which allows additional
     # properties). Portable to Neo4j unchanged: it is just another
-    # `relationshipType` value on the existing RECORD_RELATION edge type
+    # `relationshipType` value on the existing NODE_RELATION edge type
     # (see `config/constants/neo4j.py`), no new edge collection or Neo4j
     # relationship type required.
     DERIVED_FROM = "DERIVED_FROM"

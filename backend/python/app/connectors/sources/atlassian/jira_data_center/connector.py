@@ -3516,7 +3516,7 @@ class JiraDataCenterConnector(BaseConnector):
 
         When is_new_project is True (full sync wiped sync points), the "skip unchanged
         issues" short-circuit is bypassed so every issue flows through _process_record
-        and its BELONGS_TO / RECORD_RELATIONS / PERMISSION / ENTITY_RELATIONS edges are
+        and its BELONGS_TO / NODE_RELATIONS / PERMISSION / ENTITY_RELATIONS edges are
         recreated after full-sync edge deletion.
         """
         all_records: list[tuple[Record, list[Permission]]] = []

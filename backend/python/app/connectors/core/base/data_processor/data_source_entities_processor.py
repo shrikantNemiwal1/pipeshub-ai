@@ -290,6 +290,18 @@ class DataSourceEntitiesProcessor:
         ):
             self.logger.debug(f"Deleting parent-child edge from {existing_record.id} to {record.id}")
             await tx_store.delete_parent_child_edge_to_record(existing_record.id)
+            # The hierarchy edge is not the only tie to the old parent: decision
+            # 6 made the record inherit from that record too, so a stale
+            # inheritance edge keeps granting access through a parent it no
+            # longer has.
+            old_parent = await tx_store.get_record_by_external_id(
+                connector_id=record.connector_id,
+                external_id=existing_record.parent_external_record_id,
+            )
+            if old_parent:
+                await tx_store.delete_inherit_permissions_relation_record(
+                    existing_record.id, old_parent.id
+                )
 
         if record.parent_external_record_id:
             parent_record = await tx_store.get_record_by_external_id(
@@ -333,6 +345,21 @@ class DataSourceEntitiesProcessor:
                     relation_type = RecordRelations.PARENT_CHILD.value
                 await tx_store.create_record_relation(parent_record.id, record.id, relation_type)
 
+                # Inheritance follows the hierarchy: a nested record inherits from
+                # the record directly above it, not from its record group. Without
+                # this a restriction part way down a tree cannot take effect,
+                # because every descendant inherits straight past it from the group.
+                if record.inherit_permissions:
+                    await tx_store.create_inherit_permissions_relation_record(
+                        record.id, parent_record.id
+                    )
+                else:
+                    # Symmetric with the create, for the same reason the record-group
+                    # case needs it: leaving a stale edge widens access on re-sync.
+                    await tx_store.delete_inherit_permissions_relation_record(
+                        record.id, parent_record.id
+                    )
+
     async def _handle_related_external_records(
         self,
         record: Record,
@@ -359,7 +386,7 @@ class DataSourceEntitiesProcessor:
                 deleted_count = await tx_store.delete_edges_by_relationship_types(
                     from_id=record.id,
                     from_collection=CollectionNames.RECORDS.value,
-                    collection=CollectionNames.RECORD_RELATIONS.value,
+                    collection=CollectionNames.NODE_RELATIONS.value,
                     relationship_types=list(relation_types_to_delete)
                 )
                 if deleted_count > 0:
@@ -422,7 +449,7 @@ class DataSourceEntitiesProcessor:
 
         # Batch upsert all relation edges at once
         if edges_to_create:
-            await tx_store.batch_upsert_record_relations(edges_to_create)
+            await tx_store.batch_upsert_node_relations(edges_to_create)
 
     async def _handle_record_group(self, record: Record, tx_store: TransactionStore) -> str | None:
         """
@@ -501,6 +528,93 @@ class DataSourceEntitiesProcessor:
             ],
         )
 
+    async def _create_hierarchy_edge(
+        self,
+        tx_store: TransactionStore,
+        parent_id: str,
+        parent_collection: str,
+        child_id: str,
+        child_collection: str,
+    ) -> None:
+        """Parent -> child edge, the one the knowledge hub traversal descends.
+
+        BELONGS_TO runs child -> parent and so cannot be walked downwards; the
+        hub's hierarchy is the PARENT_CHILD/ATTACHMENT subset of this edge.
+        """
+        ts = get_epoch_timestamp_in_ms()
+        await tx_store.batch_create_edges(
+            [{
+                "from_id": parent_id,
+                "from_collection": parent_collection,
+                "to_id": child_id,
+                "to_collection": child_collection,
+                "relationshipType": RecordRelations.PARENT_CHILD.value,
+                "createdAtTimestamp": ts,
+                "updatedAtTimestamp": ts,
+            }],
+            collection=CollectionNames.NODE_RELATIONS.value,
+        )
+
+    async def _reparent_orphans(self, tx_store: TransactionStore, orphans: list[dict]) -> None:
+        """Re-point the children of a deleted record at their record group.
+
+        Deleting a record sweeps the hierarchy and inheritance edges that pointed
+        at it. A nested record inherits from its parent *record*, so a survivor
+        left alone would have no inheritance at all and would be invisible to
+        anyone without a direct grant on it.
+        """
+        for orphan in orphans:
+            record_id = orphan.get("record_id")
+            record_group_id = orphan.get("record_group_id")
+            if not record_id or not record_group_id:
+                continue
+            await self._create_hierarchy_edge(
+                tx_store, record_group_id, CollectionNames.RECORD_GROUPS.value,
+                record_id, CollectionNames.RECORDS.value,
+            )
+            await tx_store.create_inherit_permissions_relation_record_group(
+                record_id, record_group_id
+            )
+
+    async def _collect_orphans(
+        self, tx_store: TransactionStore, deleted_doc: dict | None, deleted_record_id: str,
+    ) -> list[dict]:
+        """Children of a record about to be deleted, with the group they fall back to.
+
+        Arango removes a node without touching its edges, so the stale ones are
+        deleted explicitly; on Neo4j `DETACH DELETE` has already taken them and
+        these calls are no-ops. ``get_record_by_key`` yields a raw document rather
+        than a Record, hence the dict access.
+        """
+        if not deleted_doc:
+            return []
+        connector_id = deleted_doc.get("connectorId")
+        external_id = deleted_doc.get("externalRecordId")
+        if not connector_id or not external_id:
+            return []
+
+        orphans: list[dict] = []
+        for child in await tx_store.get_records_by_parent(connector_id, external_id):
+            await tx_store.delete_edge(
+                deleted_record_id, CollectionNames.RECORDS.value,
+                child.id, CollectionNames.RECORDS.value,
+                CollectionNames.NODE_RELATIONS.value,
+            )
+            await tx_store.delete_inherit_permissions_relation_record(
+                child.id, deleted_record_id
+            )
+            if child.record_group_id:
+                orphans.append(
+                    {"record_id": child.id, "record_group_id": child.record_group_id}
+                )
+
+        if orphans:
+            await tx_store.batch_update_nodes(
+                [{"id": o["record_id"], "externalParentId": None} for o in orphans],
+                CollectionNames.RECORDS.value,
+            )
+        return orphans
+
     async def _link_record_to_group(self, record: Record, record_group_id: str, tx_store: TransactionStore, existing_record: Record | None = None) -> bool:
         """
         Create edges between record and record group.
@@ -518,15 +632,46 @@ class DataSourceEntitiesProcessor:
             moved = True
             await tx_store.delete_edge(existing_record.id, CollectionNames.RECORDS.value, existing_record.record_group_id, CollectionNames.RECORD_GROUPS.value, CollectionNames.BELONGS_TO.value)
             await tx_store.delete_inherit_permissions_relation_record_group(existing_record.id, existing_record.record_group_id)
+            # Leaving the hierarchy edge behind would keep the record listed under
+            # the group it just left.
+            await tx_store.delete_edge(
+                existing_record.record_group_id, CollectionNames.RECORD_GROUPS.value,
+                existing_record.id, CollectionNames.RECORDS.value,
+                CollectionNames.NODE_RELATIONS.value,
+            )
 
         if record.id and record_group_id:
             # Create a edge between the record and the record group if it doesn't exist
             await tx_store.create_record_group_relation(record.id, record_group_id)
 
-            if record.inherit_permissions:
+            # Gated on having no parent record for the same reason the hierarchy
+            # edge below is: under D6 a nested record inherits from the record
+            # above it, and _handle_parent_record owns that edge. Without the
+            # gate this and on_updated_record_permissions disagree, and the
+            # stored state depends on which ran last.
+            if record.inherit_permissions and not record.parent_external_record_id:
                 await tx_store.create_inherit_permissions_relation_record_group(record.id, record_group_id)
             else:
                 await tx_store.delete_inherit_permissions_relation_record_group(record.id, record_group_id)
+
+            # A record with no parent record hangs directly off its group. A nested
+            # one must not also get this edge, or the traversal would reach it from
+            # the group while skipping every restriction in between.
+            if not record.parent_external_record_id:
+                await self._create_hierarchy_edge(
+                    tx_store, record_group_id, CollectionNames.RECORD_GROUPS.value,
+                    record.id, CollectionNames.RECORDS.value,
+                )
+            else:
+                # It may have hung off the group before it gained a parent —
+                # synced at root and later re-parented, or promoted out of
+                # placeholder state. Leaving that edge is the same bypass the
+                # branch above avoids, arrived at by a different route.
+                await tx_store.delete_edge(
+                    record_group_id, CollectionNames.RECORD_GROUPS.value,
+                    record.id, CollectionNames.RECORDS.value,
+                    CollectionNames.NODE_RELATIONS.value,
+                )
 
         if record.shared_with_me_record_group_ids:
             # create_record_group_relation is an idempotent upsert and cannot
@@ -553,6 +698,12 @@ class DataSourceEntitiesProcessor:
                 if shared_with_me_record_group:
                     await tx_store.create_record_group_relation(
                         record.id, shared_with_me_record_group.id
+                    )
+                    # "Shared with Me" is a real second hierarchy parent, so the
+                    # record is reachable both here and from its drive location.
+                    await self._create_hierarchy_edge(
+                        tx_store, shared_with_me_record_group.id, CollectionNames.RECORD_GROUPS.value,
+                        record.id, CollectionNames.RECORDS.value,
                     )
                     if shared_with_me_record_group.id not in attached_group_ids:
                         moved = True
@@ -914,20 +1065,6 @@ class DataSourceEntitiesProcessor:
                     from_id = self.org_id
                     from_collection = CollectionNames.ORGS.value
 
-                # elif permission.entity_type == EntityType.DOMAIN.value:
-                #     domain = await tx_store.get_domain_by_external_id(permission.external_id)
-                #     if domain:
-                #         from_id = domain.id
-                #         from_collection = CollectionNames.DOMAINS.value
-
-                # elif permission.entity_type == EntityType.ANYONE.value:
-                #     from_id = None  # Anyone doesn't have an ID
-                #     from_collection = CollectionNames.ANYONE.value
-
-                # elif permission.entity_type == EntityType.ANYONE_WITH_LINK.value:
-                #     from_id = None  # Anyone with link doesn't have an ID
-                #     from_collection = CollectionNames.ANYONE_WITH_LINK.value
-
                 if from_id and from_collection:
                     record_permissions.append(permission.to_arango_permission(from_id, from_collection, to_id, to_collection))
 
@@ -1048,19 +1185,21 @@ class DataSourceEntitiesProcessor:
                 if permissions:
                     self.logger.debug("Adding %d new permission edge(s) for record: %s", len(permissions), record.id)
                     await self._handle_record_permissions(record, permissions, tx_store)
-                # if record comes with inherit permissions true create inherit permissions edge else check if inherit permissions edge exists and delete it
-                if record.inherit_permissions:
-                    record_group = await tx_store.get_record_group_by_external_id(connector_id=record.connector_id,
-                                                                      external_id=record.external_record_group_id)
-
-                    if record_group:
-                        await tx_store.create_inherit_permissions_relation_record_group(record.id, record_group.id)
-
-                if not record.inherit_permissions:
-                    record_group = await tx_store.get_record_group_by_external_id(connector_id=record.connector_id,
-                                                                      external_id=record.external_record_group_id)
-                    if record_group:
-                        # Delete the INHERIT_PERMISSIONS edge
+                # The group edge belongs to a record with no parent record. A
+                # nested one inherits from the record above it (D6), and adding
+                # the group edge here would let the traversal reach it from the
+                # group while skipping every restriction in between —
+                # _handle_parent_record owns that edge instead.
+                record_group = await tx_store.get_record_group_by_external_id(
+                    connector_id=record.connector_id,
+                    external_id=record.external_record_group_id,
+                )
+                if record_group:
+                    if record.inherit_permissions and not record.parent_external_record_id:
+                        await tx_store.create_inherit_permissions_relation_record_group(
+                            record.id, record_group.id
+                        )
+                    else:
                         await tx_store.delete_edge(
                             from_id=record.id,
                             from_collection=CollectionNames.RECORDS.value,
@@ -1068,8 +1207,6 @@ class DataSourceEntitiesProcessor:
                             to_collection=CollectionNames.RECORD_GROUPS.value,
                             collection=CollectionNames.INHERIT_PERMISSIONS.value
                         )
-                else:
-                    self.logger.info(f"No new permissions to add for record: {record.id}")
 
                 self.logger.debug(f"Successfully updated permissions for record: {record.id}")
 
@@ -1227,14 +1364,27 @@ class DataSourceEntitiesProcessor:
         # Create a edge between the record and the parent record if it doesn't exist and if parent_record_id is provided
         if record.origin == OriginTypes.UPLOAD:
             # KB records anchor to apps/<kbId> (belongsTo + inheritPermissions) and
-            # nest under a parent folder by its _key. Root items get no PARENT_CHILD edge.
+            # nest under a parent folder by its _key.
             await self._link_kb_record_to_app(record, tx_store)
-            if existing_record is None and record.parent_external_record_id:
-                await tx_store.create_record_relation(
-                    record.parent_external_record_id,
-                    record.id,
-                    RecordRelations.PARENT_CHILD.value,
-                )
+            if existing_record is None:
+                if record.parent_external_record_id:
+                    await tx_store.create_record_relation(
+                        record.parent_external_record_id,
+                        record.id,
+                        RecordRelations.PARENT_CHILD.value,
+                    )
+                else:
+                    # A root item has no parent folder, so the App is its parent in
+                    # the hierarchy. Without this edge the hub's descent from a KB
+                    # returns nothing: belongsTo runs child -> parent and cannot be
+                    # walked downwards.
+                    await self._create_hierarchy_edge(
+                        tx_store,
+                        record.connector_id,
+                        CollectionNames.APPS.value,
+                        record.id,
+                        CollectionNames.RECORDS.value,
+                    )
         else:
             await self._handle_parent_record(record, tx_store, existing_record)
 
@@ -1561,7 +1711,7 @@ class DataSourceEntitiesProcessor:
                         # the children are silently orphaned from the tree.
                         duplicate_children = await tx_store.get_edges_from_node(
                             f"{CollectionNames.RECORDS.value}/{duplicate.id}",
-                            CollectionNames.RECORD_RELATIONS.value,
+                            CollectionNames.NODE_RELATIONS.value,
                         )
                         for edge in duplicate_children:
                             if edge.get("relationshipType") != RecordRelations.PARENT_CHILD.value:
@@ -1582,6 +1732,18 @@ class DataSourceEntitiesProcessor:
                     # Drop the stale parent-child edge so _handle_parent_record can
                     # create the correct one pointing at the new parent folder.
                     await tx_store.delete_parent_child_edge_to_record(old_record.id)
+                    # And the inheritance edge that came with it (decision 6),
+                    # which _handle_parent_record re-creates against the new
+                    # parent but never removes from the old one.
+                    if old_record.parent_external_record_id:
+                        previous_parent = await tx_store.get_record_by_external_id(
+                            connector_id=new_record.connector_id,
+                            external_id=old_record.parent_external_record_id,
+                        )
+                        if previous_parent:
+                            await tx_store.delete_inherit_permissions_relation_record(
+                                old_record.id, previous_parent.id
+                            )
 
                     # Reuse the existing DB vertex id so all downstream edges
                     # (permissions, belongs-to, etc.) survive the path change.
@@ -1670,6 +1832,17 @@ class DataSourceEntitiesProcessor:
                                 new_record.parent_external_record_id,
                                 new_record.id,
                                 RecordRelations.PARENT_CHILD.value,
+                            )
+                        else:
+                            # Moved to KB root. The delete above dropped whichever
+                            # hierarchy edge pointed here, so the App edge has to be
+                            # rebuilt or the record becomes unreachable from the KB.
+                            await self._create_hierarchy_edge(
+                                tx_store,
+                                new_record.connector_id,
+                                CollectionNames.APPS.value,
+                                new_record.id,
+                                CollectionNames.RECORDS.value,
                             )
                         await self._link_kb_record_to_app(new_record, tx_store)
                     else:
@@ -1799,8 +1972,31 @@ class DataSourceEntitiesProcessor:
         event_payload = None
         async with self.data_store_provider.transaction() as tx_store:
             existing = await tx_store.get_record_by_key(record_id)
-            await tx_store.delete_parent_child_edge_to_record(record_id)
+            # Children survive this delete, so they are gathered before the parent
+            # goes and re-pointed at their record group afterwards (decision 73).
+            orphans = await self._collect_orphans(tx_store, existing, record_id)
+            # Arango's delete_nodes removes the document without touching its
+            # edges, so every edge touching this record is swept explicitly.
+            # Not just the record group's: shared_with_me_record_group_ids is
+            # never stored on the document, so a Drive file's second hierarchy
+            # parent (D55) cannot be found from here and would be left pointing
+            # at a vertex that no longer exists — which an Arango traversal then
+            # crosses into a null vertex. A no-op on Neo4j, where the DETACH
+            # DELETE below would have taken them anyway.
+            for edge_collection in (
+                CollectionNames.NODE_RELATIONS.value,
+                CollectionNames.INHERIT_PERMISSIONS.value,
+                CollectionNames.BELONGS_TO.value,
+                CollectionNames.PERMISSION.value,
+            ):
+                await tx_store.delete_edges_to(
+                    record_id, CollectionNames.RECORDS.value, edge_collection
+                )
+                await tx_store.delete_edges_from(
+                    record_id, CollectionNames.RECORDS.value, edge_collection
+                )
             await tx_store.delete_record_by_key(record_id)
+            await self._reparent_orphans(tx_store, orphans)
             vrid = getattr(existing, "virtual_record_id", None) if existing is not None else None
             if isinstance(vrid, str) and vrid:
                 event_payload = {
@@ -1844,6 +2040,9 @@ class DataSourceEntitiesProcessor:
         async with self.data_store_provider.transaction() as tx_store:
             result = await tx_store.delete_records_recursive(
                 record_ids, connector_id, cascade_children=cascade_children,
+            )
+            await self._reparent_orphans(
+                tx_store, (result or {}).get("reparented") or []
             )
         if (result or {}).get("successfully_deleted"):
             # Before publishing: the transaction has committed, so the records are
@@ -2031,6 +2230,59 @@ class DataSourceEntitiesProcessor:
                                 [app_relation], collection=CollectionNames.BELONGS_TO.value
                             )
 
+                            # The App is the top of the hierarchy the hub descends,
+                            # so the edge runs App -> group, inverting BELONGS_TO.
+                            await self._create_hierarchy_edge(
+                                tx_store, record_group.connector_id, CollectionNames.APPS.value,
+                                record_group.id, CollectionNames.RECORD_GROUPS.value,
+                            )
+
+                            # A top-level group inherits from its App only when the
+                            # connector says so. Safe for a group that is restricted —
+                            # it still needs its own grant, so app access alone reveals
+                            # nothing — and unsafe otherwise, which is why a Slack
+                            # channel must leave inherit_permissions false.
+                            inherit_app_relation = {
+                                "from_id": record_group.id,
+                                "from_collection": CollectionNames.RECORD_GROUPS.value,
+                                "to_id": record_group.connector_id,
+                                "to_collection": CollectionNames.APPS.value,
+                                "createdAtTimestamp": record_group.created_at,
+                                "updatedAtTimestamp": record_group.updated_at,
+                            }
+                            if record_group.inherit_permissions:
+                                await tx_store.batch_create_edges(
+                                    [inherit_app_relation],
+                                    collection=CollectionNames.INHERIT_PERMISSIONS.value,
+                                )
+                            else:
+                                await tx_store.delete_edge(
+                                    from_id=record_group.id,
+                                    from_collection=CollectionNames.RECORD_GROUPS.value,
+                                    to_id=record_group.connector_id,
+                                    to_collection=CollectionNames.APPS.value,
+                                    collection=CollectionNames.INHERIT_PERMISSIONS.value,
+                                )
+
+                    elif record_group.connector_id:
+                        # It has a parent group now, so it may have been
+                        # top-level on an earlier sync and still hang off the
+                        # App. Those edges would let the traversal reach it
+                        # without passing the parent's checks (D16, D66).
+                        # Keyed off the branch above rather than off
+                        # parent_external_group_id alone, so a group that
+                        # carries only parent_record_group_id is cleaned up too.
+                        await tx_store.delete_edge(
+                            record_group.connector_id, CollectionNames.APPS.value,
+                            record_group.id, CollectionNames.RECORD_GROUPS.value,
+                            CollectionNames.NODE_RELATIONS.value,
+                        )
+                        await tx_store.delete_edge(
+                            record_group.id, CollectionNames.RECORD_GROUPS.value,
+                            record_group.connector_id, CollectionNames.APPS.value,
+                            CollectionNames.INHERIT_PERMISSIONS.value,
+                        )
+
                     # 3. Handle User and Group Permissions (from the passed 'permissions' list)
                     if record_group.parent_external_group_id:
                         parent_record_group = await tx_store.get_record_group_by_external_id(
@@ -2068,6 +2320,11 @@ class DataSourceEntitiesProcessor:
                                 [parent_relation], collection=CollectionNames.BELONGS_TO.value
                             )
 
+                            await self._create_hierarchy_edge(
+                                tx_store, parent_record_group.id, CollectionNames.RECORD_GROUPS.value,
+                                record_group.id, CollectionNames.RECORD_GROUPS.value,
+                            )
+
                             if record_group.inherit_permissions:
                                 inherit_relation = parent_relation.copy()
                                 inherit_relation.pop("entityType", None)
@@ -2075,7 +2332,17 @@ class DataSourceEntitiesProcessor:
                                 await tx_store.batch_create_edges(
                                     [inherit_relation], collection=CollectionNames.INHERIT_PERMISSIONS.value
                                 )
-                            #if inherit records is false we need to remove the edge aswell
+                            else:
+                                # Reconcile: a group that stops inheriting must lose the
+                                # edge. Leaving it widens access on a re-sync, which is
+                                # the dangerous direction to get wrong.
+                                await tx_store.delete_edge(
+                                    from_id=record_group.id,
+                                    from_collection=CollectionNames.RECORD_GROUPS.value,
+                                    to_id=parent_record_group.id,
+                                    to_collection=CollectionNames.RECORD_GROUPS.value,
+                                    collection=CollectionNames.INHERIT_PERMISSIONS.value,
+                                )
 
                     # 4. Handle User and Group Permissions (from the passed 'permissions' list)
                     if not permissions:

@@ -3,9 +3,6 @@ from logging import Logger
 from typing import TYPE_CHECKING, AsyncContextManager, Optional
 
 from app.models.entities import (
-    Anyone,
-    AnyoneSameOrg,
-    AnyoneWithLink,
     AppMetadata,
     AppRole,
     AppUser,
@@ -294,18 +291,6 @@ class BaseDataStore(ABC):
 
     @abstractmethod
     async def batch_upsert_domains(self, domains: list[Domain]) -> None:
-        pass
-
-    @abstractmethod
-    async def batch_upsert_anyone(self, anyone: list[Anyone]) -> None:
-        pass
-
-    @abstractmethod
-    async def batch_upsert_anyone_with_link(self, anyone_with_link: list[AnyoneWithLink]) -> None:
-        pass
-
-    @abstractmethod
-    async def batch_upsert_anyone_same_org(self, anyone_same_org: list[AnyoneSameOrg]) -> None:
         pass
 
     @abstractmethod

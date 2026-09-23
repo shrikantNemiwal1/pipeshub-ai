@@ -1229,7 +1229,10 @@ class SlackConnector(BaseConnector):
                 updated_at=current_ts,
                 source_created_at=src_ts,
                 source_updated_at=upd_ts,
-                inherit_permissions=True,
+                # A channel is not open to everyone with the workspace app, so it
+                # must not inherit from the App: membership is the grant
+                # (decision 40).
+                inherit_permissions=False,
                 hide_children=True,
             )
         except Exception as exc:

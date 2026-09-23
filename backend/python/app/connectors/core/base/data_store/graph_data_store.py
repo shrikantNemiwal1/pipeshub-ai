@@ -19,9 +19,6 @@ from app.connectors.core.base.data_store.data_store import (
     TransactionStore,
 )
 from app.models.entities import (
-    Anyone,
-    AnyoneSameOrg,
-    AnyoneWithLink,
     AppMetadata,
     AppRole,
     AppUser,
@@ -283,7 +280,9 @@ class GraphTransactionStore(TransactionStore):
 
         When *cascade_children* is True (default), the full PARENT_CHILD +
         ATTACHMENT subtree is deleted.  When False, only ATTACHMENT edges are
-        traversed — child records linked via PARENT_CHILD survive.
+        traversed — child records linked via PARENT_CHILD survive, and each one
+        that keeps a record group is listed under the result's ``reparented`` key
+        for the caller to re-point (decision 73).
         """
         return await self.graph_provider.delete_records_recursive(
             record_ids, connector_id, transaction=self.txn, cascade_children=cascade_children,
@@ -527,15 +526,6 @@ class GraphTransactionStore(TransactionStore):
     async def batch_upsert_domains(self, domains: list[Domain]) -> None:
         return await self.graph_provider.batch_upsert_domains(domains, transaction=self.txn)
 
-    async def batch_upsert_anyone(self, anyone: list[Anyone]) -> None:
-        return await self.graph_provider.batch_upsert_anyone(anyone, transaction=self.txn)
-
-    async def batch_upsert_anyone_with_link(self, anyone_with_link: list[AnyoneWithLink]) -> None:
-        return await self.graph_provider.batch_upsert_anyone_with_link(anyone_with_link, transaction=self.txn)
-
-    async def batch_upsert_anyone_same_org(self, anyone_same_org: list[AnyoneSameOrg]) -> None:
-        return await self.graph_provider.batch_upsert_anyone_same_org(anyone_same_org, transaction=self.txn)
-
     async def commit(self) -> None:
         """
         Commit the transaction.
@@ -603,16 +593,33 @@ class GraphTransactionStore(TransactionStore):
         )
 
     async def create_inherit_permissions_relation_record(self, child_record_id: str, parent_record_id: str) -> None:
+        """Create INHERIT_PERMISSIONS edge from a record to its parent *record*.
+
+        The target is a record, not a record group: a nested record inherits
+        from the node directly above it, which is what lets a restriction part
+        way down a tree take effect.
+        """
         record_edge = {
                     "from_id": child_record_id,
                     "from_collection": CollectionNames.RECORDS.value,
                     "to_id": parent_record_id,
-                    "to_collection": CollectionNames.RECORD_GROUPS.value,
+                    "to_collection": CollectionNames.RECORDS.value,
                     "createdAtTimestamp": get_epoch_timestamp_in_ms(),
                     "updatedAtTimestamp": get_epoch_timestamp_in_ms(),
                 }
         await self.graph_provider.batch_create_edges(
             [record_edge], collection=CollectionNames.INHERIT_PERMISSIONS.value, transaction=self.txn
+        )
+
+    async def delete_inherit_permissions_relation_record(self, child_record_id: str, parent_record_id: str) -> None:
+        """Remove that edge when a record stops inheriting from its parent record."""
+        await self.graph_provider.delete_edge(
+            child_record_id,
+            CollectionNames.RECORDS.value,
+            parent_record_id,
+            CollectionNames.RECORDS.value,
+            CollectionNames.INHERIT_PERMISSIONS.value,
+            transaction=self.txn,
         )
     async def get_sync_point(self, sync_point_key: str) -> Optional[dict]:
         return await self.graph_provider.get_sync_point(sync_point_key, CollectionNames.SYNC_POINTS.value, transaction=self.txn)
@@ -635,22 +642,6 @@ class GraphTransactionStore(TransactionStore):
     async def create_orgs(self, orgs: list[Org]) -> None:
         return await self.graph_provider.batch_upsert_nodes([org.to_arango_base_org() for org in orgs],
                     collection=CollectionNames.ORGS.value, transaction=self.txn)
-
-    async def create_domains(self, domains: list[Domain]) -> None:
-        return await self.graph_provider.batch_upsert_nodes([domain.to_arango_base_domain() for domain in domains],
-                    collection=CollectionNames.DOMAINS.value, transaction=self.txn)
-
-    async def create_anyone(self, anyone: list[Anyone]) -> None:
-        return await self.graph_provider.batch_upsert_nodes([anyone_item.to_arango_base_anyone() for anyone_item in anyone],
-                    collection=CollectionNames.ANYONE.value, transaction=self.txn)
-
-    async def create_anyone_with_link(self, anyone_with_link: list[AnyoneWithLink]) -> None:
-        return await self.graph_provider.batch_upsert_nodes([anyone_with_link_item.to_arango_base_anyone_with_link() for anyone_with_link_item in anyone_with_link],
-                    collection=CollectionNames.ANYONE_WITH_LINK.value, transaction=self.txn)
-
-    async def create_anyone_same_org(self, anyone_same_org: list[AnyoneSameOrg]) -> None:
-        return await self.graph_provider.batch_upsert_nodes([anyone_same_org_item.to_arango_base_anyone_same_org() for anyone_same_org_item in anyone_same_org],
-                    collection=CollectionNames.ANYONE_SAME_ORG.value, transaction=self.txn)
 
     async def create_sync_point(self, sync_point_key: str, sync_point_data: dict) -> None:
         return await self.graph_provider.upsert_sync_point(sync_point_key, sync_point_data, collection=CollectionNames.SYNC_POINTS.value, transaction=self.txn)
@@ -740,9 +731,9 @@ class GraphTransactionStore(TransactionStore):
     async def batch_delete_edges(self, edges: list[dict], collection: str) -> int:
         return await self.graph_provider.batch_delete_edges(edges, collection=collection, transaction=self.txn)
 
-    async def batch_upsert_record_relations(self, edges: list[dict]) -> None:
+    async def batch_upsert_node_relations(self, edges: list[dict]) -> None:
         """Batch upsert record relation edges with relationshipType in UPSERT match condition."""
-        return await self.graph_provider.batch_upsert_record_relations(edges, transaction=self.txn)
+        return await self.graph_provider.batch_upsert_node_relations(edges, transaction=self.txn)
 
     async def batch_create_entity_relations(self, edges: list[dict]) -> None:
         """Batch create entity relation edges with edgeType in UPSERT match condition."""

@@ -28,6 +28,7 @@ from fastapi.responses import StreamingResponse
 
 from app.config.configuration_service import ConfigurationService
 from app.config.constants.arangodb import (
+    AccessRule,
     Connectors,
     MimeTypes,
     OriginTypes,
@@ -787,10 +788,17 @@ class ConfluenceConnector(BaseConnector):
             return None
 
         permissions = await self._fetch_page_permissions(folder_id)
-        # Mirror _sync_folders: only drop space inheritance when READ restrictions exist.
-        read_permissions = [p for p in permissions if p.type == PermissionType.READ]
-        if len(read_permissions) > 0:
-            folder_record.inherit_permissions = False
+        if permissions is None:
+            self.logger.error(f"Skipping folder {folder_id}: permissions unreadable")
+            return None
+        # A READ restriction keeps inheriting and is recorded as RESTRICTED
+        # instead: the node then needs its own grant as well as the space
+        # (decision 26). EDIT-only restrictions stay STRICT.
+        folder_record.access_rule = (
+            AccessRule.RESTRICTED
+            if any(p.type == PermissionType.READ for p in permissions)
+            else AccessRule.STRICT
+        )
         return (folder_record, permissions)
 
     async def _sync_users(self) -> None:
@@ -1392,8 +1400,15 @@ class ConfluenceConnector(BaseConnector):
                             external_record_id=item_id
                         )
 
-                        # Fetch folder permissions
+                        # Fetch folder permissions. None means the ACL could not
+                        # be read — skip rather than write the folder as STRICT,
+                        # which would expose a restricted one to the whole space.
                         permissions = await self._fetch_page_permissions(item_id)
+                        if permissions is None:
+                            self.logger.error(
+                                f"Skipping folder {item_id}: permissions unreadable"
+                            )
+                            continue
                         total_permissions_synced += len(permissions)
 
                         # Transform to FileRecord
@@ -1404,10 +1419,13 @@ class ConfluenceConnector(BaseConnector):
                         if not folder_record:
                             continue
 
-                        # Only set inherit_permissions to False if there are READ restrictions
-                        read_permissions = [p for p in permissions if p.type == PermissionType.READ]
-                        if len(read_permissions) > 0:
-                            folder_record.inherit_permissions = False
+                        # A READ restriction keeps inheriting and is recorded as
+                        # RESTRICTED instead (decision 26); EDIT-only stays STRICT.
+                        folder_record.access_rule = (
+                            AccessRule.RESTRICTED
+                            if any(p.type == PermissionType.READ for p in permissions)
+                            else AccessRule.STRICT
+                        )
 
                         # Add folder to batch
                         records_with_permissions.append((folder_record, permissions))
@@ -1611,8 +1629,15 @@ class ConfluenceConnector(BaseConnector):
                             external_record_id=item_id
                         )
 
-                        # Fetch page permissions
+                        # Fetch page permissions. None means the ACL could not be
+                        # read — skip rather than write the page as STRICT, which
+                        # would expose a restricted one to the whole space.
                         permissions = await self._fetch_page_permissions(item_id)
+                        if permissions is None:
+                            self.logger.error(
+                                f"Skipping page {item_id}: permissions unreadable"
+                            )
+                            continue
                         total_permissions_synced += len(permissions)
 
                         # Transform to WebpageRecord with update tracking
@@ -1629,11 +1654,13 @@ class ConfluenceConnector(BaseConnector):
                         if not content_indexing_enabled:
                             webpage_record.indexing_status = ProgressStatus.AUTO_INDEX_OFF.value
 
-                        # Only set inherit_permissions to False if there are READ restrictions
-                        # EDIT-only restrictions should still inherit from space for READ access
-                        read_permissions = [p for p in permissions if p.type == PermissionType.READ]
-                        if len(read_permissions) > 0:
-                            webpage_record.inherit_permissions = False
+                        # A READ restriction keeps inheriting and is recorded as
+                        # RESTRICTED instead (decision 26); EDIT-only stays STRICT.
+                        webpage_record.access_rule = (
+                            AccessRule.RESTRICTED
+                            if any(p.type == PermissionType.READ for p in permissions)
+                            else AccessRule.STRICT
+                        )
 
                         # Add item to batch
                         records_with_permissions.append((webpage_record, permissions))
@@ -2117,15 +2144,22 @@ class ConfluenceConnector(BaseConnector):
                         if not webpage_record:
                             continue
 
-                        # Fetch current permissions
+                        # Fetch current permissions. None means unreadable — skip.
                         permissions = await self._fetch_page_permissions(item_id)
+                        if permissions is None:
+                            self.logger.error(
+                                f"Skipping page {item_id}: permissions unreadable"
+                            )
+                            continue
                         total_permissions += len(permissions)
 
-                        # Only set inherit_permissions to False if there are READ restrictions
-                        # EDIT-only restrictions should still inherit from space for READ access
-                        read_permissions = [p for p in permissions if p.type == PermissionType.READ]
-                        if len(read_permissions) > 0:
-                            webpage_record.inherit_permissions = False
+                        # A READ restriction keeps inheriting and is recorded as
+                        # RESTRICTED instead (decision 26); EDIT-only stays STRICT.
+                        webpage_record.access_rule = (
+                            AccessRule.RESTRICTED
+                            if any(p.type == PermissionType.READ for p in permissions)
+                            else AccessRule.STRICT
+                        )
 
                         # Add to batch for update
                         records_with_permissions.append((webpage_record, permissions))
@@ -2218,7 +2252,7 @@ class ConfluenceConnector(BaseConnector):
             self.logger.error(f"❌ Failed to fetch permissions for space {space_name}: {e}")
             return []  # Return empty list on error, space will be created without permissions
 
-    async def _fetch_page_permissions(self, page_id: str) -> list[Permission]:
+    async def _fetch_page_permissions(self, page_id: str) -> list[Permission] | None:
         """
         Fetch permissions for a Confluence page using v1 API.
 
@@ -2226,7 +2260,14 @@ class ConfluenceConnector(BaseConnector):
             page_id: The page ID
 
         Returns:
-            List of Permission objects
+            The page's permissions, or ``None`` when they could not be read.
+
+            The distinction matters: an empty list means "this page genuinely
+            carries no restrictions", so it is written STRICT and inherits from
+            its space. Returning ``[]`` on a 403, a rate limit or a timeout
+            would say the same thing about a page whose whole purpose is a READ
+            restriction, exposing it to every member of the space. Callers must
+            treat ``None`` as "skip this record", never as "no restrictions".
         """
         permissions = []
 
@@ -2241,8 +2282,8 @@ class ConfluenceConnector(BaseConnector):
 
             # Check response
             if not response or response.status != HttpStatusCode.SUCCESS.value:
-                self.logger.warning(f"⚠️ Failed to fetch permissions for page {page_id}: {response.status if response else 'No response'}")
-                return []
+                self.logger.error(f"❌ Could not read permissions for page {page_id}: {response.status if response else 'No response'}")
+                return None
 
             response_data = response.json()
             restrictions = response_data.get("results", [])
@@ -2256,8 +2297,9 @@ class ConfluenceConnector(BaseConnector):
             return permissions
 
         except Exception as e:
-            self.logger.error(f"❌ Failed to fetch permissions for page {page_id}: {e}")
-            return []  # Return empty list on error, page will be created without permissions
+            # Not []: an unreadable ACL is not an absent ACL. See the docstring.
+            self.logger.error(f"❌ Could not read permissions for page {page_id}: {e}")
+            return None
 
     def _construct_web_url(self, links: dict[str, Any], base_url: str | None = None) -> str | None:
         """
@@ -2805,6 +2847,14 @@ class ConfluenceConnector(BaseConnector):
                 web_url=web_url,
                 source_created_at=source_created_at,
                 source_updated_at=source_created_at,  # Confluence doesn't provide updated timestamp for spaces
+                # Every space carries its own permission list, so app access
+                # alone must never reveal one: it inherits from the App, but the
+                # restriction means a grant is needed as well (decisions 26, 66).
+                # Inheritance is not optional — it defaults to False, and
+                # without the edge a RESTRICTED group can never satisfy D25 and
+                # the space becomes invisible to everyone.
+                inherit_permissions=True,
+                access_rule=AccessRule.RESTRICTED,
             )
 
         except Exception as e:
@@ -5124,11 +5174,16 @@ class ConfluenceConnector(BaseConnector):
 
             # Fetch fresh permissions
             permissions = await self._fetch_page_permissions(page_id)
-            # Only set inherit_permissions to False if there are READ restrictions
-            # EDIT-only restrictions should still inherit from space for READ access
-            read_permissions = [p for p in permissions if p.type == PermissionType.READ]
-            if len(read_permissions) > 0:
-                webpage_record.inherit_permissions = False
+            if permissions is None:
+                self.logger.error(f"Skipping page {page_id}: permissions unreadable")
+                return None
+            # A READ restriction keeps inheriting and is recorded as RESTRICTED
+            # instead (decision 26); EDIT-only stays STRICT.
+            webpage_record.access_rule = (
+                AccessRule.RESTRICTED
+                if any(p.type == PermissionType.READ for p in permissions)
+                else AccessRule.STRICT
+            )
 
             return (webpage_record, permissions)
 
@@ -5179,11 +5234,16 @@ class ConfluenceConnector(BaseConnector):
 
             # Fetch fresh permissions
             permissions = await self._fetch_page_permissions(blogpost_id)
-            # Only set inherit_permissions to False if there are READ restrictions
-            # EDIT-only restrictions should still inherit from space for READ access
-            read_permissions = [p for p in permissions if p.type == PermissionType.READ]
-            if len(read_permissions) > 0:
-                webpage_record.inherit_permissions = False
+            if permissions is None:
+                self.logger.error(f"Skipping blogpost {blogpost_id}: permissions unreadable")
+                return None
+            # A READ restriction keeps inheriting and is recorded as RESTRICTED
+            # instead (decision 26); EDIT-only stays STRICT.
+            webpage_record.access_rule = (
+                AccessRule.RESTRICTED
+                if any(p.type == PermissionType.READ for p in permissions)
+                else AccessRule.STRICT
+            )
 
             return (webpage_record, permissions)
 
@@ -5257,6 +5317,14 @@ class ConfluenceConnector(BaseConnector):
 
             # Attachments inherit permissions from parent page - fetch page permissions
             permissions = await self._fetch_page_permissions(parent_page_id)
+            if permissions is None:
+                # [] would mean "no grants" to the write path, wiping the
+                # attachment's inherited grants on a reindex.
+                self.logger.error(
+                    f"Skipping attachment {record.external_record_id}: "
+                    f"parent page permissions unreadable"
+                )
+                return None
 
             return (attachment_record, permissions)
 
@@ -5756,15 +5824,20 @@ class ConfluenceConnector(BaseConnector):
             if not comment_record:
                 return None
             
-            # Comments inherit permissions from parent page
-            # Fetch parent page permissions if available
+            # Comments inherit permissions from parent page. The try/except that
+            # used to wrap this swallowed failures back to [], re-creating the
+            # bug the None contract exists to remove: on a reindex that would
+            # wipe the comment's grants.
             permissions = []
             if record.parent_external_record_id:
-                try:
-                    permissions = await self._fetch_page_permissions(record.parent_external_record_id)
-                except Exception as e:
-                    self.logger.warning(f"Failed to fetch parent page permissions for comment: {e}")
-            
+                permissions = await self._fetch_page_permissions(record.parent_external_record_id)
+                if permissions is None:
+                    self.logger.error(
+                        f"Skipping comment {record.external_record_id}: "
+                        f"parent page permissions unreadable"
+                    )
+                    return None
+
             return (comment_record, permissions)
             
         except Exception as e:

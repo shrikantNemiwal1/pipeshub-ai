@@ -10,18 +10,13 @@ class PermissionType(str, Enum):
     READ = "READER"
     WRITE = "WRITER"
     OWNER = "OWNER"
-    COMMENT = "COMMENTER"
-    OTHER = "OTHERS"
 
 class EntityType(str, Enum):
     USER = "USER"
     GROUP = "GROUP"
     ROLE = "ROLE"
-    DOMAIN = "DOMAIN"
     ORG = "ORG"
     TEAM = "TEAM"
-    ANYONE = "ANYONE"
-    ANYONE_WITH_LINK = "ANYONE_WITH_LINK"
 
 class Permission(BaseModel):
     external_id: Optional[str] = None
