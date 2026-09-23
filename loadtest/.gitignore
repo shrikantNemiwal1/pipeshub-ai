@@ -1,6 +1,11 @@
 # Measurement output — reports, flame graphs, CSVs. Local only.
 results/
 
+# Captured query text and its bound parameters (kh/). The parameters carry a
+# real user's grant id list, so these are per-environment artifacts, not
+# something to share.
+captures/
+
 # Bearer tokens for the target environment. Never commit.
 .env
 .env.*

@@ -125,6 +125,18 @@ services:
       # DATA_STORE accepted values: "neo4j" (default) | "arangodb"
       - DATA_STORE=${DATA_STORE:-neo4j}
 
+      # Knowledge Hub visibility pre-pass. Empty/false uses the shipped v2 two-set
+      # pass; "true" uses the v3 single-union pass. Neo4j only — v3 has no Arango
+      # implementation, so leaving this on with DATA_STORE=arangodb changes nothing.
+      - KH_VISIBLE_SET_V3=${KH_VISIBLE_SET_V3:-false}
+
+      # Whether the LISTING reads that set instead of re-walking the hierarchy.
+      # Independent of the flag above: that one chooses how the set is built,
+      # this one decides whether the ~110 partition queries still re-apply the
+      # per-hop rule the pre-pass has already applied. Requires the set, so it
+      # only takes effect when KH_VISIBLE_SET_V3 is on.
+      - KH_CHILDREN_V3=${KH_CHILDREN_V3:-false}
+
       # ArangoDB (active when DATA_STORE=arangodb)
       - ARANGO_URL=http://arango:8529
       - ARANGO_DB_NAME=${ARANGO_DB_NAME:-es}
