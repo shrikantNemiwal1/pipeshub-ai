@@ -1975,71 +1975,6 @@ class TestBatchUpsertDomains:
 
 
 # ===================================================================
-# batch_upsert_anyone
-# ===================================================================
-
-class TestBatchUpsertAnyone:
-    async def test_success(self, connected_provider):
-        connected_provider.batch_upsert_nodes = AsyncMock()
-        await connected_provider.batch_upsert_anyone([{"id": "a1"}])
-        connected_provider.batch_upsert_nodes.assert_awaited_once()
-
-    async def test_empty_skips(self, connected_provider):
-        connected_provider.batch_upsert_nodes = AsyncMock()
-        await connected_provider.batch_upsert_anyone([])
-        connected_provider.batch_upsert_nodes.assert_not_awaited()
-
-    async def test_exception_raises(self, connected_provider):
-        connected_provider.batch_upsert_nodes = AsyncMock(side_effect=Exception("err"))
-        with pytest.raises(Exception, match="err"):
-            await connected_provider.batch_upsert_anyone([{"id": "a1"}])
-
-
-# ===================================================================
-# batch_upsert_anyone_with_link
-# ===================================================================
-
-@patch.object(CollectionNames, "ANYONE_WITH_LINK", create=True, new=MagicMock(value="anyoneWithLink"))
-class TestBatchUpsertAnyoneWithLink:
-    async def test_success(self, connected_provider):
-        connected_provider.batch_upsert_nodes = AsyncMock()
-        await connected_provider.batch_upsert_anyone_with_link([{"id": "a1"}])
-        connected_provider.batch_upsert_nodes.assert_awaited_once()
-
-    async def test_empty_skips(self, connected_provider):
-        connected_provider.batch_upsert_nodes = AsyncMock()
-        await connected_provider.batch_upsert_anyone_with_link([])
-        connected_provider.batch_upsert_nodes.assert_not_awaited()
-
-    async def test_exception_raises(self, connected_provider):
-        connected_provider.batch_upsert_nodes = AsyncMock(side_effect=Exception("err"))
-        with pytest.raises(Exception, match="err"):
-            await connected_provider.batch_upsert_anyone_with_link([{"id": "a1"}])
-
-
-# ===================================================================
-# batch_upsert_anyone_same_org
-# ===================================================================
-
-@patch.object(CollectionNames, "ANYONE_SAME_ORG", create=True, new=MagicMock(value="anyoneSameOrg"))
-class TestBatchUpsertAnyoneSameOrg:
-    async def test_success(self, connected_provider):
-        connected_provider.batch_upsert_nodes = AsyncMock()
-        await connected_provider.batch_upsert_anyone_same_org([{"id": "a1"}])
-        connected_provider.batch_upsert_nodes.assert_awaited_once()
-
-    async def test_empty_skips(self, connected_provider):
-        connected_provider.batch_upsert_nodes = AsyncMock()
-        await connected_provider.batch_upsert_anyone_same_org([])
-        connected_provider.batch_upsert_nodes.assert_not_awaited()
-
-    async def test_exception_raises(self, connected_provider):
-        connected_provider.batch_upsert_nodes = AsyncMock(side_effect=Exception("err"))
-        with pytest.raises(Exception, match="err"):
-            await connected_provider.batch_upsert_anyone_same_org([{"id": "a1"}])
-
-
-# ===================================================================
 # batch_create_user_app_edges
 # ===================================================================
 
@@ -2364,7 +2299,7 @@ class TestGetRelatedRecordsByRelationType:
         ]
         result = await connected_provider.get_related_records_by_relation_type(
             record_id="r1", relation_type="REPLY",
-            edge_collection="recordRelations",
+            edge_collection="nodeRelations",
         )
         assert len(result) == 1
 
@@ -2372,7 +2307,7 @@ class TestGetRelatedRecordsByRelationType:
         connected_provider.http_client.execute_aql.return_value = []
         result = await connected_provider.get_related_records_by_relation_type(
             record_id="r1", relation_type="REPLY",
-            edge_collection="recordRelations",
+            edge_collection="nodeRelations",
         )
         assert result == []
 
@@ -2380,7 +2315,7 @@ class TestGetRelatedRecordsByRelationType:
         connected_provider.http_client.execute_aql.side_effect = Exception("err")
         result = await connected_provider.get_related_records_by_relation_type(
             record_id="r1", relation_type="REPLY",
-            edge_collection="recordRelations",
+            edge_collection="nodeRelations",
         )
         assert result == []
 

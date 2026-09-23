@@ -145,7 +145,7 @@ def _make_tx_store():
     tx_store.get_app_creator_user = AsyncMock(return_value=None)
     tx_store.create_record_groups_relation = AsyncMock()
     tx_store.get_edges_to_node = AsyncMock(return_value=[])
-    tx_store.batch_upsert_record_relations = AsyncMock()
+    tx_store.batch_upsert_node_relations = AsyncMock()
     return tx_store
 
 
@@ -2466,8 +2466,8 @@ class TestHandleRelatedExternalRecordsBatchUpsert:
 
         await proc._handle_related_external_records(record, [rel_ext], tx_store)
 
-        tx_store.batch_upsert_record_relations.assert_awaited_once()
-        edges = tx_store.batch_upsert_record_relations.call_args[0][0]
+        tx_store.batch_upsert_node_relations.assert_awaited_once()
+        edges = tx_store.batch_upsert_node_relations.call_args[0][0]
         assert len(edges) == 1
         edge = edges[0]
         assert edge["relationshipType"] == RecordRelations.FOREIGN_KEY.value
@@ -2531,8 +2531,8 @@ class TestHandleRelatedExternalRecordsBatchUpsert:
 
         await proc._handle_related_external_records(record, [rel_ext], tx_store)
 
-        tx_store.batch_upsert_record_relations.assert_awaited_once()
-        edge = tx_store.batch_upsert_record_relations.call_args[0][0][0]
+        tx_store.batch_upsert_node_relations.assert_awaited_once()
+        edge = tx_store.batch_upsert_node_relations.call_args[0][0][0]
         assert edge["sourceColumn"] == "dept_id"
         assert edge["targetColumn"] == "id"
         assert edge["childTableName"] == "employees"
@@ -2889,7 +2889,7 @@ class TestHandleRelatedEdgeCases:
         await proc._handle_related_external_records(record, [{"bad": "data"}], tx_store)
 
         proc.logger.warning.assert_called()
-        tx_store.batch_upsert_record_relations.assert_not_awaited()
+        tx_store.batch_upsert_node_relations.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_skips_empty_external_record_id(self):
@@ -2908,7 +2908,7 @@ class TestHandleRelatedEdgeCases:
 
         await proc._handle_related_external_records(record, [rel_ext], tx_store)
 
-        tx_store.batch_upsert_record_relations.assert_not_awaited()
+        tx_store.batch_upsert_node_relations.assert_not_awaited()
 
 
 # ===========================================================================
@@ -3749,7 +3749,16 @@ class TestOnRecordMetadataUpdateAndDelete:
 
         await proc.on_record_deleted("rec-1")
 
-        tx_store.delete_parent_child_edge_to_record.assert_awaited_with("rec-1")
+        # No longer deletes the parent edge by name: every edge touching the
+        # record is swept in both directions, because the Shared-with-Me group
+        # id (D55) is never stored on the document and so cannot be found from
+        # here — leaving that second hierarchy edge pointing at a dead vertex.
+        tx_store.delete_edges_to.assert_any_await(
+            "rec-1", CollectionNames.RECORDS.value, CollectionNames.NODE_RELATIONS.value
+        )
+        tx_store.delete_edges_from.assert_any_await(
+            "rec-1", CollectionNames.RECORDS.value, CollectionNames.NODE_RELATIONS.value
+        )
         tx_store.delete_record_by_key.assert_awaited_with("rec-1")
         proc.messaging_producer.send_message.assert_awaited_once()
         assert proc.messaging_producer.send_message.await_args[0][1]["eventType"] == "deleteRecord"

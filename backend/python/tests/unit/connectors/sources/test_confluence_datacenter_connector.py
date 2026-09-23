@@ -1170,7 +1170,12 @@ class TestFetchPagePermissions:
         connector._transform_page_restriction_to_permissions.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_api_failure_returns_empty(self):
+    async def test_api_failure_returns_none_not_empty(self):
+        """Decision 76: "could not determine" is not "no restrictions".
+
+        Returning [] here is what let a 403 write a READ-restricted page as
+        unrestricted, exposing it to every member of its space.
+        """
         connector = _make_connector()
         mock_ds = MagicMock()
         mock_ds.get_page_relevant_view_restrictions_v1 = AsyncMock(
@@ -1179,7 +1184,7 @@ class TestFetchPagePermissions:
         connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
 
         permissions = await connector._fetch_page_permissions("page-1")
-        assert permissions == []
+        assert permissions is None
 
 
 # ===========================================================================
@@ -1589,11 +1594,11 @@ class TestMapConfluencePermission:
 
     def test_create_comment(self):
         c = _conn()
-        assert c._map_confluence_permission("create", "comment") == PermissionType.COMMENT
+        assert c._map_confluence_permission("create", "comment") == PermissionType.READ
 
     def test_delete_comment(self):
         c = _conn()
-        assert c._map_confluence_permission("delete", "comment") == PermissionType.COMMENT
+        assert c._map_confluence_permission("delete", "comment") == PermissionType.READ
 
     def test_create_page(self):
         c = _conn()
@@ -3643,11 +3648,11 @@ class TestMapConfluencePermissionFullCoverage:
 
     def test_create_comment(self):
         c = _c()
-        assert c._map_confluence_permission("create", "comment") == PermissionType.COMMENT
+        assert c._map_confluence_permission("create", "comment") == PermissionType.READ
 
     def test_delete_comment(self):
         c = _c()
-        assert c._map_confluence_permission("delete", "comment") == PermissionType.COMMENT
+        assert c._map_confluence_permission("delete", "comment") == PermissionType.READ
 
     def test_create_page(self):
         c = _c()

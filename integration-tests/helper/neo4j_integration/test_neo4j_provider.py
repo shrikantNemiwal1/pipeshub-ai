@@ -181,12 +181,12 @@ class TestNeo4jProvider(Neo4jProvider):
         return int(result[0]["c"]) if result else 0
 
     async def count_parent_child_edges(self, connector_id: str) -> int:
-        """Count parent/child folder edges (RECORD_RELATION with relationshipType PARENT_CHILD)."""
+        """Count parent/child folder edges (NODE_RELATION with relationshipType PARENT_CHILD)."""
         if not self.client:
             raise RuntimeError("Provider not connected")
         result = await self.client.execute_query(
             """
-            MATCH (p {connectorId: $cid})-[r:RECORD_RELATION {relationshipType: 'PARENT_CHILD'}]->(c {connectorId: $cid})
+            MATCH (p {connectorId: $cid})-[r:NODE_RELATION {relationshipType: 'PARENT_CHILD'}]->(c {connectorId: $cid})
             RETURN count(*) AS c
             """,
             {"cid": connector_id}
@@ -839,12 +839,12 @@ class TestNeo4jProvider(Neo4jProvider):
     async def count_record_relation_edges(
         self, connector_id: str, relation_type: str
     ) -> int:
-        """Count RECORD_RELATION edges of a specific relationshipType (PARENT_CHILD, ATTACHMENT, BLOCKS, etc.)."""
+        """Count NODE_RELATION edges of a specific relationshipType (PARENT_CHILD, ATTACHMENT, BLOCKS, etc.)."""
         if not self.client:
             raise RuntimeError("Provider not connected")
         result = await self.client.execute_query(
             """
-            MATCH (p {connectorId: $cid})-[r:RECORD_RELATION {relationshipType: $rtype}]->(c {connectorId: $cid})
+            MATCH (p {connectorId: $cid})-[r:NODE_RELATION {relationshipType: $rtype}]->(c {connectorId: $cid})
             RETURN count(*) AS c
             """,
             {"cid": connector_id, "rtype": relation_type},
@@ -900,7 +900,7 @@ class TestNeo4jProvider(Neo4jProvider):
     async def get_record_outgoing_relations(
         self, connector_id: str, external_record_id: str, relation_type: str
     ) -> List[str]:
-        """Return external ids of records reachable via outbound RECORD_RELATION of the given relationshipType.
+        """Return external ids of records reachable via outbound NODE_RELATION of the given relationshipType.
 
         For parent_child / attachment edges, the connector emits ``parent -> child``
         (see ``create_record_relation(parent_id, record_id, ...)``), so this method
@@ -915,7 +915,7 @@ class TestNeo4jProvider(Neo4jProvider):
         result = await self.client.execute_query(
             """
             MATCH (r {connectorId: $cid, externalRecordId: $eid})
-            MATCH (r)-[:RECORD_RELATION {relationshipType: $rtype}]->(t)
+            MATCH (r)-[:NODE_RELATION {relationshipType: $rtype}]->(t)
             RETURN t.externalRecordId AS ext_id
             """,
             {"cid": connector_id, "eid": external_record_id, "rtype": relation_type},
@@ -925,7 +925,7 @@ class TestNeo4jProvider(Neo4jProvider):
     async def get_record_incoming_relations(
         self, connector_id: str, external_record_id: str, relation_type: str
     ) -> List[str]:
-        """Return external ids of records pointing TO this record via RECORD_RELATION of the given type.
+        """Return external ids of records pointing TO this record via NODE_RELATION of the given type.
 
         Inverse of :meth:`get_record_outgoing_relations`. For parent_child / attachment
         edges, this returns the parent (since the connector stores the edge
@@ -936,7 +936,7 @@ class TestNeo4jProvider(Neo4jProvider):
         result = await self.client.execute_query(
             """
             MATCH (r {connectorId: $cid, externalRecordId: $eid})
-            MATCH (src)-[:RECORD_RELATION {relationshipType: $rtype}]->(r)
+            MATCH (src)-[:NODE_RELATION {relationshipType: $rtype}]->(r)
             RETURN src.externalRecordId AS ext_id
             """,
             {"cid": connector_id, "eid": external_record_id, "rtype": relation_type},
@@ -1036,7 +1036,7 @@ class TestNeo4jProvider(Neo4jProvider):
             return Record.from_arango_base_record(record_dict)
 
     _ARANGO_TO_NEO4J_EDGE: dict[str, str] = {
-        "recordRelations": "RECORD_RELATION",
+        "nodeRelations": "NODE_RELATION",
         "belongsTo": "BELONGS_TO",
         "inheritPermissions": "INHERIT_PERMISSIONS",
         "permission": "PERMISSION",

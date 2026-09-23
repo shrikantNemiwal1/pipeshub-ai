@@ -2874,32 +2874,6 @@ class TestBatchUpsertOrgs:
 
 
 # ---------------------------------------------------------------------------
-# batch_upsert_anyone / batch_upsert_anyone_with_link / batch_upsert_anyone_same_org
-# ---------------------------------------------------------------------------
-
-
-class TestBatchUpsertAnyone:
-    @pytest.mark.asyncio
-    @pytest.mark.asyncio
-    async def test_empty(self, connected_provider):
-        with patch.object(
-            connected_provider, "batch_upsert_nodes",
-            new_callable=AsyncMock
-        ) as mock_upsert:
-            await connected_provider.batch_upsert_anyone([])
-            mock_upsert.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_exception(self, connected_provider):
-        with patch.object(
-            connected_provider, "batch_upsert_nodes",
-            new_callable=AsyncMock, side_effect=Exception("fail")
-        ):
-            with pytest.raises(Exception):
-                await connected_provider.batch_upsert_anyone([{"id": "a1"}])
-
-
-# ---------------------------------------------------------------------------
 # batch_upsert_user_groups
 # ---------------------------------------------------------------------------
 
@@ -3134,7 +3108,7 @@ class TestGetRelatedRecordsByRelationType:
     async def test_not_found(self, connected_provider):
         connected_provider.http_client.execute_aql.return_value = []
         result = await connected_provider.get_related_records_by_relation_type(
-            "r1", "ATTACHMENT", "recordRelations"
+            "r1", "ATTACHMENT", "nodeRelations"
         )
         assert result == []
 
@@ -3142,7 +3116,7 @@ class TestGetRelatedRecordsByRelationType:
     async def test_exception(self, connected_provider):
         connected_provider.http_client.execute_aql.side_effect = Exception("fail")
         result = await connected_provider.get_related_records_by_relation_type(
-            "r1", "ATTACHMENT", "recordRelations"
+            "r1", "ATTACHMENT", "nodeRelations"
         )
         assert result == []
 
@@ -4347,11 +4321,9 @@ class TestBatchUpsertRecords:
 
 
 # ---------------------------------------------------------------------------
-# Note: batch_upsert_domains, batch_upsert_anyone_with_link,
-# batch_upsert_anyone_same_org, and batch_create_user_app_edges reference
-# CollectionNames constants (DOMAINS, ANYONE_WITH_LINK, ANYONE_SAME_ORG,
-# USER_APP) that do not exist in the enum. These are dead code in the
-# provider and are skipped.
+# Note: batch_upsert_domains and batch_create_user_app_edges reference
+# CollectionNames constants (DOMAINS, USER_APP) that do not exist in the enum.
+# These are dead code in the provider and are skipped.
 # ---------------------------------------------------------------------------
 
 
@@ -8789,31 +8761,6 @@ class TestDeleteEdgesByConnectorId:
 
 
 # ---------------------------------------------------------------------------
-# batch_upsert_anyone
-# ---------------------------------------------------------------------------
-
-
-class TestBatchUpsertAnyone:
-    @pytest.mark.asyncio
-    @pytest.mark.asyncio
-    async def test_empty(self, connected_provider):
-        with patch.object(
-            connected_provider, "batch_upsert_nodes",
-            new_callable=AsyncMock, return_value=True
-        ) as mock_upsert:
-            await connected_provider.batch_upsert_anyone([])
-            mock_upsert.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_exception(self, connected_provider):
-        with patch.object(
-            connected_provider, "batch_upsert_nodes",
-            new_callable=AsyncMock, side_effect=Exception("fail")
-        ), pytest.raises(Exception, match="fail"):
-            await connected_provider.batch_upsert_anyone([{"_key": "a1"}])
-
-
-# ---------------------------------------------------------------------------
 # delete_connector_sync_edges
 # ---------------------------------------------------------------------------
 
@@ -10338,32 +10285,6 @@ class TestBatchUpsertDomains:
             mock.assert_not_awaited()
 
 
-class TestBatchUpsertAnyoneWithLink:
-    """CollectionNames.ANYONE_WITH_LINK is commented out. Only test empty-list."""
-
-    @pytest.mark.asyncio
-    async def test_empty(self, connected_provider):
-        with patch.object(
-            connected_provider, "batch_upsert_nodes",
-            new_callable=AsyncMock
-        ) as mock:
-            await connected_provider.batch_upsert_anyone_with_link([])
-            mock.assert_not_awaited()
-
-
-class TestBatchUpsertAnyoneSameOrg:
-    """CollectionNames.ANYONE_SAME_ORG is commented out. Only test empty-list."""
-
-    @pytest.mark.asyncio
-    async def test_empty(self, connected_provider):
-        with patch.object(
-            connected_provider, "batch_upsert_nodes",
-            new_callable=AsyncMock
-        ) as mock:
-            await connected_provider.batch_upsert_anyone_same_org([])
-            mock.assert_not_awaited()
-
-
 class TestBatchCreateUserAppEdges:
     """CollectionNames.USER_APP doesn't exist; only test empty-list early return."""
 
@@ -11695,58 +11616,6 @@ class TestBatchUpsertDomains:
         ):
             with pytest.raises(Exception):
                 await connected_provider.batch_upsert_domains([{"id": "d1"}])
-
-
-# ---------------------------------------------------------------------------
-# batch_upsert_anyone_with_link
-# ---------------------------------------------------------------------------
-
-
-class TestBatchUpsertAnyoneWithLink:
-    @pytest.mark.asyncio
-    @pytest.mark.asyncio
-    async def test_empty(self, connected_provider):
-        with patch.object(
-            connected_provider, "batch_upsert_nodes",
-            new_callable=AsyncMock
-        ) as mock_upsert:
-            await connected_provider.batch_upsert_anyone_with_link([])
-            mock_upsert.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_exception(self, connected_provider):
-        with patch.object(
-            connected_provider, "batch_upsert_nodes",
-            new_callable=AsyncMock, side_effect=Exception("fail")
-        ):
-            with pytest.raises(Exception):
-                await connected_provider.batch_upsert_anyone_with_link([{"id": "awl1"}])
-
-
-# ---------------------------------------------------------------------------
-# batch_upsert_anyone_same_org
-# ---------------------------------------------------------------------------
-
-
-class TestBatchUpsertAnyoneSameOrg:
-    @pytest.mark.asyncio
-    @pytest.mark.asyncio
-    async def test_empty(self, connected_provider):
-        with patch.object(
-            connected_provider, "batch_upsert_nodes",
-            new_callable=AsyncMock
-        ) as mock_upsert:
-            await connected_provider.batch_upsert_anyone_same_org([])
-            mock_upsert.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_exception(self, connected_provider):
-        with patch.object(
-            connected_provider, "batch_upsert_nodes",
-            new_callable=AsyncMock, side_effect=Exception("fail")
-        ):
-            with pytest.raises(Exception):
-                await connected_provider.batch_upsert_anyone_same_org([{"id": "aso1"}])
 
 
 # ---------------------------------------------------------------------------
@@ -20740,7 +20609,7 @@ class TestGetRelatedRecordsByRelationType:
         result = await connected_provider.get_related_records_by_relation_type(
             record_id="rec_main",
             relation_type="ATTACHMENT",
-            edge_collection="recordRelations"
+            edge_collection="nodeRelations"
         )
         
         assert len(result) == 2
@@ -20754,7 +20623,7 @@ class TestGetRelatedRecordsByRelationType:
         result = await connected_provider.get_related_records_by_relation_type(
             record_id="rec_main",
             relation_type="ATTACHMENT",
-            edge_collection="recordRelations"
+            edge_collection="nodeRelations"
         )
         
         assert result == []
@@ -20767,7 +20636,7 @@ class TestGetRelatedRecordsByRelationType:
         result = await connected_provider.get_related_records_by_relation_type(
             record_id="rec_main",
             relation_type="ATTACHMENT",
-            edge_collection="recordRelations"
+            edge_collection="nodeRelations"
         )
         
         assert result == []
@@ -20781,7 +20650,7 @@ class TestGetRelatedRecordsByRelationType:
         await connected_provider.get_related_records_by_relation_type(
             record_id="rec_main",
             relation_type="ATTACHMENT",
-            edge_collection="recordRelations",
+            edge_collection="nodeRelations",
             transaction="txn_789"
         )
         
@@ -21558,17 +21427,17 @@ class TestProcessFilePermissionsErrorPaths:
 
 
 # ---------------------------------------------------------------------------
-# batch_upsert_record_relations
+# batch_upsert_node_relations
 # ---------------------------------------------------------------------------
 
 
 class TestBatchUpsertRecordRelations:
-    """Tests for batch_upsert_record_relations method."""
+    """Tests for batch_upsert_node_relations method."""
 
     @pytest.mark.asyncio
     async def test_empty_edges_returns_true(self, connected_provider):
         """Should return True immediately for empty edges list."""
-        result = await connected_provider.batch_upsert_record_relations([])
+        result = await connected_provider.batch_upsert_node_relations([])
         
         assert result is True
 
@@ -21581,7 +21450,7 @@ class TestBatchUpsertRecordRelations:
         ])
         
         edges = [{"from_id": "1", "to_id": "2", "relationshipType": "CHILD"}]
-        result = await connected_provider.batch_upsert_record_relations(edges)
+        result = await connected_provider.batch_upsert_node_relations(edges)
         
         assert result is True
         connected_provider.http_client.execute_aql.assert_called_once()
@@ -21593,7 +21462,7 @@ class TestBatchUpsertRecordRelations:
         connected_provider._translate_edges_to_arango = MagicMock(return_value=[{}])
         
         with pytest.raises(Exception):
-            await connected_provider.batch_upsert_record_relations([{"from_id": "1"}])
+            await connected_provider.batch_upsert_node_relations([{"from_id": "1"}])
 
     @pytest.mark.asyncio
     async def test_transaction_support(self, connected_provider):
@@ -21601,7 +21470,7 @@ class TestBatchUpsertRecordRelations:
         connected_provider.http_client.execute_aql = AsyncMock(return_value=[])
         connected_provider._translate_edges_to_arango = MagicMock(return_value=[{"_from": "records/1"}])
         
-        await connected_provider.batch_upsert_record_relations([{"from_id": "1"}], transaction="txn_123")
+        await connected_provider.batch_upsert_node_relations([{"from_id": "1"}], transaction="txn_123")
         
         call_args = connected_provider.http_client.execute_aql.call_args
         assert call_args[1]["txn_id"] == "txn_123"

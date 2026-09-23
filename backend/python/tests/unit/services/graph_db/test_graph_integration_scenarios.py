@@ -51,7 +51,7 @@ BELONGS_TO = "belongsTo"
 BELONGS_TO_RECORD_GROUP = "belongsToRecordGroup"
 INHERIT_PERMISSIONS = "inheritPermissions"
 IS_OF_TYPE = "isOfType"
-RECORD_RELATIONS = "recordRelations"
+NODE_RELATIONS = "nodeRelations"
 USER_APP_RELATION = "userAppRelation"
 ORG_APP_RELATION = "orgAppRelation"
 PARENT_CHILD = "parentChild"
@@ -841,7 +841,7 @@ class FakeGraphProvider:
     ) -> tuple[int, bool]:
         """Delete sync-created edges for a connector."""
         sync_edge_collections = [
-            BELONGS_TO, BELONGS_TO_RECORD_GROUP, RECORD_RELATIONS,
+            BELONGS_TO, BELONGS_TO_RECORD_GROUP, NODE_RELATIONS,
             PERMISSION, INHERIT_PERMISSIONS, USER_APP_RELATION,
         ]
         total = 0
@@ -888,8 +888,8 @@ class FakeGraphProvider:
         records = self._ensure_collection(RECORDS)
         children: list[dict[str, object]] = []
         child_ids_seen: set[str] = set()
-        # Via recordRelations (PARENT_CHILD type)
-        rel_edges = self._ensure_edge_collection(RECORD_RELATIONS)
+        # Via nodeRelations (PARENT_CHILD type)
+        rel_edges = self._ensure_edge_collection(NODE_RELATIONS)
         for e in rel_edges:
             if (
                 e.get("from_id") == parent_record_id
@@ -1225,7 +1225,7 @@ class TestGoogleDriveConnectorSetup:
         ])
 
         # Record relations (parent-child)
-        p._ensure_edge_collection(RECORD_RELATIONS).extend([
+        p._ensure_edge_collection(NODE_RELATIONS).extend([
             relation_edge(d1_folder, d1_file1),
             relation_edge(d1_folder, d1_file2),
             relation_edge(d1_folder, d1_subfolder),
@@ -1738,7 +1738,7 @@ class TestPermissionInheritance:
             perm_edge(user2_key, USERS, file3_id, RECORDS, "READER"),
         ])
 
-        p._ensure_edge_collection(RECORD_RELATIONS).extend([
+        p._ensure_edge_collection(NODE_RELATIONS).extend([
             relation_edge(folder1_id, subfolder1_id),
             relation_edge(folder1_id, file2_id),
             relation_edge(subfolder1_id, file1_id),
@@ -2343,7 +2343,7 @@ class TestKnowledgeBaseManagement:
             belongs_edge(kb_folder_file, RECORDS, kb_id, KNOWLEDGE_BASES),
         ])
 
-        p._ensure_edge_collection(RECORD_RELATIONS).append(relation_edge(kb_folder, kb_folder_file))
+        p._ensure_edge_collection(NODE_RELATIONS).append(relation_edge(kb_folder, kb_folder_file))
 
         p._ensure_edge_collection(PERMISSION).extend([
             perm_edge(owner_key, USERS, kb_id, KNOWLEDGE_BASES, "OWNER"),

@@ -42,10 +42,10 @@ def _seg(seg_id: str, seg_type: str, name: str) -> dict[str, str]:
 
 
 class TestPickParent:
-    def test_prefers_record_relations_over_belongs_to(self) -> None:
+    def test_prefers_node_relations_over_belongs_to(self) -> None:
         edges = [
             {"parent_id": "rg1", "parent_type": "recordGroup", "via": "belongsTo"},
-            {"parent_id": "rec-p", "parent_type": "record", "via": "recordRelations"},
+            {"parent_id": "rec-p", "parent_type": "record", "via": "nodeRelations"},
             {"parent_id": "app1", "parent_type": "app", "via": "belongsTo"},
         ]
         chosen = pick_parent(edges)
@@ -78,8 +78,8 @@ class TestWalkAncestors:
                 "app1": ("app", "Jira"),
             },
             {
-                "rec3": [("rec2", "record", "recordRelations")],
-                "rec2": [("rec1", "record", "recordRelations")],
+                "rec3": [("rec2", "record", "nodeRelations")],
+                "rec2": [("rec1", "record", "nodeRelations")],
                 "rec1": [("rg2", "recordGroup", "belongsTo")],
                 "rg2": [("rg1", "recordGroup", "belongsTo")],
                 "rg1": [("app1", "app", "belongsTo")],
@@ -99,7 +99,7 @@ class TestWalkAncestors:
             },
             {
                 "story": [
-                    ("epic", "record", "recordRelations"),
+                    ("epic", "record", "nodeRelations"),
                     ("rg1", "recordGroup", "belongsTo"),
                 ],
                 "epic": [("rg1", "recordGroup", "belongsTo")],
@@ -113,8 +113,8 @@ class TestWalkAncestors:
         adj = _adj(
             {"a": ("record", "A"), "b": ("record", "B")},
             {
-                "a": [("b", "record", "recordRelations")],
-                "b": [("a", "record", "recordRelations")],
+                "a": [("b", "record", "nodeRelations")],
+                "b": [("a", "record", "nodeRelations")],
             },
         )
         trail = walk_ancestors("a", adj)
@@ -124,7 +124,7 @@ class TestWalkAncestors:
         # r0 ← r1 ← r2 ← r3; max_depth=2 walks two hops only
         adj = _adj(
             {f"r{i}": ("record", f"R{i}") for i in range(4)},
-            {f"r{i}": [(f"r{i + 1}", "record", "recordRelations")] for i in range(3)},
+            {f"r{i}": [(f"r{i + 1}", "record", "nodeRelations")] for i in range(3)},
         )
         trail = walk_ancestors("r0", adj, max_depth=2)
         assert [s["id"] for s in trail] == ["r2", "r1"]
@@ -132,7 +132,7 @@ class TestWalkAncestors:
     def test_missing_parent_node_stops_walk(self) -> None:
         adj = _adj(
             {"child": ("record", "Child")},
-            {"child": [("ghost", "record", "recordRelations")]},
+            {"child": [("ghost", "record", "nodeRelations")]},
         )
         assert walk_ancestors("child", adj) == []
 
@@ -264,7 +264,7 @@ def _jira_adjacency_payload() -> dict[str, Any]:
         },
         {
             "story": [
-                ("epic", "record", "recordRelations"),
+                ("epic", "record", "nodeRelations"),
                 ("rg1", "recordGroup", "belongsTo"),
             ],
             "epic": [("rg1", "recordGroup", "belongsTo")],

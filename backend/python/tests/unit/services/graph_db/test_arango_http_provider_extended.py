@@ -1239,7 +1239,7 @@ class TestBatchCreateEntityRelations:
 class TestBatchUpsertRecordRelations:
     @pytest.mark.asyncio
     async def test_empty_edges(self, connected_provider):
-        result = await connected_provider.batch_upsert_record_relations([])
+        result = await connected_provider.batch_upsert_node_relations([])
         assert result is True
 
     @pytest.mark.asyncio
@@ -1253,7 +1253,7 @@ class TestBatchUpsertRecordRelations:
             "relationshipType": "FOREIGN_KEY",
             "constraintName": "fk_orders_customers",
         }]
-        result = await connected_provider.batch_upsert_record_relations(edges)
+        result = await connected_provider.batch_upsert_node_relations(edges)
         assert result is True
 
     @pytest.mark.asyncio
@@ -1267,7 +1267,7 @@ class TestBatchUpsertRecordRelations:
             "relationshipType": "FOREIGN_KEY",
         }]
         with pytest.raises(Exception, match="fail"):
-            await connected_provider.batch_upsert_record_relations(edges)
+            await connected_provider.batch_upsert_node_relations(edges)
 
 
 class TestGetEdge:

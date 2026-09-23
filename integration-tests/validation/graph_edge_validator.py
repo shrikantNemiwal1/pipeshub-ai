@@ -51,7 +51,7 @@ _EDGE_COLLECTION_TO_YAML: Final[dict[str, str]] = {
     "permission": "permission.yaml",
     "belongsTo": "belongs_to.yaml",
     "inheritPermissions": "inherit_permissions.yaml",
-    "recordRelations": "record_relations.yaml",
+    "nodeRelations": "node_relations.yaml",
     "isOfType": "is_of_type.yaml",
     "userAppRelation": "user_app_relation.yaml",
     "entityRelations": "entity_relations.yaml",
@@ -348,12 +348,12 @@ def build_record_edge_expectations(
             rel_type = "PARENT_CHILD"
 
         exps.append(EdgeExpectation(
-            collection="recordRelations",
+            collection="nodeRelations",
             from_ref=parent_ref,
             to_ref=rec_ref,
             cardinality="at_least_one",
             expected_payload={"relationshipType": rel_type},
-            label=f"parent recordRelations ({rel_type}) -> record",
+            label=f"parent nodeRelations ({rel_type}) -> record",
         ))
 
     return exps

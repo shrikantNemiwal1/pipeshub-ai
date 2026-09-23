@@ -817,7 +817,9 @@ class TestFetchPermissionsDeep:
             "file-1", is_drive=False, user_email="user@t.com"
         )
         assert is_fallback is False  # Not fallback since user has explicit permission
-        assert len(perms) == 2
+        # The link permission is no longer returned (decision 59) — it named no
+        # grantee and was always discarded downstream. Only the user grant is.
+        assert len(perms) == 1
 
     async def test_drive_403_raises(self, connector):
         """403 error on drive raises exception."""

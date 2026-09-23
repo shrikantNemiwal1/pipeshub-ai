@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from app.config.constants.arangodb import (
+    AccessRule,
     Connectors,
     MimeTypes,
     OriginTypes,
@@ -550,10 +551,14 @@ class TestSyncFolders:
         folder1, perms1 = saved_records[0]
         folder2, perms2 = saved_records[1]
         
-        # Folder1 has READ permission, so inherit_permissions should be False
-        assert folder1.inherit_permissions is False
-        # Folder2 has only WRITE permission, inherit_permissions should remain default (True)
-        # (it's set to True by default in the model)
+        # Folder1 has a READ restriction: it keeps inheriting from the space and
+        # is RESTRICTED instead, so it needs its own grant too (decision 26).
+        assert folder1.inherit_permissions is True
+        assert folder1.access_rule is AccessRule.RESTRICTED
+        # Folder2 has only WRITE, so it stays STRICT and plain space access
+        # still reaches it. This is a positive value now, not a falsy one — the
+        # EDIT-only case is the one a careless rename turns into a no-op.
+        assert folder2.access_rule is AccessRule.STRICT
 
     async def test_sync_folders_handles_api_failure(self):
         """Test that API failures are handled and raised."""
@@ -991,7 +996,10 @@ class TestSyncFolders:
         folder1, perms1 = saved_records[0]
         folder2, perms2 = saved_records[1]
         
-        assert folder1.inherit_permissions is False
+        # Folder1 has a READ restriction: it keeps inheriting from the space and
+        # is RESTRICTED instead (decision 26).
+        assert folder1.inherit_permissions is True
+        assert folder1.access_rule is AccessRule.RESTRICTED
 
     async def test_sync_folders_handles_api_failure(self):
         """Test that API failures are handled and raised."""
@@ -1825,14 +1833,19 @@ class TestFetchPagePermissions:
         connector._transform_page_restriction_to_permissions.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_api_failure_returns_empty(self):
+    async def test_api_failure_returns_none_not_empty(self):
+        """A 403 must not read as "no restrictions" (decision 76).
+
+        [] means definitively unrestricted, which writes the page STRICT and
+        lets the whole space see it. An unreadable ACL is not an absent one.
+        """
         connector = _make_connector()
         mock_ds = MagicMock()
         mock_ds.get_page_permissions_v1 = AsyncMock(return_value=_make_mock_response(403, {}))
         connector._get_fresh_datasource = AsyncMock(return_value=mock_ds)
 
         permissions = await connector._fetch_page_permissions("page-1")
-        assert permissions == []
+        assert permissions is None
 
 
 # ===========================================================================
@@ -1914,7 +1927,8 @@ class TestSyncContentPermissionsByTitles:
 
         await connector._sync_content_permissions_by_titles(["Test Blog"])
 
-        assert mock_record.inherit_permissions is False
+        # A READ restriction keeps inheriting and is RESTRICTED instead (decision 26).
+        assert mock_record.access_rule is AccessRule.RESTRICTED
         connector.data_entities_processor.on_new_records.assert_awaited_once()
 
 
@@ -5315,7 +5329,7 @@ class TestSyncContentPages:
         assert mock_record.indexing_status == ProgressStatus.AUTO_INDEX_OFF.value
 
     @pytest.mark.asyncio
-    async def test_read_permission_sets_inherit_false(self):
+    async def test_read_permission_sets_restriction(self):
         c = _mk_connector()
         _setup_sync_content(c)
         page_data = {
@@ -5332,7 +5346,8 @@ class TestSyncContentPages:
         c._process_webpage_with_update = AsyncMock(return_value=MagicMock(record=mock_record))
 
         await c._sync_content("S1", RecordType.CONFLUENCE_PAGE)
-        assert mock_record.inherit_permissions is False
+        # A READ restriction keeps inheriting and is RESTRICTED instead (decision 26).
+        assert mock_record.access_rule is AccessRule.RESTRICTED
 
     @pytest.mark.asyncio
     async def test_page_sync_does_not_create_comment_records(self):
@@ -5593,19 +5608,40 @@ class TestFetchSpacePermissions:
 
 
 class TestFetchPagePermissionsErrors:
+    """Decision 76: unknown and empty are different answers.
+
+    Both paths used to return [], which is indistinguishable from "this page
+    genuinely carries no restrictions" — so a transient failure wrote a
+    READ-restricted page as STRICT and exposed it to every member of its space.
+    """
+
     @pytest.mark.asyncio
-    async def test_failed_response_returns_empty(self):
+    async def test_failed_response_returns_none(self):
         c = _mk_connector()
         ds = MagicMock()
         ds.get_page_permissions_v1 = AsyncMock(return_value=_mk_resp(500))
         c._get_fresh_datasource = AsyncMock(return_value=ds)
         result = await c._fetch_page_permissions("page-1")
-        assert result == []
+        assert result is None
 
     @pytest.mark.asyncio
-    async def test_exception_returns_empty(self):
+    async def test_exception_returns_none(self):
         c = _mk_connector()
         c._get_fresh_datasource = AsyncMock(side_effect=RuntimeError("fail"))
+        result = await c._fetch_page_permissions("page-1")
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_success_with_no_restrictions_still_returns_empty(self):
+        """The other half of the contract: [] must survive as a real answer.
+
+        Without this, returning None unconditionally would pass both tests
+        above while breaking every unrestricted page.
+        """
+        c = _mk_connector()
+        ds = MagicMock()
+        ds.get_page_permissions_v1 = AsyncMock(return_value=_mk_resp(200, {"results": []}))
+        c._get_fresh_datasource = AsyncMock(return_value=ds)
         result = await c._fetch_page_permissions("page-1")
         assert result == []
 
@@ -6470,7 +6506,7 @@ class TestCheckAndFetchUpdatedPageAdditional:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_read_permissions_set_inherit_false(self):
+    async def test_read_permissions_set_restriction(self):
         c = _mk_connector()
         page_data = {"id": "p1", "version": {"number": 7}, "_links": {}}
         ds = MagicMock()
@@ -6483,7 +6519,8 @@ class TestCheckAndFetchUpdatedPageAdditional:
         record = MagicMock(external_record_id="p1", external_revision_id="3")
         result = await c._check_and_fetch_updated_page("org-1", record)
         assert result is not None
-        assert mock_rec.inherit_permissions is False
+        # A READ restriction keeps inheriting and is RESTRICTED instead (decision 26).
+        assert mock_rec.access_rule is AccessRule.RESTRICTED
 
     @pytest.mark.asyncio
     async def test_exception_returns_none(self):
@@ -6498,7 +6535,7 @@ class TestCheckAndFetchUpdatedBlogpostReadPerms:
     """Test read permissions setting inherit_permissions=False (line 3639)."""
 
     @pytest.mark.asyncio
-    async def test_read_permissions_set_inherit_false(self):
+    async def test_read_permissions_set_restriction(self):
         c = _mk_connector()
         blogpost_data = {
             "id": "3010", "title": "Blog",
@@ -6515,7 +6552,8 @@ class TestCheckAndFetchUpdatedBlogpostReadPerms:
         record = MagicMock(external_record_id="3010", external_revision_id="4")
         result = await c._check_and_fetch_updated_blogpost("org-1", record)
         assert result is not None
-        assert mock_rec.inherit_permissions is False
+        # A READ restriction keeps inheriting and is RESTRICTED instead (decision 26).
+        assert mock_rec.access_rule is AccessRule.RESTRICTED
 
 
 class TestCheckAndFetchUpdatedAttachmentParentNode:
@@ -8778,7 +8816,14 @@ class TestCheckAndFetchUpdatedComment:
         assert len(perms) == 1
 
     @pytest.mark.asyncio
-    async def test_permission_fetch_failure_still_returns_record(self):
+    async def test_permission_fetch_failure_skips_the_record(self):
+        """Decision 76 inverts this case deliberately.
+
+        It used to return the comment with permissions == [], which the write
+        path reads as "no grants" — so a reindex during a transient failure
+        wiped the comment's inherited grants. Skipping leaves the last
+        known-good row untouched for the next sync.
+        """
         c = _mk_connector()
         comment_data = {
             "id": "c2",
@@ -8787,7 +8832,7 @@ class TestCheckAndFetchUpdatedComment:
             "_links": {},
         }
         c._fetch_comment_data = AsyncMock(return_value=comment_data)
-        c._fetch_page_permissions = AsyncMock(side_effect=RuntimeError("perm fail"))
+        c._fetch_page_permissions = AsyncMock(return_value=None)
 
         record = MagicMock(
             external_record_id="c2",
@@ -8797,6 +8842,33 @@ class TestCheckAndFetchUpdatedComment:
             external_record_group_id="space-1",
             parent_node_id="node-1",
             id="rec-c2",
+            version=0,
+        )
+        result = await c._check_and_fetch_updated_comment("org-1", record)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_readable_permissions_still_return_the_record(self):
+        """Guards the guard: without this, skipping unconditionally would pass
+        the test above while dropping every comment."""
+        c = _mk_connector()
+        comment_data = {
+            "id": "c4",
+            "title": "Comment",
+            "version": {"authorId": "a1", "number": 2, "createdAt": "2025-01-01T00:00:00.000Z"},
+            "_links": {},
+        }
+        c._fetch_comment_data = AsyncMock(return_value=comment_data)
+        c._fetch_page_permissions = AsyncMock(return_value=[])
+
+        record = MagicMock(
+            external_record_id="c4",
+            external_revision_id="1",
+            record_type=RecordType.COMMENT,
+            parent_external_record_id="page-1",
+            external_record_group_id="space-1",
+            parent_node_id="node-1",
+            id="rec-c4",
             version=0,
         )
         result = await c._check_and_fetch_updated_comment("org-1", record)

@@ -188,11 +188,11 @@ class TestArangoHTTPProvider(ArangoHTTPProvider):
         return len(result) if result else 0
 
     async def count_parent_child_edges(self, connector_id: str) -> int:
-        """Count parent/child folder edges (RECORD_RELATION with relationshipType PARENT_CHILD)."""
+        """Count parent/child folder edges (NODE_RELATION with relationshipType PARENT_CHILD)."""
         if not self.http_client:
             raise RuntimeError("Provider not connected")
         query = f"""
-            FOR e IN {CollectionNames.RECORD_RELATIONS.value}
+            FOR e IN {CollectionNames.NODE_RELATIONS.value}
                 FILTER e.relationshipType == 'PARENT_CHILD'
                 LET from_doc = DOCUMENT(e._from)
                 LET to_doc = DOCUMENT(e._to)
@@ -977,11 +977,11 @@ class TestArangoHTTPProvider(ArangoHTTPProvider):
     async def count_record_relation_edges(
         self, connector_id: str, relation_type: str
     ) -> int:
-        """Count RECORD_RELATIONS edges with a specific relationshipType."""
+        """Count NODE_RELATIONS edges with a specific relationshipType."""
         if not self.http_client:
             raise RuntimeError("Provider not connected")
         query = f"""
-            FOR e IN {CollectionNames.RECORD_RELATIONS.value}
+            FOR e IN {CollectionNames.NODE_RELATIONS.value}
                 FILTER e.relationshipType == @rtype
                 LET from_doc = DOCUMENT(e._from)
                 LET to_doc = DOCUMENT(e._to)
@@ -1047,7 +1047,7 @@ class TestArangoHTTPProvider(ArangoHTTPProvider):
     async def get_record_outgoing_relations(
         self, connector_id: str, external_record_id: str, relation_type: str
     ) -> List[str]:
-        """Return externalRecordIds of records reachable via outbound RECORD_RELATIONS of the given type.
+        """Return externalRecordIds of records reachable via outbound NODE_RELATIONS of the given type.
 
         For parent_child / attachment edges, the connector emits ``parent -> child``
         so this returns the **children**. To resolve the parent, use
@@ -1059,7 +1059,7 @@ class TestArangoHTTPProvider(ArangoHTTPProvider):
             FOR r IN {CollectionNames.RECORDS.value}
                 FILTER r.connectorId == @cid AND r.externalRecordId == @eid
                 LIMIT 1
-                FOR v, e IN OUTBOUND r {CollectionNames.RECORD_RELATIONS.value}
+                FOR v, e IN OUTBOUND r {CollectionNames.NODE_RELATIONS.value}
                     FILTER e.relationshipType == @rtype
                     RETURN v.externalRecordId
         """
@@ -1072,7 +1072,7 @@ class TestArangoHTTPProvider(ArangoHTTPProvider):
     async def get_record_incoming_relations(
         self, connector_id: str, external_record_id: str, relation_type: str
     ) -> List[str]:
-        """Return externalRecordIds of records pointing TO this record via RECORD_RELATIONS of the given type.
+        """Return externalRecordIds of records pointing TO this record via NODE_RELATIONS of the given type.
 
         Inverse of :meth:`get_record_outgoing_relations`. For parent_child / attachment
         edges, this returns the parent (since the connector stores the edge
@@ -1084,7 +1084,7 @@ class TestArangoHTTPProvider(ArangoHTTPProvider):
             FOR r IN {CollectionNames.RECORDS.value}
                 FILTER r.connectorId == @cid AND r.externalRecordId == @eid
                 LIMIT 1
-                FOR v, e IN INBOUND r {CollectionNames.RECORD_RELATIONS.value}
+                FOR v, e IN INBOUND r {CollectionNames.NODE_RELATIONS.value}
                     FILTER e.relationshipType == @rtype
                     RETURN v.externalRecordId
         """

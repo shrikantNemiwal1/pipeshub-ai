@@ -243,66 +243,70 @@ class TestHandleGetNodes:
         assert exc_info.value.status_code == 400
 
     @pytest.mark.asyncio
-    async def test_invalid_sort_by_defaults_to_name(self):
+    async def test_an_invalid_sort_by_is_refused(self):
+        """API-15/PG-52: falling back sorted by something the caller did not
+        ask for, and every later page resumed against that other order."""
         request = _make_request()
         svc = _make_knowledge_hub_service()
         svc.get_nodes = AsyncMock(return_value=_make_success_result())
 
-        await _handle_get_nodes(
-            request=request,
-            knowledge_hub_service=svc,
-            parent_id=None,
-            parent_type=None,
-            only_containers=False,
-            page=1,
-            limit=50,
-            sort_by="invalid_field",
-            sort_order="desc",
-            q=None,
-            node_types=None,
-            record_types=None,
-            origins=None,
-            connector_ids=None,
-            indexing_status=None,
-            created_at=None,
-            updated_at=None,
-            size=None,
-            flattened=False,
-            include=None,
-        )
-        call_kwargs = svc.get_nodes.call_args[1]
-        assert call_kwargs["sort_by"] == "name"
+        with pytest.raises(HTTPException) as caught:
+            await _handle_get_nodes(
+                request=request,
+                knowledge_hub_service=svc,
+                parent_id=None,
+                parent_type=None,
+                only_containers=False,
+                page=1,
+                limit=50,
+                sort_by="invalid_field",
+                sort_order="desc",
+                q=None,
+                node_types=None,
+                record_types=None,
+                origins=None,
+                connector_ids=None,
+                indexing_status=None,
+                created_at=None,
+                updated_at=None,
+                size=None,
+                flattened=False,
+                include=None,
+            )
+        assert caught.value.status_code == 400
+        svc.get_nodes.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_invalid_sort_order_defaults_to_asc(self):
+    async def test_an_invalid_sort_order_is_refused(self):
         request = _make_request()
         svc = _make_knowledge_hub_service()
         svc.get_nodes = AsyncMock(return_value=_make_success_result())
 
-        await _handle_get_nodes(
-            request=request,
-            knowledge_hub_service=svc,
-            parent_id=None,
-            parent_type=None,
-            only_containers=False,
-            page=1,
-            limit=50,
-            sort_by="name",
-            sort_order="invalid",
-            q=None,
-            node_types=None,
-            record_types=None,
-            origins=None,
-            connector_ids=None,
-            indexing_status=None,
-            created_at=None,
-            updated_at=None,
-            size=None,
-            flattened=False,
-            include=None,
-        )
-        call_kwargs = svc.get_nodes.call_args[1]
-        assert call_kwargs["sort_order"] == "asc"
+        with pytest.raises(HTTPException) as caught:
+            await _handle_get_nodes(
+                request=request,
+                knowledge_hub_service=svc,
+                parent_id=None,
+                parent_type=None,
+                only_containers=False,
+                page=1,
+                limit=50,
+                sort_by="name",
+                sort_order="invalid",
+                q=None,
+                node_types=None,
+                record_types=None,
+                origins=None,
+                connector_ids=None,
+                indexing_status=None,
+                created_at=None,
+                updated_at=None,
+                size=None,
+                flattened=False,
+                include=None,
+            )
+        assert caught.value.status_code == 400
+        svc.get_nodes.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_error_result_not_found(self):
@@ -823,66 +827,70 @@ class TestHandleGetNodesCoverage:
         assert exc_info.value.status_code == 400
 
     @pytest.mark.asyncio
-    async def test_invalid_sort_by_defaults_to_name(self):
+    async def test_an_invalid_sort_by_is_refused(self):
+        """API-15/PG-52: falling back sorted by something the caller did not
+        ask for, and every later page resumed against that other order."""
         request = _make_request()
         svc = _make_knowledge_hub_service()
         svc.get_nodes = AsyncMock(return_value=_make_success_result())
 
-        await _handle_get_nodes(
-            request=request,
-            knowledge_hub_service=svc,
-            parent_id=None,
-            parent_type=None,
-            only_containers=False,
-            page=1,
-            limit=50,
-            sort_by="invalid_field",
-            sort_order="desc",
-            q=None,
-            node_types=None,
-            record_types=None,
-            origins=None,
-            connector_ids=None,
-            indexing_status=None,
-            created_at=None,
-            updated_at=None,
-            size=None,
-            flattened=False,
-            include=None,
-        )
-        call_kwargs = svc.get_nodes.call_args[1]
-        assert call_kwargs["sort_by"] == "name"
+        with pytest.raises(HTTPException) as caught:
+            await _handle_get_nodes(
+                request=request,
+                knowledge_hub_service=svc,
+                parent_id=None,
+                parent_type=None,
+                only_containers=False,
+                page=1,
+                limit=50,
+                sort_by="invalid_field",
+                sort_order="desc",
+                q=None,
+                node_types=None,
+                record_types=None,
+                origins=None,
+                connector_ids=None,
+                indexing_status=None,
+                created_at=None,
+                updated_at=None,
+                size=None,
+                flattened=False,
+                include=None,
+            )
+        assert caught.value.status_code == 400
+        svc.get_nodes.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_invalid_sort_order_defaults_to_asc(self):
+    async def test_an_invalid_sort_order_is_refused(self):
         request = _make_request()
         svc = _make_knowledge_hub_service()
         svc.get_nodes = AsyncMock(return_value=_make_success_result())
 
-        await _handle_get_nodes(
-            request=request,
-            knowledge_hub_service=svc,
-            parent_id=None,
-            parent_type=None,
-            only_containers=False,
-            page=1,
-            limit=50,
-            sort_by="name",
-            sort_order="invalid",
-            q=None,
-            node_types=None,
-            record_types=None,
-            origins=None,
-            connector_ids=None,
-            indexing_status=None,
-            created_at=None,
-            updated_at=None,
-            size=None,
-            flattened=False,
-            include=None,
-        )
-        call_kwargs = svc.get_nodes.call_args[1]
-        assert call_kwargs["sort_order"] == "asc"
+        with pytest.raises(HTTPException) as caught:
+            await _handle_get_nodes(
+                request=request,
+                knowledge_hub_service=svc,
+                parent_id=None,
+                parent_type=None,
+                only_containers=False,
+                page=1,
+                limit=50,
+                sort_by="name",
+                sort_order="invalid",
+                q=None,
+                node_types=None,
+                record_types=None,
+                origins=None,
+                connector_ids=None,
+                indexing_status=None,
+                created_at=None,
+                updated_at=None,
+                size=None,
+                flattened=False,
+                include=None,
+            )
+        assert caught.value.status_code == 400
+        svc.get_nodes.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_error_result_not_found(self):

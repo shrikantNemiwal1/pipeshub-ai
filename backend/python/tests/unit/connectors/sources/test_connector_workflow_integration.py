@@ -181,7 +181,7 @@ class _InMemoryGraphStore:
         before = len(edges)
         self.edges[edge_collection] = [
             e for e in edges
-            if not (e.get("_from") == _from and e.get("relationType") in relationship_types)
+            if not (e.get("_from") == _from and e.get("relationshipType") in relationship_types)
         ]
         return before - len(self.edges[edge_collection])
 
@@ -263,10 +263,20 @@ class MockTransactionStore:
         return None
 
     async def get_record_by_key(self, key: str) -> Optional[Dict]:
-        doc = self._s.get_node(CollectionNames.RECORDS.value, key)
-        if doc:
-            return self._doc_to_record(doc)
-        return None
+        # Returns the raw document, as production does: the real data store
+        # delegates to get_document, not to a Record factory.
+        return self._s.get_node(CollectionNames.RECORDS.value, key)
+
+    async def get_records_by_parent(
+        self, connector_id: str, parent_external_record_id: str, record_type: str = None
+    ) -> List[Record]:
+        out = []
+        for doc in self._s.collections.get(CollectionNames.RECORDS.value, {}).values():
+            if (doc.get("connectorId") == connector_id
+                    and doc.get("externalParentId") == parent_external_record_id
+                    and (record_type is None or doc.get("recordType") == record_type)):
+                out.append(self._doc_to_record(doc))
+        return out
 
     async def batch_upsert_records(self, records: List[Record]) -> None:
         for record in records:
@@ -276,6 +286,14 @@ class MockTransactionStore:
     async def batch_upsert_nodes(self, nodes: List[Dict], collection: str) -> bool:
         for node in nodes:
             self._s.upsert_node(collection, node)
+        return True
+
+    async def batch_update_nodes(self, nodes: List[Dict], collection: str) -> bool:
+        # Update-only in production; upsert is close enough here, since the
+        # caller only ever updates nodes it has just read.
+        for node in nodes:
+            existing = self._s.get_node(collection, node.get("id") or node.get("_key"))
+            self._s.upsert_node(collection, {**(existing or {}), **node})
         return True
 
     # -- record groups ---
@@ -316,18 +334,15 @@ class MockTransactionStore:
         })
 
     async def create_record_relation(self, from_record_id: str, to_record_id: str, relation_type: str) -> None:
-        self._s.add_edge(CollectionNames.RECORD_RELATIONS.value, {
+        self._s.add_edge(CollectionNames.NODE_RELATIONS.value, {
             "_from": f"{CollectionNames.RECORDS.value}/{from_record_id}",
             "_to": f"{CollectionNames.RECORDS.value}/{to_record_id}",
-            "relationType": relation_type,
+            "relationshipType": relation_type,
         })
 
-    async def batch_upsert_record_relations(self, edges: List[Dict]) -> None:
+    async def batch_upsert_node_relations(self, edges: List[Dict]) -> None:
         for edge in edges:
-            stored = dict(edge)
-            if "relationshipType" in stored and "relationType" not in stored:
-                stored["relationType"] = stored["relationshipType"]
-            self._s.add_edge(CollectionNames.RECORD_RELATIONS.value, stored)
+            self._s.add_edge(CollectionNames.NODE_RELATIONS.value, dict(edge))
 
     async def create_inherit_permissions_relation_record_group(self, record_id: str, record_group_id: str) -> None:
         self._s.add_edge(CollectionNames.INHERIT_PERMISSIONS.value, {
@@ -342,6 +357,25 @@ class MockTransactionStore:
             CollectionNames.INHERIT_PERMISSIONS.value,
             record_id, CollectionNames.RECORDS.value,
             record_group_id, CollectionNames.RECORD_GROUPS.value,
+        )
+
+    async def create_inherit_permissions_relation_record(
+        self, child_record_id: str, parent_record_id: str
+    ) -> None:
+        self._s.add_edge(CollectionNames.INHERIT_PERMISSIONS.value, {
+            "from_id": child_record_id,
+            "from_collection": CollectionNames.RECORDS.value,
+            "to_id": parent_record_id,
+            "to_collection": CollectionNames.RECORDS.value,
+        })
+
+    async def delete_inherit_permissions_relation_record(
+        self, child_record_id: str, parent_record_id: str
+    ) -> None:
+        self._s.delete_edge(
+            CollectionNames.INHERIT_PERMISSIONS.value,
+            child_record_id, CollectionNames.RECORDS.value,
+            parent_record_id, CollectionNames.RECORDS.value,
         )
 
     # -- users ---
@@ -432,7 +466,7 @@ class MockTransactionStore:
 
     async def batch_create_edges(self, edges: List[Dict], collection: str) -> bool:
         for edge in edges:
-            self._s.add_edge(collection, edge)
+            self._s.add_edge(collection, dict(edge))
         return True
 
     async def batch_create_entity_relations(self, edges: List[Dict]) -> None:
@@ -455,14 +489,23 @@ class MockTransactionStore:
         return self._s.delete_edges_by_relationship_types(collection, from_id, from_collection, relationship_types)
 
     async def delete_parent_child_edge_to_record(self, record_id: str) -> int:
+        # Scoped to record sources, as both providers are: a record group hangs
+        # its top-level records off itself with the same relationship type, and
+        # Shared with Me adds a second one. An unscoped delete takes those too
+        # and leaves the record with no hierarchy parent at all.
         _to = f"{CollectionNames.RECORDS.value}/{record_id}"
-        edges = self._s.edges.get(CollectionNames.RECORD_RELATIONS.value, [])
+        record_prefix = f"{CollectionNames.RECORDS.value}/"
+        edges = self._s.edges.get(CollectionNames.NODE_RELATIONS.value, [])
         before = len(edges)
-        self._s.edges[CollectionNames.RECORD_RELATIONS.value] = [
+        self._s.edges[CollectionNames.NODE_RELATIONS.value] = [
             e for e in edges
-            if not (e.get("_to") == _to and e.get("relationType") == RecordRelations.PARENT_CHILD.value)
+            if not (
+                e.get("_to") == _to
+                and str(e.get("_from", "")).startswith(record_prefix)
+                and e.get("relationshipType") == RecordRelations.PARENT_CHILD.value
+            )
         ]
-        return before - len(self._s.edges[CollectionNames.RECORD_RELATIONS.value])
+        return before - len(self._s.edges[CollectionNames.NODE_RELATIONS.value])
 
     async def get_edges_from_node(self, from_node_id: str, edge_collection: str) -> List[Dict]:
         return self._s.get_edges_from_node(from_node_id, edge_collection)
@@ -978,8 +1021,11 @@ class TestGoogleDriveFullSyncWorkflow:
         )
         await processor.on_new_records([(parent_folder, [])])
         await processor.on_new_records([(child_file, [])])
-        rr = graph_store.edges.get(CollectionNames.RECORD_RELATIONS.value, [])
-        pc_edges = [e for e in rr if e.get("relationType") == RecordRelations.PARENT_CHILD.value]
+        rr = graph_store.edges.get(CollectionNames.NODE_RELATIONS.value, [])
+        # Record -> record only; see the note in test_sync_page_hierarchy.
+        pc_edges = [e for e in rr
+                    if e.get("relationshipType") == RecordRelations.PARENT_CHILD.value
+                    and e.get("_from", "").startswith(f"{CollectionNames.RECORDS.value}/")]
         assert len(pc_edges) == 1
 
     @pytest.mark.asyncio
@@ -1193,8 +1239,8 @@ class TestJiraFullSyncWorkflow:
             )
         ]
         await processor.on_new_records([(blocker, [])])
-        rr = graph_store.edges.get(CollectionNames.RECORD_RELATIONS.value, [])
-        block_edges = [e for e in rr if e.get("relationType") == RecordRelations.BLOCKS.value]
+        rr = graph_store.edges.get(CollectionNames.NODE_RELATIONS.value, [])
+        block_edges = [e for e in rr if e.get("relationshipType") == RecordRelations.BLOCKS.value]
         assert len(block_edges) == 1
 
 
@@ -1223,8 +1269,12 @@ class TestConfluenceWorkflow:
         child.parent_record_type = RecordType.CONFLUENCE_PAGE
         await processor.on_new_records([(parent, [])])
         await processor.on_new_records([(child, [])])
-        rr = graph_store.edges.get(CollectionNames.RECORD_RELATIONS.value, [])
-        pc = [e for e in rr if e.get("relationType") == RecordRelations.PARENT_CHILD.value]
+        rr = graph_store.edges.get(CollectionNames.NODE_RELATIONS.value, [])
+        # Record -> record only. A record with no parent record also gets a
+        # hierarchy edge from its record group, which is not what this counts.
+        pc = [e for e in rr
+              if e.get("relationshipType") == RecordRelations.PARENT_CHILD.value
+              and e.get("_from", "").startswith(f"{CollectionNames.RECORDS.value}/")]
         assert len(pc) == 1
 
     @pytest.mark.asyncio
@@ -1298,8 +1348,11 @@ class TestConfluenceWorkflow:
             author_source_id="user-abc-123",
         )
         await processor.on_new_records([(comment, [])])
-        rr = graph_store.edges.get(CollectionNames.RECORD_RELATIONS.value, [])
-        pc = [e for e in rr if e.get("relationType") == RecordRelations.PARENT_CHILD.value]
+        rr = graph_store.edges.get(CollectionNames.NODE_RELATIONS.value, [])
+        # Record -> record only; see the note in test_sync_page_hierarchy.
+        pc = [e for e in rr
+              if e.get("relationshipType") == RecordRelations.PARENT_CHILD.value
+              and e.get("_from", "").startswith(f"{CollectionNames.RECORDS.value}/")]
         assert len(pc) == 1
 
 
@@ -1483,8 +1536,8 @@ class TestIncrementalSyncWorkflow:
         child_v2.parent_record_type = RecordType.FILE
         await processor.on_new_records([(child_v2, [])])
         # Should have edge from parent2 to child, and the old one should be gone or replaced
-        rr = graph_store.edges.get(CollectionNames.RECORD_RELATIONS.value, [])
-        pc_edges = [e for e in rr if e.get("relationType") == RecordRelations.PARENT_CHILD.value]
+        rr = graph_store.edges.get(CollectionNames.NODE_RELATIONS.value, [])
+        pc_edges = [e for e in rr if e.get("relationshipType") == RecordRelations.PARENT_CHILD.value]
         assert len(pc_edges) >= 1
 
 
@@ -2222,8 +2275,8 @@ class TestComplexRealWorldScenarios:
         # Verify: only 1 record group
         assert graph_store.count_collection(CollectionNames.RECORD_GROUPS.value) == 1
         # Verify parent-child edge for subtask
-        rr = graph_store.edges.get(CollectionNames.RECORD_RELATIONS.value, [])
-        pc = [e for e in rr if e.get("relationType") == RecordRelations.PARENT_CHILD.value]
+        rr = graph_store.edges.get(CollectionNames.NODE_RELATIONS.value, [])
+        pc = [e for e in rr if e.get("relationshipType") == RecordRelations.PARENT_CHILD.value]
         assert len(pc) >= 1
 
     @pytest.mark.asyncio
@@ -2252,8 +2305,11 @@ class TestComplexRealWorldScenarios:
         await processor.on_new_records([(sub_folder, [])])
         await processor.on_new_records([(deep_file, [])])
 
-        rr = graph_store.edges.get(CollectionNames.RECORD_RELATIONS.value, [])
-        pc_edges = [e for e in rr if e.get("relationType") == RecordRelations.PARENT_CHILD.value]
+        rr = graph_store.edges.get(CollectionNames.NODE_RELATIONS.value, [])
+        # Record -> record only; see the note in test_sync_page_hierarchy.
+        pc_edges = [e for e in rr
+                    if e.get("relationshipType") == RecordRelations.PARENT_CHILD.value
+                    and e.get("_from", "").startswith(f"{CollectionNames.RECORDS.value}/")]
         assert len(pc_edges) == 2
 
     @pytest.mark.asyncio
@@ -2302,8 +2358,11 @@ class TestComplexRealWorldScenarios:
         )
         await processor.on_new_records([(comment, [])])
 
-        rr = graph_store.edges.get(CollectionNames.RECORD_RELATIONS.value, [])
-        pc_edges = [e for e in rr if e.get("relationType") == RecordRelations.PARENT_CHILD.value]
+        rr = graph_store.edges.get(CollectionNames.NODE_RELATIONS.value, [])
+        # Record -> record only; see the note in test_sync_page_hierarchy.
+        pc_edges = [e for e in rr
+                    if e.get("relationshipType") == RecordRelations.PARENT_CHILD.value
+                    and e.get("_from", "").startswith(f"{CollectionNames.RECORDS.value}/")]
         assert len(pc_edges) == 2  # root->child, child->comment
 
     @pytest.mark.asyncio
@@ -2363,8 +2422,8 @@ class TestComplexRealWorldScenarios:
         attachment.parent_record_type = RecordType.TICKET
         await processor.on_new_records([(attachment, [])])
 
-        rr = graph_store.edges.get(CollectionNames.RECORD_RELATIONS.value, [])
-        attachment_edges = [e for e in rr if e.get("relationType") == RecordRelations.ATTACHMENT.value]
+        rr = graph_store.edges.get(CollectionNames.NODE_RELATIONS.value, [])
+        attachment_edges = [e for e in rr if e.get("relationshipType") == RecordRelations.ATTACHMENT.value]
         assert len(attachment_edges) == 1
 
     @pytest.mark.asyncio
@@ -2414,8 +2473,8 @@ class TestComplexRealWorldScenarios:
             is_public=LinkPublicStatus.TRUE,
         )
         await processor.on_new_records([(link, [])])
-        rr = graph_store.edges.get(CollectionNames.RECORD_RELATIONS.value, [])
-        parent_child_edges = [e for e in rr if e.get("relationType") == RecordRelations.PARENT_CHILD.value]
+        rr = graph_store.edges.get(CollectionNames.NODE_RELATIONS.value, [])
+        parent_child_edges = [e for e in rr if e.get("relationshipType") == RecordRelations.PARENT_CHILD.value]
         assert len(parent_child_edges) >= 1
 
     @pytest.mark.asyncio
@@ -2453,8 +2512,8 @@ class TestComplexRealWorldScenarios:
         attachment.parent_record_type = RecordType.MAIL
         await processor.on_new_records([(attachment, [])])
 
-        rr = graph_store.edges.get(CollectionNames.RECORD_RELATIONS.value, [])
-        attachment_edges = [e for e in rr if e.get("relationType") == RecordRelations.ATTACHMENT.value]
+        rr = graph_store.edges.get(CollectionNames.NODE_RELATIONS.value, [])
+        attachment_edges = [e for e in rr if e.get("relationshipType") == RecordRelations.ATTACHMENT.value]
         assert len(attachment_edges) == 1
 
 

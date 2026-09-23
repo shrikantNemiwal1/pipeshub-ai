@@ -372,7 +372,9 @@ class TestFetchPermissionsExtended:
             "file-1", is_drive=False, user_email="user@example.com"
         )
         assert is_fallback is False
-        assert len(perms) == 2
+        # The link permission is no longer returned (decision 59) — it named no
+        # grantee. Only the real user grant is.
+        assert len(perms) == 1
 
     async def test_drive_permissions_with_domain_admin(self, connector):
         """Drive permissions use domain admin access."""
@@ -454,7 +456,7 @@ class TestFetchPermissionsExtended:
             ],
         })
         perms, _, _ = await connector._fetch_permissions("file-1", is_drive=False)
-        assert perms[0].entity_type == EntityType.DOMAIN
+        assert perms[0].entity_type == EntityType.ORG
 
     async def test_custom_drive_data_source(self, connector):
         """Custom drive data source is used if provided."""

@@ -1529,7 +1529,7 @@ class TestTraversalAndRecordLookups:
             ]
         )
 
-        result = await neo4j_provider.get_edges_to_node("records/r1", "recordRelations", transaction="txn-e2n")
+        result = await neo4j_provider.get_edges_to_node("records/r1", "nodeRelations", transaction="txn-e2n")
 
         assert len(result) == 1
         assert result[0]["edgeType"] == "PARENT_CHILD"
@@ -1543,7 +1543,7 @@ class TestTraversalAndRecordLookups:
         neo4j_provider._parse_arango_id = MagicMock(return_value=("records", "r1"))  # type: ignore[method-assign]
         neo4j_provider.client.execute_query = AsyncMock(side_effect=RuntimeError("edges fail"))
 
-        result = await neo4j_provider.get_edges_to_node("records/r1", "recordRelations")
+        result = await neo4j_provider.get_edges_to_node("records/r1", "nodeRelations")
 
         assert result == []
 
@@ -1560,9 +1560,9 @@ class TestTraversalAndRecordLookups:
             ]
         )
 
-        inbound = await neo4j_provider.get_related_nodes("records/r1", "recordRelations", "records")
+        inbound = await neo4j_provider.get_related_nodes("records/r1", "nodeRelations", "records")
         outbound = await neo4j_provider.get_related_nodes(
-            "records/r1", "recordRelations", "records", direction="outbound"
+            "records/r1", "nodeRelations", "records", direction="outbound"
         )
 
         assert inbound == [{"_key": "r-parent", "name": "Parent"}]
@@ -1573,7 +1573,7 @@ class TestTraversalAndRecordLookups:
         neo4j_provider._parse_arango_id = MagicMock(return_value=("records", "r1"))  # type: ignore[method-assign]
         neo4j_provider.client.execute_query = AsyncMock(side_effect=RuntimeError("related fail"))
 
-        result = await neo4j_provider.get_related_nodes("records/r1", "recordRelations", "records")
+        result = await neo4j_provider.get_related_nodes("records/r1", "nodeRelations", "records")
 
         assert result == []
 
@@ -1583,7 +1583,7 @@ class TestTraversalAndRecordLookups:
         neo4j_provider.client.execute_query = AsyncMock(return_value=[{"value": "A"}, {"value": "B"}])
 
         result = await neo4j_provider.get_related_node_field(
-            "records/r1", "recordRelations", "records", "recordName", direction="outbound"
+            "records/r1", "nodeRelations", "records", "recordName", direction="outbound"
         )
 
         assert result == ["A", "B"]
@@ -1594,7 +1594,7 @@ class TestTraversalAndRecordLookups:
         neo4j_provider.client.execute_query = AsyncMock(side_effect=RuntimeError("field fail"))
 
         result = await neo4j_provider.get_related_node_field(
-            "records/r1", "recordRelations", "records", "recordName"
+            "records/r1", "nodeRelations", "records", "recordName"
         )
 
         assert result == []
@@ -3022,14 +3022,14 @@ class TestVirtualAccessAndRecordLookup:
 
 class TestRecordRelationOperations:
     @pytest.mark.asyncio
-    async def test_batch_upsert_record_relations_empty_edges_returns_true(
+    async def test_batch_upsert_node_relations_empty_edges_returns_true(
         self, neo4j_provider: Neo4jProvider
     ):
-        assert await neo4j_provider.batch_upsert_record_relations([]) is True
+        assert await neo4j_provider.batch_upsert_node_relations([]) is True
         neo4j_provider.client.execute_query.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_batch_upsert_record_relations_transforms_edges_and_executes(
+    async def test_batch_upsert_node_relations_transforms_edges_and_executes(
         self, neo4j_provider: Neo4jProvider
     ):
         neo4j_provider.client.execute_query = AsyncMock(return_value=[{"upserted": 2}])
@@ -3051,7 +3051,7 @@ class TestRecordRelationOperations:
             },
         ]
 
-        result = await neo4j_provider.batch_upsert_record_relations(edges, transaction="txn-rel")
+        result = await neo4j_provider.batch_upsert_node_relations(edges, transaction="txn-rel")
 
         assert result is True
         kwargs = neo4j_provider.client.execute_query.await_args.kwargs
@@ -3068,10 +3068,10 @@ class TestRecordRelationOperations:
         assert payload[1]["props"]["targetColumn"] == "id"
 
     @pytest.mark.asyncio
-    async def test_batch_upsert_record_relations_raises_on_exception(self, neo4j_provider: Neo4jProvider):
+    async def test_batch_upsert_node_relations_raises_on_exception(self, neo4j_provider: Neo4jProvider):
         neo4j_provider.client.execute_query = AsyncMock(side_effect=RuntimeError("upsert rel fail"))
         with pytest.raises(RuntimeError):
-            await neo4j_provider.batch_upsert_record_relations([{"from_id": "r1", "to_id": "r2"}])
+            await neo4j_provider.batch_upsert_node_relations([{"from_id": "r1", "to_id": "r2"}])
 
     @pytest.mark.asyncio
     async def test_get_child_record_ids_by_relation_type_success_and_exception(

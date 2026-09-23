@@ -183,7 +183,7 @@ async def assert_graph_entity_with_edges(
     automatically builds and asserts the expected edges based on entity kind:
 
     - ``ticket_record`` / ``file_record`` → record edges (belongsTo, inheritPermissions,
-      isOfType, parent recordRelations)
+      isOfType, parent nodeRelations)
     - ``record_group`` → record group edges (belongsTo app, parent group hierarchy)
     - Other kinds → fields-only (no automatic edges)
     """

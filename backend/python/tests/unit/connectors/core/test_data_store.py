@@ -149,15 +149,6 @@ class ConcreteTransactionStore(TransactionStore):
     async def batch_upsert_domains(self, domains):
         pass
 
-    async def batch_upsert_anyone(self, anyone):
-        pass
-
-    async def batch_upsert_anyone_with_link(self, anyone_with_link):
-        pass
-
-    async def batch_upsert_anyone_same_org(self, anyone_same_org):
-        pass
-
     async def create_record_relation(self, from_record_id, to_record_id, relation_type):
         pass
 

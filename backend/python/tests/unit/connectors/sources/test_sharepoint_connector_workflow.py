@@ -2206,9 +2206,10 @@ class TestSharePointConvertToPermissions:
         link.type = "read"
         perm.link = link
 
+        # An anonymous link names no grantee, so it yields no permission
+        # (decision 59).
         result = await connector._convert_to_permissions([perm])
-        assert len(result) == 1
-        assert result[0].entity_type == EntityType.ANYONE_WITH_LINK
+        assert result == []
 
     @pytest.mark.asyncio
     async def test_organization_link(self):
@@ -2279,7 +2280,9 @@ class TestGetItemPermissions:
         connector._safe_api_call = AsyncMock(return_value=MagicMock(value=[perm_obj]))
 
         result = await connector._get_item_permissions("site-1", "drive-1", "item-1")
-        assert len(result) == 1
+        # The call succeeds; the one anonymous-link permission yields nothing,
+        # since it names no grantee (decision 59).
+        assert result == []
 
     @pytest.mark.asyncio
     async def test_get_item_permissions_error_returns_empty(self):

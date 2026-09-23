@@ -152,6 +152,58 @@ class TestCreateDataStore:
 
 
 # ===========================================================================
+# initialize_container — node relation migration ordering
+# ===========================================================================
+
+
+class TestNodeRelationMigrationIsFatal:
+    """The one migration that must NOT follow the house log-and-continue pattern.
+
+    It renames the hierarchy edge collection and runs *before* ensure_schema().
+    If it fails and initialization carries on, ensure_schema() creates an empty
+    nodeRelations while the real edges still sit under the old name — the
+    service then serves a graph with no hierarchy at all, and the next boot's
+    both-exist branch has to clean up after it. The All-team and KB-apps
+    migrations below it deliberately swallow their errors, so nothing but this
+    test stops someone "fixing" the inconsistency.
+    """
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {"DATA_STORE": "arangodb"})
+    @patch("app.containers.connector.Health.system_health_check", new_callable=AsyncMock)
+    @patch("app.containers.connector.run_node_relation_migration", new_callable=AsyncMock)
+    async def test_a_failed_migration_is_fatal_and_skips_schema_init(
+        self, mock_migration, mock_health
+    ):
+        container, _logger, _config_service = _make_mock_container()
+        mock_migration.return_value = {"success": False, "error": "rename refused"}
+        ensure_schema = container.data_store.return_value.graph_provider.ensure_schema
+
+        with pytest.raises(Exception, match="rename refused"):
+            await initialize_container(container)
+
+        ensure_schema.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @patch.dict(os.environ, {"DATA_STORE": "arangodb"})
+    @patch("app.containers.connector.Health.system_health_check", new_callable=AsyncMock)
+    @patch("app.containers.connector.run_all_team_migration", new_callable=AsyncMock)
+    @patch("app.containers.connector.run_node_relation_migration", new_callable=AsyncMock)
+    async def test_a_successful_migration_lets_schema_init_run(
+        self, mock_migration, mock_all_team, mock_health
+    ):
+        """Guards the guard: without this, the assertion above would hold even
+        if ensure_schema were never awaited on any path."""
+        container, _logger, _config_service = _make_mock_container()
+        mock_migration.return_value = {"success": True, "skipped": True}
+        mock_all_team.return_value = {"success": True, "skipped": True}
+        ensure_schema = container.data_store.return_value.graph_provider.ensure_schema
+
+        assert await initialize_container(container) is True
+        ensure_schema.assert_awaited_once()
+
+
+# ===========================================================================
 # initialize_container — happy path
 # ===========================================================================
 

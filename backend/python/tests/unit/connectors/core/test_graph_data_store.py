@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.config.constants.arangodb import CollectionNames
 from app.connectors.core.base.data_store.graph_data_store import (
     GraphDataStore,
     GraphTransactionStore,
@@ -79,13 +80,10 @@ def mock_graph_provider():
     provider.batch_upsert_app_users = AsyncMock()
     provider.batch_upsert_orgs = AsyncMock()
     provider.batch_upsert_domains = AsyncMock()
-    provider.batch_upsert_anyone = AsyncMock()
-    provider.batch_upsert_anyone_with_link = AsyncMock()
-    provider.batch_upsert_anyone_same_org = AsyncMock()
     provider.batch_upsert_nodes = AsyncMock()
     provider.batch_create_edges = AsyncMock()
     provider.batch_delete_edges = AsyncMock(return_value=0)
-    provider.batch_upsert_record_relations = AsyncMock()
+    provider.batch_upsert_node_relations = AsyncMock()
     provider.batch_create_entity_relations = AsyncMock()
     provider.create_record_relation = AsyncMock()
     provider.create_record_group_relation = AsyncMock()
@@ -254,21 +252,6 @@ class TestGraphTransactionStore:
     async def test_batch_upsert_domains(self, tx_store, mock_graph_provider) -> None:
         await tx_store.batch_upsert_domains([])
         mock_graph_provider.batch_upsert_domains.assert_awaited_once_with([], transaction="txn-123")
-
-    @pytest.mark.asyncio
-    async def test_batch_upsert_anyone(self, tx_store, mock_graph_provider) -> None:
-        await tx_store.batch_upsert_anyone([])
-        mock_graph_provider.batch_upsert_anyone.assert_awaited_once_with([], transaction="txn-123")
-
-    @pytest.mark.asyncio
-    async def test_batch_upsert_anyone_with_link(self, tx_store, mock_graph_provider) -> None:
-        await tx_store.batch_upsert_anyone_with_link([])
-        mock_graph_provider.batch_upsert_anyone_with_link.assert_awaited_once_with([], transaction="txn-123")
-
-    @pytest.mark.asyncio
-    async def test_batch_upsert_anyone_same_org(self, tx_store, mock_graph_provider) -> None:
-        await tx_store.batch_upsert_anyone_same_org([])
-        mock_graph_provider.batch_upsert_anyone_same_org.assert_awaited_once_with([], transaction="txn-123")
 
     @pytest.mark.asyncio
     async def test_create_sync_point(self, tx_store, mock_graph_provider) -> None:
@@ -559,6 +542,23 @@ class TestGraphTransactionStore:
         assert len(edges) == 1
         assert edges[0]["from_id"] == "child1"
         assert edges[0]["to_id"] == "parent1"
+        # Both ends are records. This went unasserted for a long time, and the
+        # helper meanwhile pointed its target at RECORD_GROUPS — an edge into
+        # the wrong collection entirely.
+        assert edges[0]["from_collection"] == CollectionNames.RECORDS.value
+        assert edges[0]["to_collection"] == CollectionNames.RECORDS.value
+
+    @pytest.mark.asyncio
+    async def test_delete_inherit_permissions_relation_record(self, tx_store, mock_graph_provider) -> None:
+        await tx_store.delete_inherit_permissions_relation_record("child1", "parent1")
+        mock_graph_provider.delete_edge.assert_awaited_once_with(
+            "child1",
+            CollectionNames.RECORDS.value,
+            "parent1",
+            CollectionNames.RECORDS.value,
+            CollectionNames.INHERIT_PERMISSIONS.value,
+            transaction="txn-123",
+        )
 
     @pytest.mark.asyncio
     async def test_get_sync_point(self, tx_store, mock_graph_provider) -> None:
@@ -612,9 +612,9 @@ class TestGraphTransactionStore:
         )
 
     @pytest.mark.asyncio
-    async def test_batch_upsert_record_relations(self, tx_store, mock_graph_provider) -> None:
-        await tx_store.batch_upsert_record_relations([{"from_id": "a", "to_id": "b"}])
-        mock_graph_provider.batch_upsert_record_relations.assert_awaited_once_with(
+    async def test_batch_upsert_node_relations(self, tx_store, mock_graph_provider) -> None:
+        await tx_store.batch_upsert_node_relations([{"from_id": "a", "to_id": "b"}])
+        mock_graph_provider.batch_upsert_node_relations.assert_awaited_once_with(
             [{"from_id": "a", "to_id": "b"}], transaction="txn-123"
         )
 

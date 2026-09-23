@@ -33,7 +33,7 @@ from app.utils.chat_helpers import (
     build_block_web_url,
     build_message_content_array,
     build_parent_info,
-    build_record_relations_info,
+    build_node_relations_info,
     context_includes_jira_tickets,
     count_tokens,
     count_tokens_in_messages,
@@ -5256,7 +5256,7 @@ class TestEnrichRecordsWithGraphContext:
                 for rid in record_ids
             }
 
-        gp.get_record_relations_batch = AsyncMock(side_effect=_relations_batch)
+        gp.get_node_relations_batch = AsyncMock(side_effect=_relations_batch)
 
         async def _get_document(record_id, collection=None, *args, **kwargs):
             if record_id in docs_by_id:
@@ -5615,7 +5615,7 @@ class TestEnrichRecordsWithGraphContext:
             flattened_results=[{"virtual_record_id": "vr-ticket", "block_index": 0}],
             virtual_to_record_map=vtr_map,
         )
-        assert "record_relations" not in rec
+        assert "node_relations" not in rec
 
     @pytest.mark.asyncio
     async def test_queries_both_relation_types_in_one_batch(self):
@@ -5625,10 +5625,10 @@ class TestEnrichRecordsWithGraphContext:
         await enrich_records_with_graph_context(
             vr_map, graph_provider=gp, flattened_results=[],
         )
-        gp.get_record_relations_batch.assert_awaited_once()
-        from app.utils.chat_helpers import RECORD_RELATION_ENRICHMENT_TYPES
-        requested = set(gp.get_record_relations_batch.await_args.args[1])
-        assert requested == {rel.value for rel in RECORD_RELATION_ENRICHMENT_TYPES}
+        gp.get_node_relations_batch.assert_awaited_once()
+        from app.utils.chat_helpers import NODE_RELATION_ENRICHMENT_TYPES
+        requested = set(gp.get_node_relations_batch.await_args.args[1])
+        assert requested == {rel.value for rel in NODE_RELATION_ENRICHMENT_TYPES}
         assert gp.get_parent_record_ids_by_relation_type.await_count == 0
         assert gp.get_child_record_ids_by_relation_type.await_count == 0
 
@@ -5645,7 +5645,7 @@ class TestEnrichRecordsWithGraphContext:
         await enrich_records_with_graph_context(
             vr_map, graph_provider=gp, flattened_results=[],
         )
-        relations = rec["record_relations"]
+        relations = rec["node_relations"]
         assert len(relations) == 2
         by_id = {r["record_id"]: r for r in relations}
         assert by_id["rec-file-1"]["record_name"] == "Name-rec-file-1"
@@ -5665,7 +5665,7 @@ class TestEnrichRecordsWithGraphContext:
         await enrich_records_with_graph_context(
             vr_map, graph_provider=gp, flattened_results=[],
         )
-        relations = rec["record_relations"]
+        relations = rec["node_relations"]
         assert len(relations) == 1
         assert set(relations[0]["labels"]) == {"ATTACHMENT", "CHILD"}
 
@@ -5689,7 +5689,7 @@ class TestEnrichRecordsWithGraphContext:
         await enrich_records_with_graph_context(
             vr_map, graph_provider=gp, flattened_results=[],
         )
-        assert "record_relations" not in rec
+        assert "node_relations" not in rec
 
     @pytest.mark.asyncio
     async def test_returns_all_relations_without_cap(self):
@@ -5702,7 +5702,7 @@ class TestEnrichRecordsWithGraphContext:
         await enrich_records_with_graph_context(
             vr_map, graph_provider=gp, flattened_results=[],
         )
-        assert len(rec["record_relations"]) == 25
+        assert len(rec["node_relations"]) == 25
 
     @pytest.mark.asyncio
     async def test_related_record_gets_context_metadata(self):
@@ -5730,7 +5730,7 @@ class TestEnrichRecordsWithGraphContext:
             vr_map, graph_provider=gp, flattened_results=[],
             blob_store=None, org_id="org-1",
         )
-        relations = rec["record_relations"]
+        relations = rec["node_relations"]
         assert len(relations) == 1
         assert "context_metadata" in relations[0]
         assert "[PST-10] Subtask" in relations[0]["context_metadata"]
@@ -5766,7 +5766,7 @@ class TestEnrichRecordsWithGraphContext:
             vr_map, graph_provider=gp, flattened_results=[],
             blob_store=blob_store, org_id="org-1",
         )
-        relations = rec["record_relations"]
+        relations = rec["node_relations"]
         assert len(relations) == 1
         ctx = relations[0]["context_metadata"]
         assert "Summary" in ctx
@@ -5797,7 +5797,7 @@ class TestEnrichRecordsWithGraphContext:
             vr_map, graph_provider=gp, flattened_results=[],
             blob_store=None, org_id="org-1",
         )
-        relations = rec["record_relations"]
+        relations = rec["node_relations"]
         assert len(relations) == 1
         ctx = relations[0]["context_metadata"]
         assert "[PST-10] Subtask" in ctx
@@ -5852,8 +5852,8 @@ class TestEnrichRecordsWithGraphContext:
         # Dependent parent was annotated
         assert flattened[0]["parent_node_relation"]["record_id"] == "rec-issue-1"
         # Relation-eligible got relations
-        assert len(ticket_rec["record_relations"]) == 1
-        assert ticket_rec["record_relations"][0]["record_id"] == "rec-related"
+        assert len(ticket_rec["node_relations"]) == 1
+        assert ticket_rec["node_relations"][0]["record_id"] == "rec-related"
 
 class TestBuildParentInfo:
     def test_returns_empty_when_no_relation(self):
@@ -5931,12 +5931,12 @@ class TestBuildMessageContentArrayParentInfo:
 
 class TestBuildRecordRelationsInfo:
     def test_returns_empty_when_no_relations(self):
-        assert build_record_relations_info({}) == ""
-        assert build_record_relations_info({"record_relations": []}) == ""
+        assert build_node_relations_info({}) == ""
+        assert build_node_relations_info({"node_relations": []}) == ""
 
     def test_renders_minimal_record_id_name_and_labels(self):
-        text = build_record_relations_info({
-            "record_relations": [
+        text = build_node_relations_info({
+            "node_relations": [
                 {
                     "record_id": "rec-1",
                     "record_name": "screenshot.png",
@@ -5970,8 +5970,8 @@ class TestBuildRecordRelationsInfo:
             "* Status: DONE\n"
             "* Priority: MEDIUM"
         )
-        text = build_record_relations_info({
-            "record_relations": [
+        text = build_node_relations_info({
+            "node_relations": [
                 {
                     "record_id": "rec-task-1",
                     "record_name": "[PST-10] Add test evidence",
@@ -5987,8 +5987,8 @@ class TestBuildRecordRelationsInfo:
         assert "Summary: Task requesting addition of test evidence" in text
 
     def test_mixed_rich_and_minimal_entries(self):
-        text = build_record_relations_info({
-            "record_relations": [
+        text = build_node_relations_info({
+            "node_relations": [
                 {
                     "record_id": "rec-rich",
                     "record_name": "Rich",
@@ -6007,8 +6007,8 @@ class TestBuildRecordRelationsInfo:
         assert "- Record ID: rec-minimal | Name: Minimal" in text
 
     def test_groups_many_records_under_one_label_heading(self):
-        text = build_record_relations_info({
-            "record_relations": [
+        text = build_node_relations_info({
+            "node_relations": [
                 {"record_id": "rec-1", "record_name": "Sub 1", "labels": ["CHILD"]},
                 {"record_id": "rec-2", "record_name": "Sub 2", "labels": ["CHILD"]},
                 {"record_id": "rec-3", "record_name": "Sub 3", "labels": ["CHILD"]},
@@ -6076,7 +6076,7 @@ class TestBuildMessageContentArrayRecordRelations:
         record = _make_record_blob(
             virtual_record_id="vr-ticket",
             record_name="[PST-9] Test ticket",
-            record_relations=[
+            node_relations=[
                 {
                     "record_id": "rec-file-1",
                     "record_name": "screenshot.png",

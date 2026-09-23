@@ -333,9 +333,6 @@ class TestAbstractMethodInventory:
         "batch_upsert_app_roles",
         "batch_upsert_orgs",
         "batch_upsert_domains",
-        "batch_upsert_anyone",
-        "batch_upsert_anyone_with_link",
-        "batch_upsert_anyone_same_org",
         "batch_create_user_app_edges",
         # Entity ID operations
         "get_entity_id_by_email",
@@ -370,10 +367,21 @@ class TestAbstractMethodInventory:
         "get_failed_records_by_org",
         "check_toolset_instance_in_use",
         "check_connector_in_use",
-        # Knowledge hub operations
+        # Knowledge hub operations. This list is where BE-09's second clause --
+        # "v1 signatures unchanged" -- is enforced: the three inventory tests
+        # below fail if one of these is removed or renamed, and one of them
+        # fails on additions too. BE-09's first clause, that the v1 provider
+        # tests pass unedited, is a verification run rather than a test: the
+        # graph_db unit suites pass with no edits, run from backend/python.
         "get_knowledge_hub_root_nodes",
         "get_knowledge_hub_children",
         "get_knowledge_hub_search",
+        # Knowledge hub v2: the permission-model read queries. Browse, flatten
+        # and one partition of a global search are all the children method.
+        "get_knowledge_hub_root_nodes_v2",
+        "get_knowledge_hub_children_v2",
+        "get_knowledge_hub_partitions_v2",
+        "get_knowledge_hub_access_context_v2",
         "get_knowledge_hub_breadcrumbs",
         "get_knowledge_hub_context_permissions",
         "get_knowledge_hub_filter_options",
@@ -415,6 +423,8 @@ class TestAbstractMethodInventory:
         "filter_nodes_with_permission_role",
         "filter_accessible_virtual_record_ids",
         "get_record_parent_adjacency",
+        # Migrations
+        "migrate_legacy_relation_edge",
     ]
 
     def test_all_expected_methods_are_abstract(self):
